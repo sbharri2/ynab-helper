@@ -1,0 +1,67 @@
+{
+  "manifest_version": 3,
+  "name": "YNAB Helper - Amazon & Venmo Scraper",
+  "version": "1.1.0",
+  "description": "Scrape Amazon orders and Venmo transactions for YNAB budget tracking",
+  "permissions": [
+    "activeTab",
+    "storage",
+    "scripting"
+  ],
+  "host_permissions": [
+    "https://*.amazon.com/*",
+    "https://*.amazon.ca/*",
+    "https://*.amazon.co.uk/*",
+    "https://*.venmo.com/*"
+  ],
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.amazon.com/gp/your-account/order-history*",
+        "https://*.amazon.com/gp/css/order-history*",
+        "https://*.amazon.com/your-orders/orders*",
+        "https://*.amazon.ca/gp/your-account/order-history*",
+        "https://*.amazon.ca/gp/css/order-history*",
+        "https://*.amazon.ca/your-orders/orders*",
+        "https://*.amazon.co.uk/gp/your-account/order-history*",
+        "https://*.amazon.co.uk/gp/css/order-history*",
+        "https://*.amazon.co.uk/your-orders/orders*"
+      ],
+      "js": ["content/amazon-scraper.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://*.amazon.com/cpe/yourpayments/transactions*",
+        "https://*.amazon.ca/cpe/yourpayments/transactions*",
+        "https://*.amazon.co.uk/cpe/yourpayments/transactions*"
+      ],
+      "js": ["content/payments-scraper.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://*.venmo.com/*"
+      ],
+      "js": ["content/venmo-scraper.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "background": {
+    "service_worker": "background/service-worker.js"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "options_page": "options/options.html"
+}

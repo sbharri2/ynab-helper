@@ -1,0 +1,32 @@
+# Node modules
+node_modules/
+
+# Environment variables and secrets
+.env
+*.pem
+*.key
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Build outputs
+dist/
+build/
+
+# Logs
+*.log
+
+# Chrome extension packaging
+*.crx
+*.pem
+
+# Test files
+test/

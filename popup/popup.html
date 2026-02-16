@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YNAB Helper</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>YNAB Helper</h1>
+      <p class="subtitle">Amazon Order Scraper</p>
+    </header>
+
+    <div class="accounts-section">
+      <div class="account-card">
+        <div class="account-header">
+          <h3>👨 Steven's Account</h3>
+          <div class="data-counts">
+            <span id="stevenOrderCount" class="data-count">0 orders</span>
+            <span id="stevenPaymentCount" class="data-count">0 payments</span>
+          </div>
+        </div>
+        <button id="fetchStevenBtn" class="btn btn-primary">Fetch Steven's Data</button>
+        <button id="clearStevenBtn" class="btn btn-secondary btn-sm">Clear Steven's Cache</button>
+      </div>
+
+      <div class="account-card">
+        <div class="account-header">
+          <h3>👩 Allison's Account</h3>
+          <div class="data-counts">
+            <span id="allisonOrderCount" class="data-count">0 orders</span>
+            <span id="allisonPaymentCount" class="data-count">0 payments</span>
+          </div>
+        </div>
+        <button id="fetchAllisonBtn" class="btn btn-primary">Fetch Allison's Data</button>
+        <button id="clearAllisonBtn" class="btn btn-secondary btn-sm">Clear Allison's Cache</button>
+      </div>
+
+      <div class="account-card venmo-card">
+        <div class="account-header">
+          <h3>💸 Venmo Family Account</h3>
+          <span id="venmoFamilyCount" class="data-count">0 items</span>
+        </div>
+        <input type="file" id="venmoFamilyFile" accept=".csv" style="display: none;">
+        <button id="uploadVenmoFamilyBtn" class="btn btn-primary">Upload Family Venmo CSV</button>
+        <button id="clearVenmoFamilyBtn" class="btn btn-secondary btn-sm">Clear Family Venmo</button>
+        <div class="help-text" style="margin-top: 8px; font-size: 11px;">
+          Upload multiple months - data accumulates automatically
+        </div>
+      </div>
+
+      <div class="account-card venmo-card">
+        <div class="account-header">
+          <h3>💳 Allison Personal Venmo</h3>
+          <span id="venmoAllisonCount" class="data-count">0 items</span>
+        </div>
+        <input type="file" id="venmoAllisonFile" accept=".csv" style="display: none;">
+        <button id="uploadVenmoAllisonBtn" class="btn btn-primary">Upload Allison Venmo CSV</button>
+        <button id="clearVenmoAllisonBtn" class="btn btn-secondary btn-sm">Clear Allison Venmo</button>
+        <div class="help-text" style="margin-top: 8px; font-size: 11px;">
+          Upload multiple months - data accumulates automatically
+        </div>
+      </div>
+    </div>
+
+    <div class="help-text" style="margin: 10px 0; font-size: 12px; color: #666; text-align: center;">
+      📝 Navigate to Amazon Order History or Payments page, then click the button for the logged-in account
+    </div>
+
+    <div class="sync-section">
+      <button id="syncYnabBtn" class="btn btn-success btn-large">Sync Both to YNAB</button>
+      <button id="settingsBtn" class="btn btn-secondary">YNAB Settings</button>
+    </div>
+
+    <div id="statusArea" class="status-area hidden">
+      <div class="status-content">
+        <span id="statusIcon" class="status-icon"></span>
+        <span id="statusText">Ready</span>
+      </div>
+      <div id="progressBar" class="progress-bar hidden">
+        <div id="progressFill" class="progress-fill"></div>
+      </div>
+    </div>
+
+    <div id="resultsSection" class="results-section hidden">
+      <div class="results-header">
+        <h2>Combined Preview</h2>
+        <span id="orderCount" class="order-count">0 orders</span>
+      </div>
+
+      <div class="table-container">
+        <table id="resultsTable">
+          <thead>
+            <tr>
+              <th>Account</th>
+              <th>Date</th>
+              <th>Order ID</th>
+              <th>Items</th>
+              <th>Total</th>
+            </tr>
+          </thead>
+          <tbody id="resultsBody">
+          </tbody>
+        </table>
+      </div>
+
+      <div class="preview-note">
+        Showing first 10 orders from both accounts.
+      </div>
+    </div>
+
+    <div id="errorArea" class="error-area hidden">
+      <div class="error-content">
+        <span class="error-icon">!</span>
+        <span id="errorText"></span>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

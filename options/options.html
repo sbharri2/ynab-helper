@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YNAB Helper - Settings</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>YNAB Helper Settings</h1>
+      <p class="subtitle">Configure YNAB API Integration</p>
+    </header>
+
+    <main>
+      <section class="settings-section">
+        <h2>Step 1: Get Your YNAB API Token</h2>
+        <p class="help-text">
+          <strong>How to get your token:</strong>
+        </p>
+        <ol class="instructions">
+          <li>Go to <a href="https://app.ynab.com/settings/developer" target="_blank">YNAB Developer Settings</a></li>
+          <li>Click "New Token"</li>
+          <li>Give it a name like "Amazon Helper"</li>
+          <li>Copy the token (it will only be shown once!)</li>
+          <li>Paste it below</li>
+        </ol>
+
+        <div class="form-group">
+          <label for="apiToken">YNAB Personal Access Token:</label>
+          <input
+            type="password"
+            id="apiToken"
+            placeholder="Enter your YNAB API token"
+            autocomplete="off"
+          >
+          <button id="toggleToken" class="btn-link">Show token</button>
+        </div>
+
+        <button id="saveToken" class="btn btn-primary">Save & Test Connection</button>
+
+        <div id="connectionStatus" class="status-message hidden"></div>
+      </section>
+
+      <section class="settings-section" id="budgetSection" style="display: none;">
+        <h2>Step 2: Select Budget & Accounts</h2>
+
+        <div class="form-group">
+          <label for="budgetSelect">Budget:</label>
+          <select id="budgetSelect">
+            <option value="">Loading budgets...</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="amazonAccountSelect">Amazon Account (credit card where Amazon charges appear):</label>
+          <select id="amazonAccountSelect">
+            <option value="">Select a budget first...</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="venmoAccountSelect">Venmo Account (bank account for Venmo transfers):</label>
+          <select id="venmoAccountSelect">
+            <option value="">Select a budget first...</option>
+          </select>
+        </div>
+
+        <button id="saveSettings" class="btn btn-primary">Save Settings</button>
+
+        <div id="saveStatus" class="status-message hidden"></div>
+      </section>
+
+      <section class="settings-section" id="currentSettings" style="display: none;">
+        <h2>Current Settings</h2>
+        <div class="settings-display">
+          <p><strong>Budget:</strong> <span id="currentBudget">Not set</span></p>
+          <p><strong>Amazon Account:</strong> <span id="currentAmazonAccount">Not set</span></p>
+          <p><strong>Venmo Account:</strong> <span id="currentVenmoAccount">Not set</span></p>
+          <p><strong>Token:</strong> <span class="token-status">Configured ✓</span></p>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <button id="clearSettings" class="btn btn-secondary">Clear All Settings</button>
+    </footer>
+  </div>
+
+  <script src="options.js"></script>
+</body>
+</html>
