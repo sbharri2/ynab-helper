@@ -138,7 +138,7 @@ def insert_pending_order(
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (user_id, source, external_id, email_id, order_date,
-             total_cents, raw_summary, json.dumps(raw_payload)),
+             total_cents, raw_summary, json.dumps(raw_payload, default=str)),
         )
         return cur.lastrowid
 
