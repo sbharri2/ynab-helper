@@ -29,17 +29,10 @@ SUBJECT_OUTGOING_RE = re.compile(
     r"^You\s+(?P<verb>paid|charged)\s+(?P<who>.+?)\s+\$(?P<amt>[\d,]+\.\d{2})\s*$"
 )
 
-# Body note: appears between the amount and "See transaction".
-# In observed fixtures the body repeats the subject-like prefix
-# ("Jane Doe paid you $31.00") multiple times before the real note, e.g.:
-#   "...paid you $31.00 Jane Doe paid you $31.00Jane Doe paid you$31.00 NOTESee transaction..."
-# so we anchor on the LAST "$X.XX" before "See transaction" by forbidding
-# "$" inside the captured note. We also allow zero whitespace between the
-# note and "See transaction" since the fixtures lack a separator there.
-NOTE_RE = re.compile(
-    r"\$\s*[\d,]+\.\d{2}\s+(?P<note>[^$]+?)\s*See\s+transaction",
-    re.IGNORECASE | re.DOTALL,
-)
+# For finding "$X.XX" anchors anywhere in the body (used by note extraction below)
+AMOUNT_ANCHOR_RE = re.compile(r"\$\s*[\d,]+\.\d{2}")
+# No word boundary before "See" — real fixtures have "HamSee transaction" (no space)
+SEE_TRANSACTION_RE = re.compile(r"See\s+transaction", re.I)
 
 # Body-fallback direction (when subject isn't passed)
 DIRECTION_PATTERNS = [
@@ -92,12 +85,26 @@ def extract_amount_cents_from_body(body: str) -> int | None:
 
 
 def extract_note_from_body(body: str) -> str:
-    """Note appears between the amount and 'See transaction' in the body."""
-    m = NOTE_RE.search(body)
-    if m:
-        note = m.group("note").strip()
-        if 1 <= len(note) <= 300:
-            return note
+    """Note appears between the last '$X.XX' anchor and 'See transaction'.
+
+    Body shape varies — observed fixtures repeat the subject-like prefix
+    ("Jane Doe paid you $31.00") multiple times before the real note:
+      "...paid you $31.00 Jane Doe paid you $31.00Jane Doe paid you$31.00 NOTESee transaction..."
+
+    To handle this AND preserve notes that themselves contain '$' (common
+    on Venmo — "owes $5", "$5 each", etc.), we anchor on the LAST $X.XX
+    occurring before "See transaction" rather than the first.
+    """
+    see_match = SEE_TRANSACTION_RE.search(body)
+    if not see_match:
+        return ""
+    prefix = body[: see_match.start()]
+    anchors = list(AMOUNT_ANCHOR_RE.finditer(prefix))
+    if not anchors:
+        return ""
+    note = prefix[anchors[-1].end() : see_match.start()].strip()
+    if 1 <= len(note) <= 300:
+        return note
     return ""
 
 

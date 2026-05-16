@@ -58,3 +58,23 @@ def test_parse_falls_back_to_body_when_no_subject():
     # Body contains "Jane Doe paid you $31.00" — body-only path should still work
     assert result["amount_cents"] == 3100
     assert result["direction"] == "received"
+
+
+def test_extract_note_preserves_dollar_signs_in_note():
+    """Notes commonly contain '$' (split-the-bill, '$5 each', etc.).
+    The extractor must anchor on the LAST $X.XX before 'See transaction',
+    so $-containing notes survive intact."""
+    body = "Jane Doe paid you $5.00 Jane Doe paid you $5.00 owes $2 still + tip See transaction"
+    assert venmo.extract_note_from_body(body) == "owes $2 still + tip"
+
+
+def test_extract_note_handles_duplicated_headline_prefix():
+    """Body has the headline repeated 2-3 times before the real note —
+    extractor anchors on the LAST occurrence."""
+    body = "X paid you $10.00 X paid you $10.00X paid you$10.00 actual note See transaction"
+    assert venmo.extract_note_from_body(body) == "actual note"
+
+
+def test_extract_note_returns_empty_when_no_see_transaction():
+    body = "Jane Doe paid you $5.00 some text without the sentinel"
+    assert venmo.extract_note_from_body(body) == ""
