@@ -35,39 +35,49 @@ _W_PAYEE  = 0.20
 _W_MEMO   = 0.10
 
 # Tuning knobs.
-_AMOUNT_CAP_CENTS = 1000   # $10 — diffs beyond this score 0
+_AMOUNT_CAP_CENTS = 1000   # $10 absolute cap on tolerance
+_AMOUNT_PCT_CAP = 0.10     # ±10% of order total
 _DATE_WINDOW_DAYS = 14     # date diffs beyond this kill the score
 
 
 def _amount_score(order_total_cents: int, txn_amount_cents: int) -> float:
-    """Linear falloff from 1.0 at exact match to 0.0 at a $10 difference.
+    """Linear falloff from 1.0 at exact match to 0.0 at the tolerance edge.
 
-    YNAB amounts are negative (outflow); the order total is positive. We
-    compare absolute values so the caller does not have to flip signs.
+    Tolerance per spec: min(10% of order total, $10). So a $47 order
+    tolerates ±$4.70, while a $500 order tolerates ±$10 (capped).
+    YNAB amounts are negative (outflow); we compare absolute values.
     """
-    diff = abs(abs(txn_amount_cents) - abs(order_total_cents))
+    o = abs(order_total_cents)
+    diff = abs(abs(txn_amount_cents) - o)
     if diff == 0:
         return 1.0
-    if diff >= _AMOUNT_CAP_CENTS:
+    tolerance = min(int(o * _AMOUNT_PCT_CAP), _AMOUNT_CAP_CENTS)
+    if tolerance == 0 or diff >= tolerance:
         return 0.0
-    return 1.0 - (diff / _AMOUNT_CAP_CENTS)
+    return 1.0 - (diff / tolerance)
 
 
 def _date_score(order_date, txn_date) -> float:
-    """1.0 same day, linear to 0.0 at 14 days apart."""
-    diff_days = abs((txn_date - order_date).days)
-    if diff_days >= _DATE_WINDOW_DAYS:
+    """1.0 same day, linear to 0.0 at 14 days. Charges before the order
+    date (txn < order) score 0 — Amazon doesn't bill before ordering.
+    """
+    delta_days = (txn_date - order_date).days
+    if delta_days < 0 or delta_days >= _DATE_WINDOW_DAYS:
         return 0.0
-    return 1.0 - (diff_days / _DATE_WINDOW_DAYS)
+    return 1.0 - (delta_days / _DATE_WINDOW_DAYS)
 
 
 def _payee_score(payee: str, source: str) -> float:
-    """1.0 if the source-specific regex hits, 0.5 fallback otherwise."""
+    """1.0 if the source-specific regex hits, 0.0 otherwise.
+
+    Unknown sources score 0 (fail closed) rather than a neutral 0.5 —
+    we'd rather miss a match than auto-link the wrong payee.
+    """
     if not payee:
         return 0.0
     pattern = _PAYEE_PATTERNS.get(source)
     if pattern is None:
-        return 0.5
+        return 0.0
     return 1.0 if pattern.search(payee) else 0.0
 
 
