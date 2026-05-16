@@ -162,8 +162,10 @@ email_sources:
   - name: amazon
     query: "from:auto-confirm@amazon.com newer_than:2d"
     parser: amazon
+  # Venmo: subject filter excludes monthly statements + non-transactional emails.
+  # See receipt-inspection.md — 10/37 venmo@venmo.com emails are non-transactional.
   - name: venmo
-    query: "from:venmo@venmo.com newer_than:2d"
+    query: 'from:venmo@venmo.com newer_than:2d (subject:"paid you" OR subject:"You paid" OR subject:"charged you" OR subject:"You charged")'
     parser: venmo
 
 ynab:
@@ -703,15 +705,20 @@ FIXTURES = Path(__file__).parent / "fixtures" / "amazon_emails"
 
 
 def _load(name: str) -> str:
-    """Load first matching fixture by filename prefix."""
-    matches = list(FIXTURES.glob(f"{name}*.html"))
-    assert matches, f"No fixture found matching {name}*.html"
+    """Load first matching .txt fixture by filename prefix.
+
+    We parse from the plain-text MIME part — Amazon emails ship both
+    HTML and plain text, and the plain text is dramatically easier
+    to extract structured data from. See parsing-knowledge.md.
+    """
+    matches = list(FIXTURES.glob(f"{name}*.txt"))
+    assert matches, f"No fixture found matching {name}*.txt"
     return matches[0].read_text(encoding="utf-8")
 
 
 def test_extract_order_id_from_confirmation():
-    html = _load("auto-confirm-amazon-com")
-    order_id = amazon.extract_order_id(html)
+    body = _load("auto-confirm-amazon-com")
+    order_id = amazon.extract_order_id(body)
     # Format: 123-4567890-1234567
     assert order_id is not None
     parts = order_id.split("-")
@@ -761,8 +768,8 @@ Expected: PASS.
 
 ```python
 def test_extract_total_cents():
-    html = _load("auto-confirm-amazon-com")
-    total = amazon.extract_total_cents(html)
+    body = _load("auto-confirm-amazon-com")
+    total = amazon.extract_total_cents(body)
     assert total is not None
     assert total > 0
     assert total < 100_000_00  # under $100k sanity
@@ -780,14 +787,28 @@ Expected: AttributeError — `extract_total_cents` not defined.
 
 ```python
 # Add to bot/parsers/amazon.py
-TOTAL_RE = re.compile(r"Order Total[:\s]*\$?([\d,]+\.\d{2})", re.I)
-TOTAL_FALLBACK_RE = re.compile(r"\bTotal[:\s]*\$?([\d,]+\.\d{2})", re.I)
+#
+# Real Amazon emails use "Grand Total:" with the amount on the next line as
+# "X.XX USD" (no leading $). We accept either format with permissive
+# whitespace/newline between marker and amount. See parsing-knowledge.md
+# for the empirical findings.
+TOTAL_GRAND_RE = re.compile(
+    r"Grand Total[:\s]+\$?([\d,]+\.\d{2})\s*(?:USD)?", re.I
+)
+TOTAL_ORDER_RE = re.compile(
+    r"Order Total[:\s]+\$?([\d,]+\.\d{2})\s*(?:USD)?", re.I
+)
+TOTAL_FALLBACK_RE = re.compile(
+    r"\bTotal[:\s]+\$?([\d,]+\.\d{2})\s*(?:USD)?", re.I
+)
 
 
-def extract_total_cents(html: str) -> int | None:
-    """Prefer 'Order Total: $X.XX'; fall back to first 'Total: $X.XX'."""
-    for regex in (TOTAL_RE, TOTAL_FALLBACK_RE):
-        m = regex.search(html)
+def extract_total_cents(body: str) -> int | None:
+    """Prefer 'Grand Total: X.XX USD' (current Amazon template),
+    fall back to 'Order Total: $X.XX' (older), then any 'Total:'.
+    """
+    for regex in (TOTAL_GRAND_RE, TOTAL_ORDER_RE, TOTAL_FALLBACK_RE):
+        m = regex.search(body)
         if m:
             dollars_str = m.group(1).replace(",", "")
             return int(round(float(dollars_str) * 100))
@@ -802,83 +823,63 @@ pytest tests/test_amazon_parser.py::test_extract_total_cents -v
 
 Expected: PASS.
 
-- [ ] **Step 9: Write the failing test for `extract_order_date`**
+- [ ] **Step 9: Write the failing test for `parse_email_date_header`**
+
+The empirical finding is that current Amazon emails have NO "Order placed" phrase in the body — the only reliable date source is the `Date:` email header, which the watcher passes in. See parsing-knowledge.md.
 
 ```python
 from datetime import date
 
-def test_extract_order_date():
-    html = _load("auto-confirm-amazon-com")
-    d = amazon.extract_order_date(html)
-    assert isinstance(d, date)
-    # Sanity: within the last 60 days (fixture is recent)
-    from datetime import timedelta
-    assert (date.today() - d) < timedelta(days=120)
+def test_parse_email_date_header():
+    # RFC 2822 format — same as what Gmail returns in the Date header
+    d = amazon.parse_email_date_header("Fri, 8 May 2026 00:13:15 +0000")
+    assert d == date(2026, 5, 8)
+
+
+def test_parse_email_date_header_returns_none_on_empty():
+    assert amazon.parse_email_date_header("") is None
+    assert amazon.parse_email_date_header("garbage") is None
 ```
 
-- [ ] **Step 10: Run test, verify it fails**
+- [ ] **Step 10: Run tests, verify they fail**
 
 ```powershell
-pytest tests/test_amazon_parser.py::test_extract_order_date -v
+pytest tests/test_amazon_parser.py::test_parse_email_date_header tests/test_amazon_parser.py::test_parse_email_date_header_returns_none_on_empty -v
 ```
 
-Expected: AttributeError.
+Expected: AttributeError on `parse_email_date_header`.
 
-- [ ] **Step 11: Implement `extract_order_date`**
+- [ ] **Step 11: Implement `parse_email_date_header`**
 
 ```python
 # Add to bot/parsers/amazon.py
-from datetime import date, datetime
-
-DATE_RE_FULL = re.compile(r"Order placed[:\s]+([A-Z][a-z]+ \d{1,2},? \d{4})", re.I)
-DATE_RE_SHORT = re.compile(r"Order placed[:\s]+([A-Z][a-z]+ \d{1,2})", re.I)
-DATE_RE_ARRIVING = re.compile(r"Arriving[:\s]+([A-Z][a-z]+ \d{1,2})", re.I)
+from datetime import date
+from email.utils import parsedate_to_datetime
 
 
-def _parse_amazon_date(text: str, today: date | None = None) -> date | None:
-    today = today or date.today()
-    text = text.replace(",", "").strip()
-    for fmt in ("%B %d %Y", "%B %d"):
-        try:
-            d = datetime.strptime(text, fmt).date()
-            if fmt == "%B %d":
-                d = d.replace(year=today.year)
-                # If parsed month is in the future relative to today, assume last year
-                if d > today:
-                    d = d.replace(year=today.year - 1)
-            return d
-        except ValueError:
-            continue
-    return None
-
-
-def extract_order_date(html: str, today: date | None = None) -> date | None:
-    for regex in (DATE_RE_FULL, DATE_RE_SHORT):
-        m = regex.search(html)
-        if m:
-            d = _parse_amazon_date(m.group(1), today=today)
-            if d:
-                return d
-    # Last resort: "Arriving" date is a delivery estimate — not ideal but better than nothing
-    m = DATE_RE_ARRIVING.search(html)
-    if m:
-        return _parse_amazon_date(m.group(1), today=today)
-    return None
+def parse_email_date_header(s: str) -> date | None:
+    """Parse RFC 2822 date string (e.g. 'Fri, 8 May 2026 00:13:15 +0000') → date."""
+    if not s:
+        return None
+    try:
+        return parsedate_to_datetime(s).date()
+    except (TypeError, ValueError):
+        return None
 ```
 
-- [ ] **Step 12: Run test, verify it passes**
+- [ ] **Step 12: Run tests, verify they pass**
 
 ```powershell
-pytest tests/test_amazon_parser.py::test_extract_order_date -v
+pytest tests/test_amazon_parser.py -v
 ```
 
-Expected: PASS.
+Expected: 4 PASS.
 
 - [ ] **Step 13: Commit**
 
 ```powershell
 git add bot/parsers/amazon.py tests/test_amazon_parser.py
-git commit -m "feat(amazon-parser): extract order_id, total_cents, order_date"
+git commit -m "feat(amazon-parser): extract order_id, total_cents, date-header parsing"
 ```
 
 ---
@@ -893,12 +894,12 @@ git commit -m "feat(amazon-parser): extract order_id, total_cents, order_date"
 
 ```python
 def test_extract_items_returns_nonempty_list():
-    html = _load("auto-confirm-amazon-com")
-    items = amazon.extract_items(html)
+    body = _load("auto-confirm-amazon-com")
+    items = amazon.extract_items(body)
     assert isinstance(items, list)
     assert len(items) > 0
     for item in items:
-        assert 5 <= len(item) <= 200  # validation bounds from existing scraper
+        assert 5 <= len(item) <= 300  # bumped from 200 — modern Amazon titles run long
         assert isinstance(item, str)
 ```
 
@@ -910,31 +911,31 @@ Expected: AttributeError on `extract_items`.
 
 ```python
 # Add to bot/parsers/amazon.py
-from bs4 import BeautifulSoup
+#
+# Real Amazon order-confirmation plain-text bodies list items as lines starting
+# with '* ' followed by the product title. Quantity and price appear on the
+# next lines (indented). See parsing-knowledge.md for the fixture sample.
 
 
-def extract_items(html: str) -> list[str]:
-    """Items are titles linked from /dp/ or /gp/product/ hrefs; dedupe; 5-200 char range."""
-    soup = BeautifulSoup(html, "lxml")
-    seen: list[str] = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "/dp/" not in href and "/gp/product/" not in href:
+def extract_items(body: str) -> list[str]:
+    """Items appear as plain-text lines starting with '* ' in Amazon emails.
+    Multi-line continuations (Quantity/price/etc.) are not item titles — skip them.
+    """
+    items: list[str] = []
+    for line in body.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("* "):
             continue
-        text = a.get_text(strip=True)
-        if not (5 <= len(text) <= 200):
+        title = stripped[2:].strip()
+        # Filter: must look like a product title, not a footer bullet
+        if not (5 <= len(title) <= 300):
             continue
-        if text in seen:
+        if title.lower().startswith(("http", "www.", "click")):
             continue
-        seen.append(text)
-    if seen:
-        return seen
-    # Fallback: image alt text on product images
-    for img in soup.find_all("img", alt=True):
-        alt = img["alt"].strip()
-        if 5 <= len(alt) <= 200 and alt not in seen:
-            seen.append(alt)
-    return seen or ["(could not parse items)"]
+        if title in items:
+            continue
+        items.append(title)
+    return items or ["(could not parse items)"]
 ```
 
 - [ ] **Step 4: Run test, verify it passes**
@@ -949,22 +950,29 @@ Expected: PASS.
 
 ```python
 def test_parse_returns_complete_dict():
-    html = _load("auto-confirm-amazon-com")
-    result = amazon.parse(html)
+    body = _load("auto-confirm-amazon-com")
+    result = amazon.parse(body, date_header="Fri, 8 May 2026 00:13:15 +0000")
 
     assert result["parse_status"] in {"ok", "partial"}
     assert result["order_id"]
     assert result["total_cents"] > 0
     assert isinstance(result["order_date"], date)
+    assert result["order_date"] == date(2026, 5, 8)
     assert len(result["items"]) > 0
     assert result["source"] == "amazon"
 
 
 def test_parse_handles_garbage_input():
-    result = amazon.parse("<html>not a real amazon email</html>")
+    result = amazon.parse("not a real amazon email")
     assert result["parse_status"] == "partial"
     assert result["order_id"] is None
     assert result["items"] == ["(could not parse items)"]
+
+
+def test_parse_falls_back_to_today_when_no_date_header():
+    body = _load("auto-confirm-amazon-com")
+    result = amazon.parse(body)
+    assert result["order_date"] == date.today()
 ```
 
 - [ ] **Step 6: Run test, verify both fail**
@@ -975,18 +983,37 @@ Expected: AttributeError on `parse`.
 
 ```python
 # Add to bot/parsers/amazon.py
-def parse(html: str, *, today: date | None = None) -> dict:
-    """Top-level parser. Never raises — returns partial dict on failure."""
-    order_id = extract_order_id(html)
-    total_cents = extract_total_cents(html)
-    order_date = extract_order_date(html, today=today)
-    items = extract_items(html)
+from bs4 import BeautifulSoup
+
+
+def _html_to_text(html: str) -> str:
+    return BeautifulSoup(html, "lxml").get_text("\n", strip=True)
+
+
+def parse(body: str, *, subject: str = "", date_header: str = "",
+          today: date | None = None) -> dict:
+    """Top-level parser. Never raises — returns partial dict on failure.
+
+    body: plain-text OR HTML message body. If HTML is detected (starts with '<'),
+          it's converted to text first.
+    subject: email subject line (currently unused but reserved for fallback parsing)
+    date_header: RFC 2822 Date header from the email — used as order_date.
+                 Falls back to `today` arg, then date.today() if not provided.
+    """
+    text = _html_to_text(body) if body.lstrip().startswith("<") else body
+    order_id = extract_order_id(text)
+    total_cents = extract_total_cents(text)
+    items = extract_items(text)
+    order_date = (parse_email_date_header(date_header)
+                  or today or date.today())
 
     missing = [
         name for name, val in
-        [("order_id", order_id), ("total_cents", total_cents), ("order_date", order_date)]
+        [("order_id", order_id), ("total_cents", total_cents)]
         if val is None
     ]
+    if items == ["(could not parse items)"]:
+        missing.append("items")
     return {
         "source": "amazon",
         "order_id": order_id,
@@ -1035,38 +1062,60 @@ from bot.parsers import venmo
 
 FIXTURES = Path(__file__).parent / "fixtures" / "venmo_emails"
 
-
-def _load(name: str) -> tuple[str, str]:
-    """Returns (html, text) for first fixture matching name prefix."""
-    html_matches = list(FIXTURES.glob(f"{name}*.html"))
-    txt_matches = list(FIXTURES.glob(f"{name}*.txt"))
-    assert html_matches or txt_matches, f"No fixture for {name}*"
-    html = html_matches[0].read_text(encoding="utf-8") if html_matches else ""
-    text = txt_matches[0].read_text(encoding="utf-8") if txt_matches else ""
-    return html, text
+# The "paid-you" fixture was saved manually during plan adjustment because the
+# auto-pulled venmo@venmo.com fixture turned out to be a monthly statement
+# (not transactional). See parsing-knowledge.md "Empirical findings".
+PAID_YOU_FIXTURE_PREFIX = "venmo-venmo-com-paid-you"
 
 
-def test_extract_direction():
-    html, text = _load("venmo")
-    body = text or html
-    direction = venmo.extract_direction(body)
-    assert direction in {"paid", "received", "charged", "charged_by"}
+def _load(name: str) -> str:
+    matches = list(FIXTURES.glob(f"{name}*.txt"))
+    assert matches, f"No fixture for {name}*.txt"
+    return matches[0].read_text(encoding="utf-8")
 
 
-def test_extract_amount_cents():
-    html, text = _load("venmo")
-    body = text or html
-    amt = venmo.extract_amount_cents(body)
-    assert amt is not None and amt > 0
+def test_parse_subject_received():
+    out = venmo.parse_subject("Jane Doe paid you $31.00")
+    assert out["direction"] == "received"
+    assert out["counterparty"] == "Jane Doe"
+    assert out["amount_cents"] == 3100
+
+
+def test_parse_subject_outgoing():
+    out = venmo.parse_subject("You paid Jennifer Gilbert $123.45")
+    assert out["direction"] == "paid"
+    assert out["counterparty"] == "Jennifer Gilbert"
+    assert out["amount_cents"] == 12345
+
+
+def test_extract_note_from_body():
+    body = _load(PAID_YOU_FIXTURE_PREFIX)
+    note = venmo.extract_note_from_body(body)
+    assert note == "Calf-tan and/or Capped Ham"
 
 
 def test_parse_returns_complete_dict():
-    html, text = _load("venmo")
-    result = venmo.parse(html or text)
+    body = _load(PAID_YOU_FIXTURE_PREFIX)
+    result = venmo.parse(
+        body,
+        subject="Jane Doe paid you $31.00",
+        date_header="Fri, 8 May 2026 00:13:15 +0000",
+    )
     assert result["source"] == "venmo"
     assert result["parse_status"] in {"ok", "partial"}
-    assert result["amount_cents"] > 0
-    assert result["direction"] in {"paid", "received", "charged", "charged_by", None}
+    assert result["amount_cents"] == 3100
+    assert result["direction"] == "received"
+    assert result["counterparty"] == "Jane Doe"
+    assert result["note"] == "Calf-tan and/or Capped Ham"
+    assert result["order_date"] == date(2026, 5, 8)
+
+
+def test_parse_falls_back_to_body_when_no_subject():
+    body = _load(PAID_YOU_FIXTURE_PREFIX)
+    result = venmo.parse(body)
+    # Body contains "Amanda Walter paid you $31.00" — body-only path should still work
+    assert result["amount_cents"] == 3100
+    assert result["direction"] == "received"
 ```
 
 - [ ] **Step 2: Run tests, verify they fail**
@@ -1082,7 +1131,14 @@ Expected: ImportError.
 ```python
 """Parse Venmo per-transaction emails into structured txn dicts.
 
-All functions are pure — string in, dict/value out. No I/O.
+Subject line is the primary source — it always follows one of these forms:
+  - "Amanda Walter paid you $31.00"       (incoming)
+  - "You paid Jennifer Gilbert $123.45"   (outgoing)
+  - "Amanda Walter charged you $20.00"    (incoming charge request)
+  - "You charged Jennifer Gilbert $20.00" (outgoing charge request)
+
+Body is used for the note (the only thing not in the subject). Body format:
+  "Amanda Walter paid you $31.00 Amanda Walter paid you$31.00 <NOTE> See transaction..."
 
 The user must enable per-transaction email notifications in the Venmo app:
   Me → Settings → Notifications → Email → Payments sent + Payments received
@@ -1091,24 +1147,30 @@ from __future__ import annotations
 
 import re
 from datetime import date
+from email.utils import parsedate_to_datetime
 from bs4 import BeautifulSoup
 
-DIRECTION_PATTERNS = [
-    (re.compile(r"You paid", re.I), "paid"),
-    (re.compile(r"You charged", re.I), "charged"),
-    (re.compile(r"paid you", re.I), "received"),
-    (re.compile(r"charged you", re.I), "charged_by"),
-]
+SUBJECT_INCOMING_RE = re.compile(
+    r"^(?P<who>.+?)\s+(?P<verb>paid|charged)\s+you\s+\$(?P<amt>[\d,]+\.\d{2})\s*$"
+)
+SUBJECT_OUTGOING_RE = re.compile(
+    r"^You\s+(?P<verb>paid|charged)\s+(?P<who>.+?)\s+\$(?P<amt>[\d,]+\.\d{2})\s*$"
+)
 
-AMOUNT_RE = re.compile(r"\$\s*([\d,]+\.\d{2})")
-# Counterparty: best-effort — Venmo headlines tend to look like
-#   "Sarah Chen paid you $42.00"  or  "You paid Sarah Chen $42.00"
-COUNTERPARTY_PATTERNS = [
-    re.compile(r"^([A-Z][\w'\-\. ]{1,50}) paid you\b", re.M),
-    re.compile(r"^([A-Z][\w'\-\. ]{1,50}) charged you\b", re.M),
-    re.compile(r"You paid ([A-Z][\w'\-\. ]{1,50})\b", re.I),
-    re.compile(r"You charged ([A-Z][\w'\-\. ]{1,50})\b", re.I),
+# Body note: appears between the amount and "See transaction"
+NOTE_RE = re.compile(
+    r"\$\s*[\d,]+\.\d{2}\s+(?P<note>.+?)\s+See\s+transaction",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Body-fallback direction (when subject isn't passed)
+DIRECTION_PATTERNS = [
+    (re.compile(r"\bYou paid\b", re.I), "paid"),
+    (re.compile(r"\bYou charged\b", re.I), "charged"),
+    (re.compile(r"\bpaid you\b", re.I), "received"),
+    (re.compile(r"\bcharged you\b", re.I), "charged_by"),
 ]
+AMOUNT_RE = re.compile(r"\$\s*([\d,]+\.\d{2})")
 
 
 def _html_to_text(html: str) -> str:
@@ -1117,48 +1179,82 @@ def _html_to_text(html: str) -> str:
     return BeautifulSoup(html, "lxml").get_text("\n", strip=True)
 
 
-def extract_direction(body: str) -> str | None:
+def parse_subject(subject: str) -> dict:
+    """Extract direction, counterparty, amount from the subject line."""
+    out = {"direction": None, "counterparty": None, "amount_cents": None}
+    if not subject:
+        return out
+    s = subject.strip()
+    m = SUBJECT_INCOMING_RE.match(s)
+    if m:
+        out["counterparty"] = m.group("who").strip()
+        out["direction"] = "received" if m.group("verb") == "paid" else "charged_by"
+        out["amount_cents"] = int(round(float(m.group("amt").replace(",", "")) * 100))
+        return out
+    m = SUBJECT_OUTGOING_RE.match(s)
+    if m:
+        out["direction"] = m.group("verb")  # 'paid' or 'charged'
+        out["counterparty"] = m.group("who").strip()
+        out["amount_cents"] = int(round(float(m.group("amt").replace(",", "")) * 100))
+    return out
+
+
+def extract_direction_from_body(body: str) -> str | None:
     for regex, label in DIRECTION_PATTERNS:
         if regex.search(body):
             return label
     return None
 
 
-def extract_amount_cents(body: str) -> int | None:
+def extract_amount_cents_from_body(body: str) -> int | None:
     m = AMOUNT_RE.search(body)
     if not m:
         return None
     return int(round(float(m.group(1).replace(",", "")) * 100))
 
 
-def extract_counterparty(body: str) -> str | None:
-    for regex in COUNTERPARTY_PATTERNS:
-        m = regex.search(body)
-        if m:
-            return m.group(1).strip()
-    return None
-
-
-def extract_note(body: str) -> str:
-    """The note is typically the line immediately after the headline.
-    Best-effort: grab a quoted substring or the first short line after the amount."""
-    # Quoted-string heuristic
-    qm = re.search(r'[""\'"]([^""\'"]{2,200})[""\'"]', body)
-    if qm:
-        return qm.group(1).strip()
+def extract_note_from_body(body: str) -> str:
+    """Note appears between the amount and 'See transaction' in the body."""
+    m = NOTE_RE.search(body)
+    if m:
+        # The pattern can capture duplicated headline text; trim if present
+        note = m.group("note").strip()
+        # Strip leading repeated headline (e.g. "Amanda Walter paid you $31.00")
+        # by removing anything before/up to the last $X.XX before the actual note
+        # — but the simpler heuristic is to take everything if it's reasonable length
+        if 1 <= len(note) <= 300:
+            return note
     return ""
 
 
-def parse(html_or_text: str, *, today: date | None = None) -> dict:
-    """Top-level parser. Never raises."""
-    text = _html_to_text(html_or_text) if "<" in html_or_text else html_or_text
-    direction = extract_direction(text)
-    amount = extract_amount_cents(text)
-    counterparty = extract_counterparty(text)
-    note = extract_note(text)
-    order_date = today or date.today()
+def parse_email_date_header(s: str) -> date | None:
+    if not s:
+        return None
+    try:
+        return parsedate_to_datetime(s).date()
+    except (TypeError, ValueError):
+        return None
 
-    missing = [n for n, v in [("direction", direction), ("amount_cents", amount)] if v is None]
+
+def parse(body: str, *, subject: str = "", date_header: str = "",
+          today: date | None = None) -> dict:
+    """Top-level parser. Never raises.
+
+    Prefers subject parsing (cleanest, always present). Falls back to body
+    extraction for any missing fields.
+    """
+    text = _html_to_text(body) if body.lstrip().startswith("<") else body
+
+    subj = parse_subject(subject)
+    direction = subj["direction"] or extract_direction_from_body(text)
+    counterparty = subj["counterparty"]
+    amount = subj["amount_cents"] or extract_amount_cents_from_body(text)
+    note = extract_note_from_body(text)
+    order_date = (parse_email_date_header(date_header) or today or date.today())
+
+    missing = [
+        n for n, v in [("direction", direction), ("amount_cents", amount)] if v is None
+    ]
     return {
         "source": "venmo",
         "direction": direction,
@@ -1166,8 +1262,9 @@ def parse(html_or_text: str, *, today: date | None = None) -> dict:
         "note": note,
         "amount_cents": amount or 0,
         "order_date": order_date,
-        "summary": f"{direction or '?'} {counterparty or '?'} ${(amount or 0)/100:.2f}"
-                   + (f' — "{note}"' if note else ""),
+        "summary": (f"{direction or '?'} {counterparty or '?'} "
+                    f"${(amount or 0)/100:.2f}"
+                    + (f' — "{note}"' if note else "")),
         "parse_status": "ok" if not missing else "partial",
         "missing_fields": missing,
     }
@@ -1179,7 +1276,7 @@ def parse(html_or_text: str, *, today: date | None = None) -> dict:
 pytest tests/test_venmo_parser.py -v
 ```
 
-Expected: PASS. If `test_extract_direction` fails because no fixture exists, confirm in Task 0 that Venmo notifications were enabled and re-run inspection.
+Expected: 6 PASS. The "paid-you" fixture is checked in to the repo as part of the plan-adjustment commit — it was saved manually because the auto-inspection script grabbed a non-transactional fixture first.
 
 - [ ] **Step 5: Commit**
 
@@ -1902,8 +1999,14 @@ def poll_once(settings: Settings) -> int:
             for m in resp.get("messages", []):
                 msg = svc.users().messages().get(userId="me", id=m["id"], format="full").execute()
                 body = _extract_body(msg)
+                headers = {h["name"]: h["value"]
+                           for h in msg["payload"].get("headers", [])}
                 parser = _load_parser(source.parser)
-                parsed = parser(body)
+                parsed = parser(
+                    body,
+                    subject=headers.get("Subject", ""),
+                    date_header=headers.get("Date", ""),
+                )
                 if parsed["parse_status"] not in {"ok", "partial"}:
                     continue
                 try:

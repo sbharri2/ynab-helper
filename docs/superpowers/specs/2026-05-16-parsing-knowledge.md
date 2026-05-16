@@ -125,6 +125,51 @@ Web scrapers fail constantly because pages change — emails are more stable (Am
 
 ---
 
+## Empirical findings (2026-05-16 inspection of sbharri2@gmail.com)
+
+Ran `scripts/inspect_receipts.py` against the live inbox. Results updated the parser plan in `docs/superpowers/plans/2026-05-16-ynab-helper-mvp1.md`.
+
+### Amazon — verified senders (60-day window, 50 emails)
+
+| Sender | Count | Role | Has order_id | Has total | Has /dp/ link |
+|---|---|---|---|---|---|
+| `order-update@amazon.com` | 13 | "Delivered" emails — has order_id, no total | 13/13 | 0/13 | 0/13 |
+| `shipment-tracking@amazon.com` | 12 | "Shipped" emails — has order_id + total (could be fallback) | 12/12 | 12/12 | 0/12 |
+| `auto-confirm@amazon.com` | 9 | **PRIMARY — order confirmation** | 9/9 | 9/9 | 0/9 |
+| `marketplace-messages@amazon.com` | 6 | 3rd-party seller messages (skip) | 6/6 | 0/6 | 0/6 |
+| `store-news@amazon.com` | 6 | Marketing (skip) | 0/6 | 0/6 | 0/6 |
+| `no-reply@amazon.com` | 3 | Misc account notifications | 0/3 | 0/3 | 0/3 |
+
+### Amazon — actual parsing patterns (verified against real fixture)
+
+- **Total marker is `Grand Total:` followed by `X.XX USD`** — NOT `Order Total: $X.XX`
+- **No "Order placed" date phrase in body** — must use the email's `Date:` header
+- **Items are plain-text lines starting with `* `** — NOT `<a href="/dp/...">` links
+- **Quantity follows on next line as `  Quantity: N`**
+- **Item price follows as `  X.XX USD`**
+- **Subject contains first item title: `Ordered: "TORRAS Ultra-Magnetic..."`** — useful fallback
+
+### Venmo — verified senders (60-day window, 50 emails)
+
+| Sender | Count | Role | Has direction phrase |
+|---|---|---|---|
+| `venmo@venmo.com` | 37 | **PRIMARY — transactional**, but 10/37 are monthly statements / non-transactional | 27/37 |
+| `venmo@email.venmo.com` | 13 | Marketing only ("Add money", "Beauty, brunch", debit card offers) | 0/13 |
+
+**Filter recommendation:** Use Gmail query
+`from:venmo@venmo.com (subject:"paid you" OR subject:"You paid" OR subject:"charged")`
+to skip the monthly-statement noise.
+
+### Venmo — actual parsing patterns (verified against real "paid you" fixture)
+
+- **Subject line is the cleanest source**: `Amanda Walter paid you $31.00` contains direction + counterparty + amount, all in one line
+- **Body repeats subject** plus the note (e.g., `Calf-tan and/or Capped Ham`) immediately after the amount, before `See transaction`
+- **No quoted-string format for notes** — must extract between amount and `See transaction` / `Money credited`
+- **Transaction ID is in body** (`Transaction ID 4592185697256829017`) — could serve as `external_id`
+- **Transaction date is in body** (`Date May 07, 2026`) — but email Date header is reliable enough
+
+---
+
 ## What still needs live validation
 
 The above is reasoning from web-scraper code. Confirming against actual emails requires the OAuth re-auth and `scripts/inspect_receipts.py` run, which is blocked on the user's desktop access. Things to specifically verify when unblocked:

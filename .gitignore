@@ -40,5 +40,10 @@ logs/
 # Receipt inspection output (contains personal email data)
 receipt-inspection.md
 receipt-inspection.txt
-tests/fixtures/amazon_emails/
-tests/fixtures/venmo_emails/
+tests/fixtures/amazon_emails/*
+tests/fixtures/venmo_emails/*
+
+# ...but allow committed synthetic test fixtures (redacted, used by parser tests)
+!tests/fixtures/venmo_emails/venmo-venmo-com-paid-you_*.txt
+!tests/fixtures/amazon_emails/.gitkeep
+!tests/fixtures/venmo_emails/.gitkeep
