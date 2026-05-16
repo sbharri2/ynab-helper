@@ -1,139 +1,84 @@
-# YNAB Helper - Amazon Scraper Chrome Extension
+# YNAB Helper
 
-A Chrome extension that scrapes Amazon order history and exports data to CSV for easy import into YNAB (You Need A Budget).
+Personal Telegram assistant that categorizes YNAB transactions while purchases are still fresh in memory. Pulls Amazon and Venmo receipts from Gmail in real time, asks for daily review on everything else, suggests categories using a local LLM (Ollama), and writes the chosen category back to YNAB via API.
 
-## Features
+See `docs/superpowers/specs/2026-05-16-ynab-helper-design.md` for the full design.
 
-- Scrape Amazon order history directly from the browser
-- Filter orders by date range (30 days, 90 days, 1 year, or all)
-- Preview scraped orders in the popup
-- Export to CSV format compatible with YNAB
-- Cache results for quick access
-- Clean, minimal UI
+## Status
 
-## Installation
+- MVP-1 (Steven's flow): in development per `docs/superpowers/plans/2026-05-16-ynab-helper-mvp1.md`
+- MVP-2 (wife's Gmail): planned
+- MVP-3 (weekly digest): planned
 
-### Development Mode
+## Architecture
 
-1. Download or clone this repository to your local machine
-2. Open Chrome and navigate to `chrome://extensions/`
-3. Enable "Developer mode" (toggle in top-right corner)
-4. Click "Load unpacked"
-5. Select the `ynab_helper` folder
-6. The extension should now appear in your extensions list
+- **gmail_watcher** (scheduled, every 5 min) — polls Gmail for new Amazon/Venmo emails, parses, queues
+- **ynab_watcher** (scheduled, every 30 min) — matches pending categorized orders to new YNAB charges, queues non-Amazon/Venmo for daily digest
+- **telegram_bot** (long-running) — pushes items to user, parses replies, applies categories
+- **categorizer** (Ollama HTTP) — local LLM suggests YNAB category from items + history
+- **matcher** — pure scoring function linking emails to YNAB charges
 
-### Adding Icons
+## Requirements (deployment machine)
 
-Before using the extension, you'll need to add icon files to the `icons` folder:
-- Create a folder named `icons` in the extension directory
-- Add three PNG images:
-  - `icon16.png` (16x16 pixels)
-  - `icon48.png` (48x48 pixels)
-  - `icon128.png` (128x128 pixels)
+- Windows 10+, Python 3.12+
+- Ollama installed and a model pulled (e.g. `ollama pull qwen2.5:14b`)
+- Telegram bot created via BotFather (free)
+- YNAB Personal Access Token
+- Gmail account with OAuth approved for the bot
 
-You can create simple placeholder icons or design custom ones. The icons represent the extension in various places in Chrome.
+## Setup
 
-## Usage
+```powershell
+git clone <repo>
+cd ynab-helper
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e ".[dev]"
 
-1. Navigate to Amazon Order History:
-   - Go to Amazon.com
-   - Click "Returns & Orders" in the top navigation
-   - You should be on a URL like: `https://www.amazon.com/gp/css/order-history`
+# Auth Gmail (browser popup):
+python scripts\reauth_gmail.py
 
-2. Click the YNAB Helper extension icon in your Chrome toolbar
+# Validate parsing assumptions against your actual inbox:
+python scripts\inspect_receipts.py
 
-3. Select your desired date range from the dropdown (default: 90 days)
+# Capture YNAB + Telegram tokens, pick budget, get chat_id:
+python scripts\first_run_setup.py
 
-4. Click "Fetch Orders" to scrape the current page
+# Install Windows scheduled tasks (admin PowerShell):
+.\scripts\setup_scheduled_tasks.ps1
 
-5. Preview the first 10 orders in the popup table
+# Verify Ollama running:
+ollama list
+```
 
-6. Click "Export CSV" to download a CSV file with all scraped orders
+## Running
 
-## CSV Format
+After `setup_scheduled_tasks.ps1`:
+- `YNAB-Helper-GmailWatcher` runs every 5 min
+- `YNAB-Helper-YnabWatcher` runs every 30 min
+- `YNAB-Helper-Bot` runs at logon and restarts on failure
 
-The exported CSV includes the following columns:
-- **Date**: Order date in MM/DD/YYYY format
-- **Order ID**: Amazon order number
-- **Items**: Semicolon-separated list of items in the order
-- **Item Count**: Number of items in the order
-- **Total**: Order total amount
-- **Currency**: Currency code (default: USD)
+Check via `taskschd.msc`.
 
-## Importing to YNAB
+## Testing
 
-1. Open the exported CSV in a spreadsheet application
-2. Format the data as needed for YNAB import
-3. Import into YNAB following their CSV import guidelines
+```powershell
+pytest -v
+```
 
-## Limitations
+## Chrome extension (backfill tool)
 
-- Only scrapes orders visible on the current page
-- Amazon's page structure may change, requiring updates to selectors
-- Does not handle pagination automatically (refresh and re-scrape for more orders)
-- Works best with US Amazon (.com), but includes support for .ca and .co.uk domains
+The original Chrome scraper lives in `chrome-extension/` — useful for catching up on historical Amazon orders that the bot wasn't around to see. See `chrome-extension/README.md`.
+
+## Files
+
+- `bot/` — Python source
+- `tests/` — unit tests + fixtures
+- `scripts/` — setup, deployment, validation
+- `chrome-extension/` — legacy Chrome backfill tool
+- `docs/superpowers/specs/` — design + parsing-knowledge docs
+- `docs/superpowers/plans/` — implementation plans
 
 ## Privacy
 
-This extension:
-- Only runs on Amazon order history pages
-- Does not send data to external servers
-- Stores scraped data locally in Chrome storage
-- All processing happens locally in your browser
-
-## Troubleshooting
-
-**No orders found:**
-- Make sure you're on the Amazon Order History page
-- Check that orders are visible on the page (scroll down if needed)
-- Try refreshing the page and running the scraper again
-
-**Missing data:**
-- Amazon's page structure varies; some orders may not parse correctly
-- Check the browser console (F12) for error messages
-- The extension tries multiple selectors but may not catch all variations
-
-**Extension not working:**
-- Reload the extension from `chrome://extensions/`
-- Check that you have the latest version of Chrome
-- Verify all extension files are present and properly loaded
-
-## Development
-
-### File Structure
-
-```
-ynab_helper/
-├── manifest.json              # Extension configuration
-├── popup/
-│   ├── popup.html            # Popup UI
-│   ├── popup.css             # Popup styling
-│   └── popup.js              # Popup logic
-├── content/
-│   └── amazon-scraper.js     # Content script for scraping
-├── background/
-│   └── service-worker.js     # Background service worker
-├── icons/
-│   ├── icon16.png
-│   ├── icon48.png
-│   └── icon128.png
-└── README.md
-```
-
-### Updating Selectors
-
-If Amazon changes their page structure, you may need to update the CSS selectors in `content/amazon-scraper.js`:
-
-- `findOrderCards()`: Selectors for order card containers
-- `extractOrderDate()`: Selectors for order dates
-- `extractOrderId()`: Selectors for order IDs
-- `extractItems()`: Selectors for product titles
-- `extractTotal()`: Selectors for order totals
-
-## License
-
-MIT License - feel free to modify and use as needed.
-
-## Contributing
-
-Contributions welcome! Please feel free to submit pull requests or open issues for bugs and feature requests.
+All processing happens on the local machine. The local Ollama instance is the only AI involved — no transaction data leaves your network. The Gmail OAuth token is stored locally. The YNAB API token is in a gitignored `.env`.
