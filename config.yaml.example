@@ -1,0 +1,33 @@
+# Copy to config.yaml. config.yaml is gitignored.
+gmail_accounts:
+  - email: sbharri2@gmail.com
+    user_id: steven
+    token_path: ~/.google_workspace_mcp/credentials/sbharri2@gmail.com.json
+    chat_id: 0  # set by first_run_setup.py
+
+email_sources:
+  - name: amazon
+    query: "from:auto-confirm@amazon.com newer_than:2d"
+    parser: amazon
+  # Venmo: subject filter excludes monthly statements + non-transactional emails.
+  # See receipt-inspection.md — 10/37 venmo@venmo.com emails are non-transactional.
+  - name: venmo
+    query: 'from:venmo@venmo.com newer_than:2d (subject:"paid you" OR subject:"You paid" OR subject:"charged you" OR subject:"You charged")'
+    parser: venmo
+
+ynab:
+  budget_id: ""  # set by first_run_setup.py
+  poll_interval_minutes: 30
+
+ollama:
+  endpoint: http://localhost:11434
+  model: qwen2.5:14b
+  temperature: 0.3
+
+telegram:
+  quiet_hours: "22:00-07:00"
+  daily_digest_time: "09:00"
+
+paths:
+  database: ./ynab_helper.db
+  log_dir: ./logs
