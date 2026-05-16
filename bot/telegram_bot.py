@@ -23,7 +23,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timezone
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC timestamp (replaces deprecated _utcnow())."""
+    return datetime.now(timezone.utc)
 from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -199,7 +204,7 @@ async def _push_next_item(
               last_asked_id = excluded.last_asked_id,
               last_action_at = excluded.last_action_at
             """,
-            (chat_id, user_id, item["kind"], item["id"], datetime.utcnow()),
+            (chat_id, user_id, item["kind"], item["id"], _utcnow()),
         )
     return True
 
@@ -315,7 +320,7 @@ def _apply_choice(
             con.execute(
                 "UPDATE pending_txn SET chosen_category = ?, "
                 "chosen_at = ?, status = 'categorized' WHERE id = ?",
-                (category_id, datetime.utcnow(), item_id),
+                (category_id, _utcnow(), item_id),
             )
         try:
             ynab = YnabClient(settings.ynab_token, settings.ynab.budget_id)
@@ -531,6 +536,7 @@ def run(settings: Settings | None = None) -> None:
 
     app.add_handler(CommandHandler("start", _start_cmd))
     app.add_handler(CommandHandler("pending", _pending_cmd))
+    app.add_handler(CommandHandler("help", _help_cmd))
     app.add_handler(CallbackQueryHandler(_handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_text))
 
