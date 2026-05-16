@@ -30,3 +30,15 @@ build/
 
 # Test files
 test/
+
+# ynab-helper runtime artifacts
+ynab_helper.db
+ynab_helper.db-journal
+config.yaml
+logs/
+
+# Receipt inspection output (contains personal email data)
+receipt-inspection.md
+receipt-inspection.txt
+tests/fixtures/amazon_emails/
+tests/fixtures/venmo_emails/
