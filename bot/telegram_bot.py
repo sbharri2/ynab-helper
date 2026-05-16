@@ -22,8 +22,9 @@ fully async. The push loop is a normal coroutine spawned via
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 
 
 def _utcnow() -> datetime:
@@ -105,6 +106,29 @@ def _in_quiet_hours(now: datetime, window: str) -> bool:
     return cur >= start or cur < end
 
 
+def _in_digest_window(
+    now: datetime, digest_time_str: str, window_minutes: int = 60
+) -> bool:
+    """True if ``now`` is within ``window_minutes`` after ``digest_time_str``.
+
+    ``digest_time_str`` is "HH:MM". Used to gate non-Amazon/Venmo pending_txn
+    items so they only push during the daily digest window (e.g., 9-10am)
+    rather than the moment they're detected.
+
+    Malformed input returns False so a typo doesn't accidentally batch
+    everything forever.
+    """
+    try:
+        target = dtime.fromisoformat(digest_time_str)
+    except (ValueError, TypeError):
+        return False
+    target_today = datetime.combine(now.date(), target)
+    if now.tzinfo is not None:
+        target_today = target_today.replace(tzinfo=now.tzinfo)
+    delta_minutes = (now - target_today).total_seconds() / 60
+    return 0 <= delta_minutes <= window_minutes
+
+
 # ---------------------------------------------------------------------------
 # Inline keyboard rendering
 # ---------------------------------------------------------------------------
@@ -168,20 +192,20 @@ def _annotate_with_suggestion_name(item: dict, categories: list[dict]) -> dict:
     return item
 
 
-async def _push_next_item(
+async def _push_item_to_user(
     app: Application,
     settings: Settings,
     categories: list[dict],
     chat_id: int,
     user_id: str,
+    item: dict,
 ) -> bool:
-    """Render and send the next pending item to the chat.
+    """Render a specific item and record it as the last-asked for this chat.
 
-    Returns True if an item was sent, False if the queue is empty.
+    Extracted from ``_push_next_item`` so commands like ``/digest`` can fetch
+    an item with custom filters (e.g., forcing include_txns=True) and still
+    use the same rendering + bookkeeping path.
     """
-    item = next_item_for_user(settings.paths.database, user_id=user_id)
-    if item is None:
-        return False
     item = _annotate_with_suggestion_name(item, categories)
     body = format_item_prompt(item)
     keyboard = _build_keyboard(item, categories)
@@ -207,6 +231,37 @@ async def _push_next_item(
             (chat_id, user_id, item["kind"], item["id"], _utcnow()),
         )
     return True
+
+
+async def _push_next_item(
+    app: Application,
+    settings: Settings,
+    categories: list[dict],
+    chat_id: int,
+    user_id: str,
+    *,
+    include_txns: bool | None = None,
+) -> bool:
+    """Render and send the next pending item to the chat.
+
+    If ``include_txns`` is None, gate on the daily-digest window so
+    pending_txn items only push between digest_time and +window_minutes.
+    pending_order items (Amazon/Venmo) are always eligible.
+
+    Returns True if an item was sent, False if the queue is empty.
+    """
+    if include_txns is None:
+        include_txns = _in_digest_window(
+            datetime.now(), settings.telegram.daily_digest_time
+        )
+    item = next_item_for_user(
+        settings.paths.database, user_id=user_id, include_txns=include_txns,
+    )
+    if item is None:
+        return False
+    return await _push_item_to_user(
+        app, settings, categories, chat_id, user_id, item,
+    )
 
 
 def _apply_choice(
@@ -436,7 +491,8 @@ async def _handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     kind, payload = _parse_user_reply(update.message.text or "")
 
     if kind == "undo":
-        await update.message.reply_text("Undo isn't wired up yet — sorry.")
+        # Reuse the slash-command handler so text "undo" and "/undo" agree.
+        await _undo_cmd(update, context)
         return
 
     status = _apply_choice(
@@ -481,15 +537,22 @@ async def _push_loop(app: Application) -> None:
                 user_id = account.user_id
 
                 # If a question is already in-flight for this chat, don't
-                # double-prompt — wait for the user to answer.
+                # double-prompt — wait for the user to answer. Also respect
+                # per-chat /quiet (quiet_until column).
                 with storage.connect(settings.paths.database) as con:
                     row = con.execute(
-                        "SELECT last_asked_id FROM bot_conversation "
+                        "SELECT last_asked_id, quiet_until FROM bot_conversation "
                         "WHERE chat_id = ?",
                         (chat_id,),
                     ).fetchone()
                 if row and row["last_asked_id"] is not None:
                     continue
+                if row and row["quiet_until"] is not None:
+                    qu = row["quiet_until"]
+                    # qu is a tz-naive datetime (stored as isoformat); compare
+                    # against tz-naive `now` from datetime.now() above.
+                    if isinstance(qu, datetime) and now < qu:
+                        continue
 
                 await _push_next_item(app, settings, categories, chat_id, user_id)
         except asyncio.CancelledError:
@@ -506,18 +569,155 @@ async def _post_init(app: Application) -> None:
     log.info("push loop started")
 
 
+async def _skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Skip the current pending item (same behavior as replying 'skip')."""
+    settings: Settings = context.application.bot_data["settings"]
+    categorizer: Categorizer = context.application.bot_data["categorizer"]
+    categories: list[dict] = context.application.bot_data["categories"]
+
+    chat_id = update.effective_chat.id
+    user_id = _resolve_user_id_for_chat(settings, chat_id)
+    if user_id is None:
+        await update.message.reply_text("This chat isn't linked. See /start.")
+        return
+
+    status = _apply_choice(
+        settings, categorizer, categories,
+        chat_id=chat_id, user_id=user_id,
+        choice_kind="skip", payload=None,
+    )
+    await update.message.reply_text(status)
+    await _push_next_item(
+        context.application, settings, categories, chat_id, user_id,
+    )
+
+
+async def _digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force-push the next item including pending_txns regardless of window.
+
+    Useful when the user wants to clear their digest queue outside the
+    configured daily_digest_time window.
+    """
+    settings: Settings = context.application.bot_data["settings"]
+    categories: list[dict] = context.application.bot_data["categories"]
+    chat_id = update.effective_chat.id
+    user_id = _resolve_user_id_for_chat(settings, chat_id)
+    if user_id is None:
+        await update.message.reply_text("This chat isn't linked. See /start.")
+        return
+
+    sent = await _push_next_item(
+        context.application, settings, categories, chat_id, user_id,
+        include_txns=True,
+    )
+    if not sent:
+        await update.message.reply_text("Queue is empty. ✨")
+
+
+async def _quiet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Per-chat notification mute. Usage: /quiet on  or  /quiet off."""
+    settings: Settings = context.application.bot_data["settings"]
+    chat_id = update.effective_chat.id
+    user_id = _resolve_user_id_for_chat(settings, chat_id)
+    if user_id is None:
+        await update.message.reply_text("This chat isn't linked. See /start.")
+        return
+
+    arg = " ".join(context.args or []).strip().lower()
+    if arg == "on":
+        until = datetime.now() + timedelta(hours=24)
+        with storage.connect(settings.paths.database) as con:
+            con.execute(
+                """
+                INSERT INTO bot_conversation (chat_id, user_id, quiet_until)
+                VALUES (?, ?, ?)
+                ON CONFLICT(chat_id) DO UPDATE SET quiet_until = excluded.quiet_until
+                """,
+                (chat_id, user_id, until),
+            )
+        await update.message.reply_text(
+            "Notifications paused for 24h. /quiet off to resume."
+        )
+    elif arg == "off":
+        with storage.connect(settings.paths.database) as con:
+            con.execute(
+                "UPDATE bot_conversation SET quiet_until = NULL WHERE chat_id = ?",
+                (chat_id,),
+            )
+        await update.message.reply_text("Notifications resumed.")
+    else:
+        await update.message.reply_text("Usage: /quiet on  or  /quiet off")
+
+
+async def _undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Revert the most recent categorization within a 5-minute window.
+
+    For pending_orders the revert is fully local (categorization hasn't been
+    pushed to YNAB yet — that happens on match). For pending_txns the category
+    was already applied to YNAB, so we revert local state and warn the user.
+    """
+    settings: Settings = context.application.bot_data["settings"]
+    with storage.connect(settings.paths.database) as con:
+        row = con.execute(
+            """
+            SELECT id, details FROM audit_log
+            WHERE event = 'categorized'
+              AND ts >= datetime('now', '-5 minutes')
+            ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            await update.message.reply_text("Nothing to undo (5-min window).")
+            return
+        try:
+            details = json.loads(row["details"]) if row["details"] else {}
+        except json.JSONDecodeError:
+            details = {}
+        kind = details.get("kind")
+        item_id = details.get("id")
+        if not kind or item_id is None:
+            await update.message.reply_text("Couldn't parse last action — nothing undone.")
+            return
+
+        if kind == "order":
+            con.execute(
+                "UPDATE pending_order SET chosen_category = NULL, "
+                "chosen_at = NULL, status = 'pending' WHERE id = ?",
+                (item_id,),
+            )
+            msg = "Reverted. The order is back in your queue."
+        else:
+            con.execute(
+                "UPDATE pending_txn SET chosen_category = NULL, "
+                "chosen_at = NULL, status = 'pending' WHERE id = ?",
+                (item_id,),
+            )
+            msg = (
+                "Reverted locally. ⚠️ The category was already applied to YNAB — "
+                "you'll need to edit it manually in YNAB if you want to clear it there too."
+            )
+
+    storage.audit(
+        settings.paths.database, "undone", {"kind": kind, "id": item_id},
+    )
+    await update.message.reply_text(msg)
+
+
 async def _help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Commands available right now:\n"
-        "  /start   — show your chat id (one-time setup)\n"
-        "  /pending — how many items are in the queue\n"
-        "  /help    — this message\n\n"
+        "Commands:\n"
+        "  /start    — link this chat (one-time setup)\n"
+        "  /pending  — show the next queued item\n"
+        "  /digest   — force the next pending txn even outside digest window\n"
+        "  /skip     — skip the current item\n"
+        "  /undo     — revert your last categorization (5-min window)\n"
+        "  /quiet on|off — pause/resume notifications for 24h\n"
+        "  /help     — this message\n\n"
         "Replies during a categorization prompt:\n"
-        "  y / yes / ✅ — confirm the suggested category\n"
+        "  y / yes / ✅   — confirm the suggested category\n"
         "  <category name> — use that category (e.g. 'Groceries')\n"
-        "  <free text> — LLM picks the best-matching category\n"
-        "  skip — defer this item\n"
-        "  (/undo, /digest, /quiet — planned for MVP-1.1)"
+        "  <free text>    — LLM picks the best-matching category\n"
+        "  skip           — defer this item"
     )
 
 
@@ -551,6 +751,10 @@ def run(settings: Settings | None = None) -> None:
 
     app.add_handler(CommandHandler("start", _start_cmd))
     app.add_handler(CommandHandler("pending", _pending_cmd))
+    app.add_handler(CommandHandler("skip", _skip_cmd))
+    app.add_handler(CommandHandler("digest", _digest_cmd))
+    app.add_handler(CommandHandler("quiet", _quiet_cmd))
+    app.add_handler(CommandHandler("undo", _undo_cmd))
     app.add_handler(CommandHandler("help", _help_cmd))
     app.add_handler(CallbackQueryHandler(_handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_text))

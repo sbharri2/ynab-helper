@@ -11,11 +11,17 @@ from pathlib import Path
 from bot import storage
 
 
-def next_item_for_user(db_path: Path | str, *, user_id: str) -> dict | None:
+def next_item_for_user(
+    db_path: Path | str, *, user_id: str, include_txns: bool = True
+) -> dict | None:
     """Return the next item to ask the user about, or None if the queue is empty.
 
     Priority: pending_order (real-time email items) before pending_txn (digest items).
     Within each, oldest first.
+
+    When ``include_txns`` is False, only pending_orders are returned — used by
+    the push loop to gate non-Amazon/Venmo transactions to the daily digest
+    window (see ``_in_digest_window`` in telegram_bot).
     """
     with storage.connect(db_path) as con:
         order = con.execute(
@@ -29,6 +35,9 @@ def next_item_for_user(db_path: Path | str, *, user_id: str) -> dict | None:
             d["kind"] = "order"
             d["raw_payload"] = json.loads(d.get("raw_payload") or "{}")
             return d
+
+        if not include_txns:
+            return None
 
         txn = con.execute(
             """SELECT * FROM pending_txn
