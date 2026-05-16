@@ -31,9 +31,9 @@ def test_extract_order_id_from_confirmation():
 def test_extract_total_cents():
     body = _load("auto-confirm-amazon-com")
     total = amazon.extract_total_cents(body)
-    assert total is not None
-    assert total > 0
-    assert total < 100_000_00
+    # Pin the exact value from the fixture so regex drift fails loud
+    # rather than silently capturing a wrong-but-in-range amount.
+    assert total == 3216, f"expected 3216 (=$32.16) from Grand Total, got {total}"
 
 
 def test_parse_email_date_header():
