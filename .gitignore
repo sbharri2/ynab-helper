@@ -47,3 +47,8 @@ tests/fixtures/venmo_emails/*
 !tests/fixtures/venmo_emails/venmo-venmo-com-paid-you_*.txt
 !tests/fixtures/amazon_emails/.gitkeep
 !tests/fixtures/venmo_emails/.gitkeep
+
+.venv/
+__pycache__/
+*.egg-info/
+*.pyc
