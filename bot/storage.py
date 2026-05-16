@@ -11,6 +11,14 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+# Python 3.12 deprecated the default date/datetime adapters and converters that
+# `detect_types=PARSE_DECLTYPES` relies on. Register explicit ISO-8601 ones now
+# so the warnings don't pollute every test run downstream.
+sqlite3.register_adapter(date, lambda d: d.isoformat())
+sqlite3.register_adapter(datetime, lambda dt: dt.isoformat())
+sqlite3.register_converter("DATE", lambda b: date.fromisoformat(b.decode()))
+sqlite3.register_converter("TIMESTAMP", lambda b: datetime.fromisoformat(b.decode()))
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS pending_order (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
