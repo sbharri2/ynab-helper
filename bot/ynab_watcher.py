@@ -77,6 +77,11 @@ def poll_once(settings: Settings) -> dict:
 
 
 def _enqueue(settings: Settings, txn: dict) -> None:
+    # TODO(MVP-1.1): gate enqueue/push on `settings.telegram.daily_digest_time`
+    #   so non-Amazon/Venmo txns batch at 9am instead of pushing in real-time.
+    #   Currently the bot's 30s push loop will surface them as soon as inserted.
+    # TODO(MVP-2): route to the correct user_id from the YNAB account, not the
+    #   first gmail account (hard-codes single-user assumption).
     storage.insert_pending_txn(
         settings.paths.database,
         user_id=settings.gmail_accounts[0].user_id,

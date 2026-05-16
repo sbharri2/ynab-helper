@@ -506,6 +506,21 @@ async def _post_init(app: Application) -> None:
     log.info("push loop started")
 
 
+async def _help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Commands available right now:\n"
+        "  /start   — show your chat id (one-time setup)\n"
+        "  /pending — how many items are in the queue\n"
+        "  /help    — this message\n\n"
+        "Replies during a categorization prompt:\n"
+        "  y / yes / ✅ — confirm the suggested category\n"
+        "  <category name> — use that category (e.g. 'Groceries')\n"
+        "  <free text> — LLM picks the best-matching category\n"
+        "  skip — defer this item\n"
+        "  (/undo, /digest, /quiet — planned for MVP-1.1)"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
