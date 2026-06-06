@@ -9,11 +9,20 @@ email_sources:
   - name: amazon
     query: "from:auto-confirm@amazon.com newer_than:2d"
     parser: amazon
+  - name: amazon_shipment
+    query: "from:shipment-tracking@amazon.com newer_than:2d"
+    parser: amazon_shipment
   # Venmo: subject filter excludes monthly statements + non-transactional emails.
   # See receipt-inspection.md — 10/37 venmo@venmo.com emails are non-transactional.
   - name: venmo
     query: 'from:venmo@venmo.com newer_than:2d (subject:"paid you" OR subject:"You paid" OR subject:"charged you" OR subject:"You charged")'
     parser: venmo
+  # Generic Shopify/retailer order confirmations (Rhoback, Urban Outfitters,
+  # Etsy, Zappos, piper+ivy, etc.). Use after configuring Allison's gmail to
+  # forward category:purchases (excluding Amazon) to this account.
+  - name: retailer_order
+    query: 'subject:("Order #" OR "Order Confirmation" OR "Receipt #") newer_than:3d -from:amazon -from:venmo'
+    parser: retailer_order
 
 ynab:
   budget_id: ""  # set by first_run_setup.py
@@ -21,7 +30,7 @@ ynab:
 
 ollama:
   endpoint: http://localhost:11434
-  model: qwen2.5:14b
+  model: qwen3-coder:30b
   temperature: 0.3
 
 telegram:

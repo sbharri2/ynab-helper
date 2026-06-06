@@ -35,6 +35,8 @@ def poll_once(settings: Settings) -> dict:
     ynab = YnabClient(settings.ynab_token, settings.ynab.budget_id)
 
     txns = ynab.list_uncategorized()
+    cutoff = settings.ynab.enqueue_after
+    txns = [t for t in txns if t["txn_date"] >= cutoff]
     pending_orders = storage.list_unmatched_amazon_orders(settings.paths.database)
 
     matched = 0
@@ -92,6 +94,31 @@ def _enqueue(settings: Settings, txn: dict) -> None:
         txn_date=txn["txn_date"],
         memo=txn["memo"],
     )
+    # Phase 3.3: also mirror into the system-of-record ledger via ingest.
+    # ingest.ingest_signal dedupes against ledger_txn (which holds the YNAB
+    # history import), so this is safe to call on every poll — duplicates
+    # become merged_existing rows, not double-counts. Setup for Phase 7.
+    try:
+        from bot import ingest
+        ingest.ingest_signal(
+            settings.paths.database,
+            signal_kind="ynab_sync",
+            email_id=f"ynab:{txn['ynab_txn_id']}",
+            parsed={
+                "ynab_account_id": txn["ynab_account_id"],
+                "posted_date": txn["txn_date"],
+                "amount_cents": txn["amount_cents"],
+                "payee": txn["payee"],
+                "memo": txn["memo"],
+                "summary": txn.get("memo") or txn.get("payee") or "",
+                "ynab_txn_id": txn["ynab_txn_id"],
+            },
+            user_id=settings.gmail_accounts[0].user_id,
+            settings=settings,
+        )
+    except Exception as e:  # noqa: BLE001 - never crash enqueue on ledger error
+        log.warning("ledger ingest from ynab_watcher failed (%s): %s",
+                    txn.get("ynab_txn_id"), e)
 
 
 def _expire_stale_orders(db_path, *, days: int = 30) -> int:

@@ -9,8 +9,8 @@ def test_list_uncategorized_calls_api(mock_ynab):
     mock_api.get_transactions.return_value.data.transactions = [
         MagicMock(
             id="tx-1", account_id="acc-1", payee_name="STARBUCKS",
-            amount=-12750, date=date(2026, 5, 14), memo="",
-            category_id=None,
+            amount=-12750, var_date=date(2026, 5, 14), memo="",
+            category_id=None, transfer_account_id=None,
         )
     ]
     mock_ynab.ApiClient.return_value.__enter__.return_value = MagicMock()
@@ -30,9 +30,9 @@ def test_list_uncategorized_filters_out_categorized(mock_ynab):
     mock_api = MagicMock()
     mock_api.get_transactions.return_value.data.transactions = [
         MagicMock(id="tx-uncat", account_id="a", payee_name="X", amount=-1000,
-                  date=date(2026, 5, 1), memo="", category_id=None),
+                  var_date=date(2026, 5, 1), memo="", category_id=None, transfer_account_id=None),
         MagicMock(id="tx-cat", account_id="a", payee_name="Y", amount=-2000,
-                  date=date(2026, 5, 2), memo="", category_id="some-cat-id"),
+                  var_date=date(2026, 5, 2), memo="", category_id="some-cat-id", transfer_account_id=None),
     ]
     mock_ynab.ApiClient.return_value.__enter__.return_value = MagicMock()
     mock_ynab.TransactionsApi.return_value = mock_api
@@ -48,7 +48,7 @@ def test_list_uncategorized_coalesces_none_strings(mock_ynab):
     mock_api = MagicMock()
     mock_api.get_transactions.return_value.data.transactions = [
         MagicMock(id="tx-1", account_id="a", payee_name=None, amount=-500,
-                  date=date(2026, 5, 1), memo=None, category_id=None),
+                  var_date=date(2026, 5, 1), memo=None, category_id=None, transfer_account_id=None),
     ]
     mock_ynab.ApiClient.return_value.__enter__.return_value = MagicMock()
     mock_ynab.TransactionsApi.return_value = mock_api
@@ -68,7 +68,7 @@ def test_set_category_sends_correct_envelope(mock_ynab):
     YnabClient(token="x", budget_id="budget-uuid").set_category("tx-1", "cat-uuid")
 
     call_kwargs = mock_api.update_transaction.call_args.kwargs
-    assert call_kwargs["budget_id"] == "budget-uuid"
+    assert call_kwargs["plan_id"] == "budget-uuid"
     assert call_kwargs["transaction_id"] == "tx-1"
     # The envelope is constructed as PutTransactionWrapper(transaction=ExistingTransaction(category_id=...))
     # Both classes are accessed through the mocked `ynab` module, so verify the chain:

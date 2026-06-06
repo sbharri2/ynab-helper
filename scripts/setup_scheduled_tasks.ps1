@@ -1,10 +1,10 @@
-# scripts/setup_scheduled_tasks.ps1 — run as administrator
+# scripts/setup_scheduled_tasks.ps1 -run as administrator
 param(
     [string]$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 )
 
 $python = Join-Path $RepoRoot ".venv\Scripts\python.exe"
-if (-not (Test-Path $python)) { throw "venv python not found at $python — run 'python -m venv .venv' and install dependencies first." }
+if (-not (Test-Path $python)) { throw "venv python not found at $python -run 'python -m venv .venv' and install dependencies first." }
 
 function New-YnabTask {
     param([string]$Name, [string]$Script, [int]$IntervalMinutes)
@@ -15,10 +15,20 @@ function New-YnabTask {
     Write-Host "Registered: $Name (every $IntervalMinutes min)"
 }
 
-New-YnabTask -Name "YNAB-Helper-GmailWatcher" -Script "gmail_watcher" -IntervalMinutes 5
-New-YnabTask -Name "YNAB-Helper-YnabWatcher"  -Script "ynab_watcher"  -IntervalMinutes 30
+New-YnabTask -Name "YNAB-Helper-GmailWatcher"    -Script "gmail_watcher"    -IntervalMinutes 5
+New-YnabTask -Name "YNAB-Helper-YnabWatcher"     -Script "ynab_watcher"     -IntervalMinutes 30
+New-YnabTask -Name "YNAB-Helper-SampleCollector" -Script "sample_collector" -IntervalMinutes 60
 
-# Long-running bot — separate task, runs at logon, restarts on failure
+# Daily catch-up: refreshes LLM suggestions on pending_txn rows so the bot has
+# things to DM. Runs at 7:30am, just before quiet hours end at 7:00am... actually
+# right after, so first morning DM lands while the user is checking their phone.
+$catchupAction = New-ScheduledTaskAction -Execute $python -Argument "-m scripts.daily_catchup --limit 20" -WorkingDirectory $RepoRoot
+$catchupTrigger = New-ScheduledTaskTrigger -Daily -At 7:30am
+$catchupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 15)
+Register-ScheduledTask -TaskName "YNAB-Helper-DailyCatchup" -Action $catchupAction -Trigger $catchupTrigger -Settings $catchupSettings -RunLevel Highest -Force | Out-Null
+Write-Host "Registered: YNAB-Helper-DailyCatchup (daily 7:30am)"
+
+# Long-running bot -separate task, runs at logon, restarts on failure
 $action = New-ScheduledTaskAction -Execute $python -Argument "-m bot.telegram_bot" -WorkingDirectory $RepoRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit (New-TimeSpan -Days 9999)

@@ -39,6 +39,10 @@ def next_item_for_user(
         if not include_txns:
             return None
 
+        # No suggested_category filter: bot DMs even no-guess items with a
+        # "no guess — what category?" prompt. Better UX than silent queue.
+        # The 86 backlog rows where we wiped bad LLM defaults (Chase Amazon,
+        # Sewing Class, etc.) become DM-eligible again as no-guess prompts.
         txn = con.execute(
             """SELECT * FROM pending_txn
                WHERE user_id = ? AND status = 'pending'
@@ -82,8 +86,18 @@ def format_item_prompt(item: dict) -> str:
             else str(txn_date)
         )
         payee = item.get("payee", "?")
-        suggestion = item.get("suggested_category_name") or "(no suggestion)"
+        context = (item.get("raw_summary") or item.get("memo") or "").strip()
+        context_line = f"{context}\n" if context else ""
+        # Render the bottom line differently depending on whether we have a guess.
+        # The no-guess case is now common (Phase 0.5 dropped the filter); show
+        # a clear prompt so the user knows the bot needs their input from scratch.
+        suggestion_name = item.get("suggested_category_name")
+        if suggestion_name:
+            bottom = f"Best guess: {suggestion_name}"
+        else:
+            bottom = "No guess yet — pick a category below."
         return (
-            f"📋 ${amount:.2f} {payee} · {date_str}\n\n"
-            f"Best guess: {suggestion}"
+            f"📋 ${amount:.2f} {payee} · {date_str}\n"
+            f"{context_line}\n"
+            f"{bottom}"
         )

@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import importlib
 import logging
+import os
 from datetime import date
 
 from google.oauth2.credentials import Credentials
@@ -31,6 +32,7 @@ log = logging.getLogger(__name__)
 
 
 def _build_gmail_service(token_path: str):
+    token_path = os.path.expanduser(token_path)
     creds = Credentials.from_authorized_user_file(token_path)
     if creds.expired and creds.refresh_token:
         creds.refresh(Request())
@@ -66,8 +68,19 @@ def poll_once(settings: Settings) -> int:
     storage.init_db(settings.paths.database)
     new_count = 0
 
-    ynab = YnabClient(settings.ynab_token, settings.ynab.budget_id)
-    categories = ynab.list_categories() if settings.ynab_token else []
+    # Phase 3.2 hardening: feed the LLM only spending-eligible categories
+    # (excludes Credit Card Payments + scheduled-bill goals). Falls back to
+    # YnabClient.list_categories() when the local ledger is empty (no history
+    # imported yet).
+    spending_cats = storage.list_categories_for_spending(settings.paths.database)
+    if spending_cats:
+        categories = [
+            {"id": c["id"], "name": c["name"], "group": c["group_name"]}
+            for c in spending_cats
+        ]
+    else:
+        ynab = YnabClient(settings.ynab_token, settings.ynab.budget_id)
+        categories = ynab.list_categories() if settings.ynab_token else []
     cat_engine = Categorizer(settings.ollama.endpoint, settings.ollama.model,
                               settings.ollama.temperature)
 
@@ -111,13 +124,20 @@ def poll_once(settings: Settings) -> int:
                 except sqlite3.IntegrityError:
                     continue
 
-                # Categorize
+                # Categorize. Phase 3.2: inject historical priors for the payee
+                # so the LLM strongly favors how Steven actually categorizes this
+                # merchant (e.g. Amazon → Groceries/Household, not "Chase Amazon").
+                payee_for_priors = parsed.get("counterparty") or parsed["source"]
+                priors = storage.get_category_priors_for_payee(
+                    settings.paths.database, payee_for_priors, top_n=5,
+                )
                 suggestion = cat_engine.suggest(
                     summary=parsed.get("summary", ""),
                     amount_cents=parsed.get("total_cents") or parsed.get("amount_cents") or 0,
                     date_str=str(parsed.get("order_date") or ""),
                     source=parsed["source"],
                     categories=categories,
+                    priors=priors,
                 )
                 with storage.connect(settings.paths.database) as con:
                     con.execute(

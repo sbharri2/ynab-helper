@@ -3,12 +3,29 @@ from bot import storage
 from bot.conversation import next_item_for_user, format_item_prompt
 
 
-def _insert_pending_txn(db, *, user_id="steven", ynab_txn_id="t1"):
+def _insert_pending_txn(db, *, user_id="steven", ynab_txn_id="t1",
+                        suggested_category="cat-x"):
     storage.insert_pending_txn(
         db, user_id=user_id, ynab_txn_id=ynab_txn_id,
         ynab_account_id="acct-1", payee="Starbucks",
         amount_cents=-450, txn_date=date(2026, 5, 15), memo="",
     )
+    if suggested_category is not None:
+        with storage.connect(db) as con:
+            con.execute(
+                "UPDATE pending_txn SET suggested_category = ? "
+                "WHERE ynab_txn_id = ?",
+                (suggested_category, ynab_txn_id),
+            )
+
+
+def test_pending_txn_without_suggestion_is_not_returned(tmp_path):
+    """Catchup-gating: a pending_txn with no suggested_category should
+    not surface to the bot. It must be enriched by daily_catchup first."""
+    db = tmp_path / "test.db"
+    storage.init_db(db)
+    _insert_pending_txn(db, suggested_category=None)
+    assert next_item_for_user(db, user_id="steven") is None
 
 
 def test_next_item_returns_oldest_pending(tmp_path):
