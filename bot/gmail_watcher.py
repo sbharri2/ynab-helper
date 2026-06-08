@@ -9,6 +9,11 @@ For each (gmail_account x email_source) pair:
 
 The Telegram bot independently watches for new pending_order rows and pushes
 them to the user - this module does not talk to Telegram directly.
+
+Auth backend: IMAP with App Password (preferred) or legacy Gmail OAuth.
+IMAP wins when `imap_password_env` is set on the GmailAccount config and
+the named env var has a value. The OAuth path is kept as a fallback so
+already-running installs that haven't migrated still work.
 """
 from __future__ import annotations
 
@@ -18,9 +23,6 @@ import logging
 import os
 from datetime import date
 
-from google.oauth2.credentials import Credentials
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
 import sqlite3
 
 from bot import storage
@@ -32,6 +34,13 @@ log = logging.getLogger(__name__)
 
 
 def _build_gmail_service(token_path: str):
+    """Legacy OAuth path. Only called when an account isn't configured
+    for IMAP. Imported lazily so machines without google-api-python-client
+    installed can still run the IMAP path.
+    """
+    from google.oauth2.credentials import Credentials
+    from google.auth.transport.requests import Request
+    from googleapiclient.discovery import build
     token_path = os.path.expanduser(token_path)
     creds = Credentials.from_authorized_user_file(token_path)
     if creds.expired and creds.refresh_token:
@@ -41,8 +50,26 @@ def _build_gmail_service(token_path: str):
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
+def _account_imap_password(account) -> str | None:
+    """Resolve the App Password for an account from its env var name."""
+    env_name = getattr(account, "imap_password_env", "")
+    if not env_name:
+        return None
+    return os.environ.get(env_name)
+
+
 def _extract_body(msg: dict) -> str:
-    """Walk the message payload, preferring text/plain over text/html."""
+    """Walk the message payload, preferring text/plain when usable.
+
+    Some senders (Citi transaction alerts especially) put the real
+    content in the HTML body and leave text/plain as boilerplate that
+    says "click here to view your message". When text/plain has fewer
+    than 2 `$` signs but HTML has at least one, we strip the HTML and
+    return that instead.
+
+    Backward-compatible: Amazon / Venmo / retailer parsers all see their
+    usual text/plain bodies because those are dollar-rich.
+    """
     def walk(part):
         body = part.get("body", {})
         if "data" in body:
@@ -55,7 +82,24 @@ def _extract_body(msg: dict) -> str:
     bodies = list(walk(msg["payload"]))
     text = next((b for m, b in bodies if m == "text/plain"), None)
     html = next((b for m, b in bodies if "html" in m), None)
-    return text or html or ""  # prefer text/plain
+
+    # Conservative: switch to stripped HTML only when text/plain has ZERO
+    # dollar amounts (Citi alerts being the canonical case). Earlier this
+    # used "< 2" which broke Amazon order confirmations whose text/plain
+    # had a single $ and lots of items as "* " bullets — the bullets
+    # don't survive HTML stripping. amazon.py also accepts raw HTML, so
+    # if a parser really needs HTML it can request it explicitly.
+    if html and "$" not in (text or "") and "$" in html:
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+            for s in soup(["script", "style"]):
+                s.decompose()
+            return soup.get_text(separator="\n", strip=True)
+        except Exception:  # noqa: BLE001 - fall back to text on any error
+            pass
+
+    return text or html or ""
 
 
 def _load_parser(name: str):
@@ -85,21 +129,41 @@ def poll_once(settings: Settings) -> int:
                               settings.ollama.temperature)
 
     for account in settings.gmail_accounts:
-        svc = _build_gmail_service(account.token_path)
+        # Choose IMAP when an App Password env var is configured and set;
+        # otherwise fall back to the legacy OAuth path.
+        imap_pw = _account_imap_password(account)
+        use_imap = bool(imap_pw)
+        if use_imap:
+            from bot.gmail_imap import (
+                GmailIMAP, extract_body as imap_extract_body,
+                extract_headers as imap_extract_headers,
+                message_id_for_dedupe as imap_msg_id,
+            )
+
         for source in settings.email_sources:
-            log.info("polling %s for %s", account.email, source.name)
-            try:
-                resp = svc.users().messages().list(
-                    userId="me", q=source.query, maxResults=50
-                ).execute()
-            except Exception as e:
-                log.error("gmail list failed: %s", e)
-                continue
-            for m in resp.get("messages", []):
-                msg = svc.users().messages().get(userId="me", id=m["id"], format="full").execute()
-                body = _extract_body(msg)
-                headers = {h["name"]: h["value"]
-                           for h in msg["payload"].get("headers", [])}
+            log.info("polling %s for %s (backend=%s)", account.email,
+                     source.name, "imap" if use_imap else "oauth")
+
+            # Backend-specific iteration. Each yields (email_id, body, headers).
+            if use_imap:
+                try:
+                    msg_iter = _iter_imap(
+                        account.email, imap_pw, source.query,
+                        GmailIMAP, imap_extract_body, imap_extract_headers,
+                        imap_msg_id,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.error("imap failed for %s: %s", account.email, e)
+                    continue
+            else:
+                try:
+                    svc = _build_gmail_service(account.token_path)
+                    msg_iter = _iter_oauth(svc, source.query)
+                except Exception as e:  # noqa: BLE001
+                    log.error("oauth failed for %s: %s", account.email, e)
+                    continue
+
+            for email_id, body, headers, _mark_done in msg_iter:
                 parser = _load_parser(source.parser)
                 parsed = parser(
                     body,
@@ -107,7 +171,63 @@ def poll_once(settings: Settings) -> int:
                     date_header=headers.get("Date", ""),
                 )
                 if parsed["parse_status"] not in {"ok", "partial"}:
+                    # Leave failed-parse emails in inbox so the user can
+                    # see them and decide what to do.
                     continue
+                # The "m" reference below uses email_id where the OAuth
+                # path used to use m["id"]; both are stable per-message
+                # ids the storage layer dedupes on.
+                m = {"id": email_id}
+
+                # CC/bank transaction alerts go straight to the ledger
+                # (with dedupe). They aren't "orders to match" — they
+                # represent the actual charge that hit the account.
+                # Amazon/Venmo/retailer order confirmations keep using
+                # the legacy pending_order flow because they need to be
+                # matched against the eventual CC charge.
+                if source.parser in {
+                    "citi_alert", "chase_alert",
+                    "coastal_transaction_alert",
+                    "coastal_check_cleared",
+                }:
+                    from bot import ingest
+                    try:
+                        ingest.ingest_signal(
+                            settings.paths.database,
+                            signal_kind=source.parser,
+                            email_id=m["id"],
+                            parsed=parsed,
+                            user_id=account.user_id,
+                            settings=settings,
+                        )
+                        new_count += 1
+                        _mark_done()
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("ingest %s failed for %s: %s",
+                                    source.parser, m["id"], e)
+                    continue
+
+                # Coastal balance summary → write account_balance_observed
+                # via ingest, no ledger_txn / pending_order.
+                if source.parser == "coastal_balance_summary":
+                    from bot import ingest
+                    try:
+                        ingest.ingest_signal(
+                            settings.paths.database,
+                            signal_kind="coastal_balance_summary",
+                            email_id=m["id"],
+                            parsed=parsed,
+                            user_id=account.user_id,
+                            settings=settings,
+                        )
+                        new_count += 1
+                        _mark_done()
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("balance ingest failed: %s", e)
+                    continue
+
+                # Legacy path: Amazon / Venmo / retailer_order →
+                # pending_order, categorized for the Telegram UX.
                 try:
                     row_id = storage.insert_pending_order(
                         settings.paths.database,
@@ -124,9 +244,6 @@ def poll_once(settings: Settings) -> int:
                 except sqlite3.IntegrityError:
                     continue
 
-                # Categorize. Phase 3.2: inject historical priors for the payee
-                # so the LLM strongly favors how Steven actually categorizes this
-                # merchant (e.g. Amazon → Groceries/Household, not "Chase Amazon").
                 payee_for_priors = parsed.get("counterparty") or parsed["source"]
                 priors = storage.get_category_priors_for_payee(
                     settings.paths.database, payee_for_priors, top_n=5,
@@ -147,8 +264,63 @@ def poll_once(settings: Settings) -> int:
                     )
                 storage.audit(settings.paths.database, "pending_order_inserted",
                               {"id": row_id, "source": parsed["source"]})
+                _mark_done()
 
     return new_count
+
+
+def _iter_oauth(svc, query: str):
+    """Yields (email_id, body, headers, mark_done) tuples from Gmail OAuth.
+
+    OAuth path is a fallback; mark_done is a no-op (the OAuth code never
+    learned the label-add behavior).
+    """
+    try:
+        resp = svc.users().messages().list(
+            userId="me", q=query, maxResults=50,
+        ).execute()
+    except Exception as e:  # noqa: BLE001
+        log.error("gmail list failed: %s", e)
+        return
+    for m in resp.get("messages", []):
+        msg = svc.users().messages().get(
+            userId="me", id=m["id"], format="full",
+        ).execute()
+        body = _extract_body(msg)
+        headers = {h["name"]: h["value"]
+                   for h in msg["payload"].get("headers", [])}
+        yield m["id"], body, headers, lambda *_a, **_kw: False
+
+
+def _iter_imap(address: str, app_password: str, query: str,
+               GmailIMAP_cls, body_fn, headers_fn, msgid_fn,
+               on_processed=None):
+    """Yields (email_id, body, headers) from a Gmail IMAP connection.
+
+    Uses X-GM-RAW so the existing Gmail-syntax queries in config.yaml
+    (e.g. `from:info6.citi.com newer_than:3d`) work unchanged.
+
+    If ``on_processed`` is provided, it's called as
+    ``on_processed(imap, uid)`` after the caller decides ingest
+    succeeded. We thread the imap connection + uid through closures so
+    the caller can call mark_processed() inside its for-loop.
+    """
+    with GmailIMAP_cls(address, app_password) as imap:
+        uids = imap.search(query)
+        log.info("imap %s: %d hits for %r", address, len(uids), query[:60])
+        for uid in uids:
+            msg = imap.fetch_message(uid)
+            if msg is None:
+                continue
+            email_id = msgid_fn(msg, uid)
+            body = body_fn(msg)
+            headers = headers_fn(msg)
+            # Closure that lets the caller mark this specific uid as done
+            # without needing direct access to the imap connection.
+            def _mark_done(label: str = "ynab-bot/processed",
+                           _imap=imap, _uid=uid) -> bool:
+                return _imap.mark_processed(_uid, label=label)
+            yield email_id, body, headers, _mark_done
 
 
 if __name__ == "__main__":

@@ -54,6 +54,16 @@ _TXN_KINDS = {
 }
 _BALANCE_KINDS = {"balance_summary", "coastal_balance_summary"}
 
+# Signal kinds that should ALSO write a pending_txn row when ingest
+# creates a new ledger_txn — so the user gets a confirm-category DM
+# right after the email arrives, not silently absorbed into the ledger
+# with whatever the LLM picked. ynab_sync is intentionally NOT in here —
+# ynab_watcher.poll_once already writes its own pending_txn for those.
+_PROMPT_USER_KINDS = {
+    "chase_alert", "citi_alert", "coastal_transaction_alert",
+    "coastal_check_cleared",
+}
+
 
 def ingest_signal(
     db_path: Path | str,
@@ -161,11 +171,42 @@ def ingest_signal(
         "amount_cents": amount_cents, "posted_date": str(posted_date),
     })
 
+    # If this is a CC/bank charge from an email AND we just created a fresh
+    # ledger_txn for it, also enqueue a pending_txn so the bot's push loop
+    # surfaces it for confirm. ynab_txn_id is synthesized as "ledger:<id>"
+    # so the row is uniquely keyed. _apply_choice detects that prefix and
+    # skips the YNAB write (no YNAB id yet).
+    pending_txn_id: int | None = None
+    if action == "new" and signal_kind in _PROMPT_USER_KINDS and user_id:
+        try:
+            pending_txn_id = storage.insert_pending_txn(
+                db_path,
+                user_id=user_id,
+                ynab_txn_id=f"ledger:{ledger_txn_id}",
+                ynab_account_id=account_id,
+                payee=payee,
+                amount_cents=amount_cents,
+                txn_date=posted_date,
+                memo=parsed.get("summary") or parsed.get("memo") or "",
+            )
+            if pending_txn_id and category_id:
+                with storage.connect(db_path) as con:
+                    con.execute(
+                        "UPDATE pending_txn SET suggested_category = ?, "
+                        "raw_summary = ? WHERE id = ?",
+                        (category_id, parsed.get("summary") or "",
+                         pending_txn_id),
+                    )
+        except sqlite3.IntegrityError:
+            # Already enqueued for this ledger_txn — fine
+            pass
+
     return {
         "action": action,
         "ledger_txn_id": ledger_txn_id,
         "ledger_signal_id": ledger_signal_id,
         "category_id": category_id,
+        "pending_txn_id": pending_txn_id,
     }
 
 
@@ -246,9 +287,30 @@ def _resolve_account_id(db_path: Path | str, parsed: dict) -> str | None:
     last4 = parsed.get("account_last4") or parsed.get("last4")
     if last4:
         with storage.connect(db_path) as con:
+            # Prefer the explicit last4 column (populated via setup); fall
+            # back to substring match on the account name for accounts
+            # where the user encoded last4 in the name (e.g. "Blue Cash
+            # Everyday® - STEVEN HARRIS -81005").
             row = con.execute(
-                "SELECT id FROM account WHERE name LIKE ?",
-                (f"%{last4}%",),
+                "SELECT id FROM account WHERE last4 = ?",
+                (last4,),
+            ).fetchone()
+            if not row:
+                row = con.execute(
+                    "SELECT id FROM account WHERE name LIKE ?",
+                    (f"%{last4}%",),
+                ).fetchone()
+            if row:
+                return row["id"]
+    # Coastal balance summaries and similar give us an account label
+    # like "JOINT CHECKING" rather than a real last4. Match by case-
+    # insensitive substring against the account name.
+    label = parsed.get("account_label") or parsed.get("account_name")
+    if label:
+        with storage.connect(db_path) as con:
+            row = con.execute(
+                "SELECT id FROM account WHERE UPPER(name) LIKE UPPER(?)",
+                (f"%{label}%",),
             ).fetchone()
             if row:
                 return row["id"]

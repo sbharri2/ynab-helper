@@ -416,6 +416,31 @@ async def _push_next_item(
         if row and row["last_asked_id"] == item["id"]:
             return False
 
+        # Defensive: if the row's suggested_category points to a
+        # non-spending category (named-goal / scheduled-bill / CC-payment
+        # bucket), drop the suggestion before rendering. The LLM is told
+        # never to pick these, but the hardening isn't 100% — we'd
+        # rather show "no suggestion" than confuse the user with a
+        # button like "Amazon Prime" for a $19 grocery run.
+        sug = item.get("suggested_category")
+        if sug:
+            with storage.connect(settings.paths.database) as con:
+                row = con.execute(
+                    "SELECT is_spending FROM category WHERE id = ?",
+                    (sug,),
+                ).fetchone()
+            if row is not None and not row["is_spending"]:
+                item["suggested_category"] = None
+                # Also clear the persisted suggestion so the row doesn't
+                # keep surfacing the bad pick on later push attempts.
+                table = "pending_order" if item["kind"] == "order" else "pending_txn"
+                with storage.connect(settings.paths.database) as con:
+                    con.execute(
+                        f"UPDATE {table} SET suggested_category = NULL "
+                        f"WHERE id = ?",
+                        (item["id"],),
+                    )
+
         item = _annotate_with_suggestion_name(item, categories)
         body = format_item_prompt(item)
         # Educated-guess buttons: pull this payee's historical priors so the
@@ -522,17 +547,30 @@ def _apply_choice(
 
     # --- skip -----------------------------------------------------------
     if choice_kind == "skip":
+        # Both kinds need a status change, or the next push picks the same
+        # row again — exactly the "tap skip, get same item" loop the user
+        # hit on a parser-broken Amazon order.
         if kind == "txn":
             with storage.connect(settings.paths.database) as con:
                 con.execute(
                     "UPDATE pending_txn SET status = 'skipped' WHERE id = ?",
                     (item_id,),
                 )
-        # Orders stay 'pending' — we'll re-ask them later. We just clear
-        # the conversation pointer so the next push picks the next item.
+        else:
+            # pending_order has CHECK status IN
+            # ('pending','categorized','matched','expired'). Use 'expired'
+            # as the user-deferred bucket — order won't surface again
+            # until the matching YNAB charge arrives.
+            with storage.connect(settings.paths.database) as con:
+                con.execute(
+                    "UPDATE pending_order SET status = 'expired', "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (item_id,),
+                )
         with storage.connect(settings.paths.database) as con:
             con.execute(
-                "UPDATE bot_conversation SET last_asked_id = NULL WHERE chat_id = ?",
+                "UPDATE bot_conversation SET last_asked_id = NULL, "
+                "last_asked_message_id = NULL WHERE chat_id = ?",
                 (chat_id,),
             )
         storage.audit(settings.paths.database, "skipped",
@@ -590,18 +628,36 @@ def _apply_choice(
             settings.paths.database, item_id, chosen_category=category_id,
         )
     else:
-        # txn — categorize directly in YNAB
+        # txn — categorize. Two paths:
+        #   - real YNAB id → push category to YNAB
+        #   - synthetic "ledger:N" id (from a CC alert ingested ahead of
+        #     YNAB sync) → update the ledger_txn row directly; YNAB will
+        #     pick up the eventual sync independently and ynab_watcher
+        #     will dedupe to the same ledger row.
         with storage.connect(settings.paths.database) as con:
             con.execute(
                 "UPDATE pending_txn SET chosen_category = ?, "
                 "chosen_at = ?, status = 'categorized' WHERE id = ?",
                 (category_id, _utcnow(), item_id),
             )
-        try:
-            ynab = YnabClient(settings.ynab_token, settings.ynab.budget_id)
-            ynab.set_category(item["ynab_txn_id"], category_id)
-        except Exception as e:  # noqa: BLE001
-            log.error("YNAB set_category failed: %s", e)
+        ynab_id = item.get("ynab_txn_id") or ""
+        if ynab_id.startswith("ledger:"):
+            try:
+                ledger_id = int(ynab_id.split(":", 1)[1])
+                with storage.connect(settings.paths.database) as con:
+                    con.execute(
+                        "UPDATE ledger_txn SET category_id = ?, "
+                        "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (category_id, ledger_id),
+                    )
+            except (ValueError, IndexError):
+                log.warning("malformed ledger: id %s", ynab_id)
+        else:
+            try:
+                ynab = YnabClient(settings.ynab_token, settings.ynab.budget_id)
+                ynab.set_category(ynab_id, category_id)
+            except Exception as e:  # noqa: BLE001
+                log.error("YNAB set_category failed: %s", e)
 
     # Clear the conversation pointer so the next push grabs the next item.
     with storage.connect(settings.paths.database) as con:
@@ -874,7 +930,10 @@ async def _push_loop(app: Application) -> None:
     """
     settings: Settings = app.bot_data["settings"]
     categories: list[dict] = app.bot_data["categories"]
-    poll_interval = 30  # seconds
+    # 10s — snappy enough that newly-arrived emails surface within ~70s of
+    # hitting the inbox (60s gmail poll + 10s push). Cheap; the loop just
+    # SELECTs one row when there's no work to do.
+    poll_interval = 10
 
     while True:
         try:
@@ -892,12 +951,37 @@ async def _push_loop(app: Application) -> None:
                 # per-chat /quiet (quiet_until column).
                 with storage.connect(settings.paths.database) as con:
                     row = con.execute(
-                        "SELECT last_asked_id, quiet_until FROM bot_conversation "
-                        "WHERE chat_id = ?",
+                        "SELECT last_asked_id, quiet_until, last_action_at "
+                        "FROM bot_conversation WHERE chat_id = ?",
                         (chat_id,),
                     ).fetchone()
                 if row and row["last_asked_id"] is not None:
-                    continue
+                    # Staleness guard: if the user ignored the last DM for
+                    # more than IGNORED_TTL_MINUTES, treat the pointer as
+                    # abandoned and clear it so the queue keeps moving.
+                    # Otherwise the bot stalls forever on a single ignored
+                    # message (see project_bot_stalls_on_ignored_dm).
+                    last_action_at = row["last_action_at"]
+                    IGNORED_TTL_MINUTES = 60
+                    is_stale = False
+                    if isinstance(last_action_at, datetime):
+                        age = (datetime.now(timezone.utc) - last_action_at
+                               if last_action_at.tzinfo
+                               else datetime.now() - last_action_at)
+                        is_stale = age.total_seconds() > IGNORED_TTL_MINUTES * 60
+                    if not is_stale:
+                        continue
+                    log.info("push_loop: clearing stale in-flight pointer for chat %s "
+                             "(last_action_at=%s)", chat_id, last_action_at)
+                    with storage.connect(settings.paths.database) as con:
+                        con.execute(
+                            "UPDATE bot_conversation SET last_asked_id = NULL, "
+                            "last_asked_message_id = NULL WHERE chat_id = ?",
+                            (chat_id,),
+                        )
+                    storage.audit(settings.paths.database, "ignored_dm_cleared",
+                                  {"chat_id": chat_id,
+                                   "stale_last_asked_id": row["last_asked_id"]})
                 if row and row["quiet_until"] is not None:
                     qu = row["quiet_until"]
                     # qu is a tz-naive datetime (stored as isoformat); compare
@@ -923,13 +1007,51 @@ async def _push_loop(app: Application) -> None:
 
 
 async def _post_init(app: Application) -> None:
-    """Spawn the push loop + Phase 5 summary loops after Application startup."""
+    """Spawn all background loops after Application startup."""
     app.bot_data["push_task"] = asyncio.create_task(_push_loop(app))
     log.info("push loop started")
     app.bot_data["daily_task"] = asyncio.create_task(_daily_summary_loop(app))
     log.info("daily summary loop started")
     app.bot_data["weekly_task"] = asyncio.create_task(_weekly_summary_loop(app))
     log.info("weekly summary loop started")
+    # Real-time intake — polls Gmail (1 min) and YNAB (5 min) inside the
+    # same event loop so new charges / orders surface within seconds of
+    # arrival, not whenever the user happens to /pending.
+    app.bot_data["gmail_task"] = asyncio.create_task(_gmail_poll_loop(app))
+    log.info("gmail poll loop started")
+    app.bot_data["ynab_task"] = asyncio.create_task(_ynab_poll_loop(app))
+    log.info("ynab poll loop started")
+
+
+async def _gmail_poll_loop(app: Application) -> None:
+    """Every 60s, call gmail_watcher.poll_once. Wrapped in to_thread because
+    the underlying HTTP + LLM calls are blocking."""
+    settings: Settings = app.bot_data["settings"]
+    from bot import gmail_watcher
+    INTERVAL = 60
+    while True:
+        try:
+            await asyncio.to_thread(gmail_watcher.poll_once, settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("gmail_poll iteration failed: %s", e)
+        await asyncio.sleep(INTERVAL)
+
+
+async def _ynab_poll_loop(app: Application) -> None:
+    """Every 5 minutes, call ynab_watcher.poll_once to pull new YNAB charges."""
+    settings: Settings = app.bot_data["settings"]
+    from bot import ynab_watcher
+    INTERVAL = 300
+    while True:
+        try:
+            await asyncio.to_thread(ynab_watcher.poll_once, settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("ynab_poll iteration failed: %s", e)
+        await asyncio.sleep(INTERVAL)
 
 
 def _next_fire_at(target_time: str, target_weekday: int | None = None) -> datetime:
@@ -957,12 +1079,17 @@ async def _daily_summary_loop(app: Application) -> None:
     """Background coroutine: at config.telegram.daily_summary_time every day,
     DM the daily summary to opted-in recipients.
 
-    Recomputes the current month's envelope state right before sending so
-    the snapshot reflects all activity ingested overnight.
+    Order of operations each morning:
+      1. Recompute current month's envelope state (activity / available).
+      2. Reconcile yesterday's bank-observed balances against the ledger
+         sum. ``reconcile_ok`` audits clear balances; ``reconcile_mismatch``
+         audits surface in the summary text.
+      3. Build + send the daily summary to opted-in recipients.
     """
     settings: Settings = app.bot_data["settings"]
     from bot.reporters.daily import send_daily_summaries
     from bot.envelope import recompute_month
+    from bot.reconciler import reconcile_all_observed
     while True:
         try:
             fire_at = _next_fire_at(settings.telegram.daily_summary_time)
@@ -976,6 +1103,20 @@ async def _daily_summary_loop(app: Application) -> None:
                 )
             except Exception as e:  # noqa: BLE001
                 log.warning("daily: recompute failed: %s", e)
+            # Reconcile against yesterday — the previous evening's bank
+            # Balance Summary email should already be ingested by now.
+            try:
+                from datetime import date as _date_cls, timedelta as _td
+                yesterday = _date_cls.today() - _td(days=1)
+                results = await asyncio.to_thread(
+                    reconcile_all_observed,
+                    settings.paths.database, yesterday,
+                )
+                ok = sum(1 for r in results if r["status"] == "ok")
+                mm = sum(1 for r in results if r["status"] == "mismatch")
+                log.info("daily reconcile: %d ok, %d mismatch", ok, mm)
+            except Exception as e:  # noqa: BLE001
+                log.warning("daily: reconcile failed: %s", e)
             await send_daily_summaries(app)
         except asyncio.CancelledError:
             raise

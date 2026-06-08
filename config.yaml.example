@@ -2,12 +2,23 @@
 gmail_accounts:
   - email: sbharri2@gmail.com
     user_id: steven
-    token_path: ~/.google_workspace_mcp/credentials/sbharri2@gmail.com.json
     chat_id: 0  # set by first_run_setup.py
+    # Preferred: IMAP with an App Password. Set imap_password_env to the
+    # env var name (NOT the password itself) that holds the App Password,
+    # e.g. STEVEN_GMAIL_IMAP_PASSWORD. The actual password goes in .env.
+    # Generate at https://myaccount.google.com/apppasswords (requires 2FA).
+    imap_password_env: STEVEN_GMAIL_IMAP_PASSWORD
+    # Legacy OAuth fallback. Used only when imap_password_env isn't set
+    # or its env var is empty. Refresh tokens expire every 7 days for
+    # OpenClaw's unverified app, so IMAP is the right default.
+    token_path: ~/.google_workspace_mcp/credentials/sbharri2@gmail.com.json
 
 email_sources:
   - name: amazon
-    query: "from:auto-confirm@amazon.com newer_than:2d"
+    # Restrict to real order confirmations (subject "Ordered: ..."). The
+    # same sender also pushes shipment/refund updates that the parser
+    # can't and shouldn't try to enqueue.
+    query: 'from:auto-confirm@amazon.com subject:Ordered newer_than:2d'
     parser: amazon
   - name: amazon_shipment
     query: "from:shipment-tracking@amazon.com newer_than:2d"
@@ -23,6 +34,22 @@ email_sources:
   - name: retailer_order
     query: 'subject:("Order #" OR "Order Confirmation" OR "Receipt #") newer_than:3d -from:amazon -from:venmo'
     parser: retailer_order
+  # Citi Double Cash per-charge alerts
+  - name: citi_alert
+    query: 'from:info6.citi.com subject:"transaction was made" newer_than:3d'
+    parser: citi_alert
+  # Chase Amazon (Prime Visa) per-charge alerts
+  - name: chase_alert
+    query: 'from:alerts.chase.com subject:"You made" newer_than:3d'
+    parser: chase_alert
+  # Coastal FCU per-transaction alerts (checking/savings deposits + withdrawals)
+  - name: coastal_transaction_alert
+    query: 'from:coastal24.com subject:"Transaction Alert" newer_than:3d'
+    parser: coastal_transaction_alert
+  # Coastal FCU daily balance summary — drives Phase 5 reconciliation
+  - name: coastal_balance_summary
+    query: 'from:coastal24.com subject:"Balance Summary" newer_than:3d'
+    parser: coastal_balance_summary
 
 ynab:
   budget_id: ""  # set by first_run_setup.py

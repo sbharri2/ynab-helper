@@ -13,6 +13,7 @@ Pure functions for the build; the orchestrator handles fan-out + delivery.
 from __future__ import annotations
 
 import logging
+import re
 from collections import Counter
 from datetime import date, timedelta
 
@@ -24,6 +25,29 @@ log = logging.getLogger(__name__)
 def _fmt(cents: int) -> str:
     sign = "-" if cents < 0 else ""
     return f"{sign}${abs(cents) / 100:,.2f}"
+
+
+_TRAILING_COUNTRY_RE = re.compile(r"\s+USA\s*$", re.I)
+
+
+def _clean_payee(raw: str) -> str:
+    """Pretty up a bank/CC-style ALL-CAPS merchant string for display.
+
+    Strips the trailing " USA" suffix (Citi appends it). Title-cases
+    each word so "APPLE.COM/BILL CUPERTINO" becomes "Apple.com/bill
+    Cupertino" and "LA TABERNA APEX" becomes "La Taberna Apex".
+
+    We intentionally do NOT try to strip city/state — distinguishing
+    "APEX" (a city) from "TABERNA" (part of the merchant name) in
+    all-caps text without a gazetteer guesses wrong as often as right.
+    """
+    if not raw:
+        return raw
+    s = _TRAILING_COUNTRY_RE.sub("", raw.strip())
+    # Python's str.capitalize() lowercases everything after the first
+    # character, which is exactly the right rule for "APPLE.COM" →
+    # "Apple.com" and "LA" → "La".
+    return " ".join(w.capitalize() for w in s.split())
 
 
 def build_daily_summary(db_path: str, *, as_of: date | None = None) -> str:
@@ -80,22 +104,58 @@ def build_daily_summary(db_path: str, *, as_of: date | None = None) -> str:
             (month,),
         ).fetchall()
 
+    # Outstanding queue — items waiting for the user to categorize.
+    # Surfaced at the top so the user sees "you have N items waiting"
+    # right when they open the morning DM.
+    with storage.connect(db_path) as con:
+        outstanding = con.execute(
+            "SELECT COUNT(*) FROM pending_txn WHERE status = 'pending'"
+        ).fetchone()[0]
+        outstanding_orders = con.execute(
+            "SELECT COUNT(*) FROM pending_order WHERE status = 'pending'"
+        ).fetchone()[0]
+
     lines: list[str] = []
     lines.append(f"☀️ {today.strftime('%A %B %d')}")
     lines.append("")
 
-    # Yesterday
+    total_outstanding = outstanding + outstanding_orders
+    if total_outstanding:
+        lines.append(
+            f"📥 {total_outstanding} item{'s' if total_outstanding != 1 else ''} "
+            f"waiting for you to categorize. Type 'next' to triage."
+        )
+        lines.append("")
+
+    # Yesterday — show ALL outflows (largest first), then any inflows
+    # at the bottom. The earlier version capped at 3 even when the count
+    # said 6+, which made the report look truncated.
     if rows_y:
         n = len(rows_y)
         total = sum(int(r["amount_cents"]) for r in rows_y)
-        spending_only = [int(r["amount_cents"]) for r in rows_y if int(r["amount_cents"]) < 0]
-        biggest = sorted(rows_y, key=lambda r: int(r["amount_cents"]))[:3]
+        outflows = sorted(
+            (r for r in rows_y if int(r["amount_cents"]) < 0),
+            key=lambda r: int(r["amount_cents"]),
+        )
+        inflows = sorted(
+            (r for r in rows_y if int(r["amount_cents"]) > 0),
+            key=lambda r: -int(r["amount_cents"]),
+        )
         lines.append(f"📋 Yesterday: {n} transactions, net {_fmt(total)}")
-        for r in biggest:
+        # Cap at 12 to keep the DM digestible. If there are more, show a
+        # "... and N more" footer so the count never lies.
+        MAX_LIST = 12
+        listed = outflows[:MAX_LIST]
+        for r in listed:
             amt = int(r["amount_cents"])
-            if amt >= 0:
-                continue
-            lines.append(f"  {_fmt(amt):>10}  {r['payee'] or '(no payee)'}")
+            lines.append(f"  {_fmt(amt):>10}  {_clean_payee(r['payee'] or '(no payee)')}")
+        if inflows and len(listed) < MAX_LIST:
+            for r in inflows[: MAX_LIST - len(listed)]:
+                amt = int(r["amount_cents"])
+                lines.append(f"  {_fmt(amt):>10}  {_clean_payee(r['payee'] or '(no payee)')}")
+        hidden = n - min(n, MAX_LIST)
+        if hidden > 0:
+            lines.append(f"  … and {hidden} more")
     else:
         lines.append("📋 No activity yesterday")
 
@@ -114,6 +174,48 @@ def build_daily_summary(db_path: str, *, as_of: date | None = None) -> str:
             else:
                 line = f"  {a['name'][:30]}: {_fmt(imported)} (YNAB)"
             lines.append(line)
+
+    # Reconciliation status — read from yesterday's audit_log events. When
+    # the bot's daily loop calls reconcile_all_observed, each account
+    # produces either reconcile_ok or reconcile_mismatch. Surface a tight
+    # summary: ✅ count, ⚠ any mismatches with delta.
+    with storage.connect(db_path) as con:
+        recon_rows = con.execute(
+            """SELECT event, details FROM audit_log
+               WHERE event IN ('reconcile_ok', 'reconcile_mismatch')
+                 AND date(ts) = ?""",
+            (today.isoformat(),),
+        ).fetchall()
+    if recon_rows:
+        ok_count = 0
+        mismatches: list[tuple[str, int]] = []  # (account_label, delta_cents)
+        for r in recon_rows:
+            try:
+                d = __import__("json").loads(r["details"] or "{}")
+            except (ValueError, TypeError):
+                continue
+            if r["event"] == "reconcile_ok":
+                ok_count += 1
+            else:
+                # Look up the account name for a friendly label
+                with storage.connect(db_path) as con2:
+                    arow = con2.execute(
+                        "SELECT name FROM account WHERE id = ?",
+                        (d.get("account_id"),),
+                    ).fetchone()
+                label = (arow["name"] if arow else d.get("account_id"))[:30]
+                mismatches.append((label, int(d.get("delta_cents") or 0)))
+        if mismatches:
+            lines.append("")
+            lines.append("⚠ Reconciliation mismatches:")
+            for label, delta in mismatches:
+                lines.append(f"  {label}: bank says {_fmt(delta)} from expected")
+        if ok_count:
+            lines.append("")
+            lines.append(
+                f"✅ Reconciled {ok_count} account{'s' if ok_count != 1 else ''} "
+                f"against bank balances."
+            )
 
     # Overspent
     if overspent:

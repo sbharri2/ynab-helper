@@ -14,14 +14,28 @@ from pydantic import BaseModel, Field
 class GmailAccount(BaseModel):
     email: str
     user_id: str
-    token_path: str
+    # Path to the legacy OAuth token JSON. Optional now that IMAP is the
+    # default — keep around so already-running deployments don't crash on
+    # config load. If both token_path and imap_password_env are set, IMAP
+    # wins.
+    token_path: str = ""
     chat_id: int
+    # Name of an env var holding the Gmail App Password (e.g.
+    # "STEVEN_GMAIL_IMAP_PASSWORD"). The bot only needs the var name in
+    # config; the actual password stays in .env / process env. App
+    # passwords require 2-Step Verification to be enabled on the
+    # account, generate at https://myaccount.google.com/apppasswords.
+    imap_password_env: str = ""
 
 
 class EmailSource(BaseModel):
     name: str
     query: str
-    parser: Literal["amazon", "amazon_shipment", "venmo", "retailer_order"]
+    parser: Literal[
+        "amazon", "amazon_shipment", "venmo", "retailer_order",
+        "citi_alert", "chase_alert",
+        "coastal_transaction_alert", "coastal_balance_summary",
+    ]
 
 
 class ObservedSource(BaseModel):

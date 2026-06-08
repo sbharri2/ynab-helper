@@ -234,6 +234,22 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "run_catchup",
+            "description": "Manually run the catchup pipeline: pull new YNAB charges + scrape new emails. Use when the user says 'catch up', 'run catchup', 'pull new', 'check email now', 'go grab anything new'. This used to auto-run every morning but is now explicit per the user's request.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "limit": {
+                        "type": "integer",
+                        "description": "Optional max rows. Default 30.",
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "unskip_pending",
             "description": "Return previously-skipped transactions to the active queue. Use when the user says 'revisit skipped', 'unskip everything', 'let me look at what I skipped', 'go back through them'. Supports filtering by recency (since_hours) or payee substring (payee_filter). Defaults to all skipped.",
             "parameters": {
@@ -314,6 +330,7 @@ TOOL_NAME_TO_FUNCTION = {
     "skip_pending": agent_tools.skip_pending_tool,
     "next_pending": agent_tools.next_pending_tool,
     "unskip_pending": agent_tools.unskip_pending_tool,
+    "run_catchup": agent_tools.run_catchup_tool,
     "create_category": agent_tools.create_category_tool,
     "move_category_to_group": agent_tools.move_category_to_group_tool,
     "rename_category": agent_tools.rename_category_tool,
@@ -334,6 +351,13 @@ GUIDELINES:
 - Use the tools' built-in fuzzy matching — pass user-written names verbatim (e.g. "groceries", not "Groceries").
 - Today's date and the current month are implicit; the tools handle that.
 - Never invent category or account names. If the user's name doesn't resolve, surface the tool's refusal message.
+
+QUEUE NAVIGATION — never tell the user the queue is empty without checking:
+- "next" / "what's next?" / "next one" / "move on" / "show me the next" → INVOKE `next_pending` (do not guess; the tool tells you if it's empty).
+- "categorize" (no specific category named) / "let me categorize" / "let's go" / "start triaging" → INVOKE `next_pending`.
+- "pull new" / "check email" / "catch up" / "any new ones?" / "pull YNAB transactions" / "fetch new charges" → INVOKE `run_catchup` (pulls fresh YNAB + Gmail, reports counts). Don't say "I don't see anything" — call the tool first.
+- "revisit skipped" / "unskip" / "let me see what I skipped" → INVOKE `unskip_pending`.
+- Only refuse with "queue is empty" if a tool you actually called returned that.
 """
 
 
@@ -459,7 +483,7 @@ def run_agent_turn(
                             "next_pending", "set_quiet"}:
                     injected["chat_id"] = chat_id
                 if name in {"create_category", "move_category_to_group",
-                            "rename_category"}:
+                            "rename_category", "run_catchup"}:
                     injected["settings"] = settings
                 result = func(db_path, **injected)
             except Exception as e:  # noqa: BLE001

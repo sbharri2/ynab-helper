@@ -279,6 +279,11 @@ def _migrate(con) -> None:
         con.execute("ALTER TABLE account ADD COLUMN balance_cents INTEGER DEFAULT 0")
     if "cleared_balance_cents" not in account_cols:
         con.execute("ALTER TABLE account ADD COLUMN cleared_balance_cents INTEGER DEFAULT 0")
+    if "last4" not in account_cols:
+        # CC last4 (e.g. "5674" for Citi Double Cash). Used by
+        # bot.ingest._resolve_account_id to map a CC alert's "Card
+        # Ending In: NNNN" payload to a local account.id.
+        con.execute("ALTER TABLE account ADD COLUMN last4 TEXT")
 
 
 def insert_pending_order(

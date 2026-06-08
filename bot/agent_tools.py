@@ -750,6 +750,44 @@ def move_category_to_group_tool(
     )
 
 
+def run_catchup_tool(
+    db_path: str, *, limit: int = 30, settings: Any = None,
+) -> str:
+    """Manually run the catchup pipeline: scrape new Amazon/Venmo emails
+    and add LLM suggestions to pending_txn rows that don't have one yet.
+
+    Use when the user says "catch up", "run catchup", "fill in suggestions",
+    "go scrape", "pull new". This used to run automatically every morning
+    but the user wants explicit control over it.
+
+    Returns a one-line summary. Subsequent items surface through the
+    push loop within seconds.
+    """
+    if settings is None:
+        return "Can't run catchup without settings loaded."
+    try:
+        from bot import gmail_watcher, ynab_watcher
+        # Pull new YNAB charges first
+        ynab_result = ynab_watcher.poll_once(settings)
+        # Then scrape Gmail for new emails
+        gmail_count = gmail_watcher.poll_once(settings)
+    except Exception as e:  # noqa: BLE001
+        log.exception("run_catchup failed: %s", e)
+        return f"Catchup hit an error: {e}"
+
+    # Count what's now in the queue
+    with storage.connect(db_path) as con:
+        pending = con.execute(
+            "SELECT COUNT(*) FROM pending_txn WHERE status = 'pending'"
+        ).fetchone()[0]
+
+    return (
+        f"Catchup done. New YNAB charges: {ynab_result.get('enqueued', 0)}, "
+        f"new emails parsed: {gmail_count}. "
+        f"Queue: {pending} pending. Type 'next' to start triaging."
+    )
+
+
 def unskip_pending_tool(
     db_path: str, *, since_hours: int | None = None,
     payee_filter: str | None = None,
