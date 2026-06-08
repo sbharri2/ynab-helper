@@ -425,11 +425,11 @@ async def _push_next_item(
         sug = item.get("suggested_category")
         if sug:
             with storage.connect(settings.paths.database) as con:
-                row = con.execute(
+                cat_row = con.execute(
                     "SELECT is_spending FROM category WHERE id = ?",
                     (sug,),
                 ).fetchone()
-            if row is not None and not row["is_spending"]:
+            if cat_row is not None and not cat_row["is_spending"]:
                 item["suggested_category"] = None
                 # Also clear the persisted suggestion so the row doesn't
                 # keep surfacing the bad pick on later push attempts.
