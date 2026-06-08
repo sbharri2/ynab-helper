@@ -195,6 +195,7 @@ def poll_once(settings: Settings) -> int:
                     "citi_alert", "chase_alert",
                     "coastal_transaction_alert",
                     "coastal_check_cleared",
+                    "paypal_payment",
                 }:
                     from bot import ingest
                     try:

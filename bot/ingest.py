@@ -47,7 +47,7 @@ log = logging.getLogger(__name__)
 _TXN_KINDS = {
     "amazon_order", "amazon_shipment", "venmo_payment", "retailer_order",
     "chase_alert", "citi_alert", "coastal_transaction_alert",
-    "coastal_check_cleared",
+    "coastal_check_cleared", "paypal_payment",
     # ynab_sync: a YNAB-side charge mirrored into the ledger via
     # ynab_watcher.poll_once. Phase 3.3 — sets up Phase 7 cutover.
     "ynab_sync",
@@ -65,7 +65,7 @@ _BALANCE_KINDS = {
 # ynab_watcher.poll_once already writes its own pending_txn for those.
 _PROMPT_USER_KINDS = {
     "chase_alert", "citi_alert", "coastal_transaction_alert",
-    "coastal_check_cleared",
+    "coastal_check_cleared", "paypal_payment",
 }
 
 
