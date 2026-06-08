@@ -33,7 +33,7 @@ class EmailSource(BaseModel):
     query: str
     parser: Literal[
         "amazon", "amazon_shipment", "venmo", "retailer_order",
-        "citi_alert", "chase_alert",
+        "citi_alert", "chase_alert", "chase_balance_summary",
         "coastal_transaction_alert", "coastal_balance_summary",
     ]
 

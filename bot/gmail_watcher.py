@@ -207,14 +207,18 @@ def poll_once(settings: Settings) -> int:
                                     source.parser, m["id"], e)
                     continue
 
-                # Coastal balance summary → write account_balance_observed
-                # via ingest, no ledger_txn / pending_order.
-                if source.parser == "coastal_balance_summary":
+                # Balance summary signals (Coastal + Chase CC) write
+                # account_balance_observed rows via ingest, no
+                # ledger_txn / pending_order.
+                if source.parser in {
+                    "coastal_balance_summary",
+                    "chase_balance_summary",
+                }:
                     from bot import ingest
                     try:
                         ingest.ingest_signal(
                             settings.paths.database,
-                            signal_kind="coastal_balance_summary",
+                            signal_kind=source.parser,
                             email_id=m["id"],
                             parsed=parsed,
                             user_id=account.user_id,

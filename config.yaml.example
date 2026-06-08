@@ -42,6 +42,10 @@ email_sources:
   - name: chase_alert
     query: 'from:alerts.chase.com subject:"You made" newer_than:3d'
     parser: chase_alert
+  # Chase CC daily balance alert ("Your Prime Visa balance is $X")
+  - name: chase_balance_summary
+    query: 'from:alerts.chase.com subject:"balance is" newer_than:3d'
+    parser: chase_balance_summary
   # Coastal FCU per-transaction alerts (checking/savings deposits + withdrawals)
   - name: coastal_transaction_alert
     query: 'from:coastal24.com subject:"Transaction Alert" newer_than:3d'

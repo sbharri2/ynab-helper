@@ -52,7 +52,11 @@ _TXN_KINDS = {
     # ynab_watcher.poll_once. Phase 3.3 — sets up Phase 7 cutover.
     "ynab_sync",
 }
-_BALANCE_KINDS = {"balance_summary", "coastal_balance_summary"}
+_BALANCE_KINDS = {
+    "balance_summary",
+    "coastal_balance_summary",
+    "chase_balance_summary",
+}
 
 # Signal kinds that should ALSO write a pending_txn row when ingest
 # creates a new ledger_txn — so the user gets a confirm-category DM
@@ -286,34 +290,70 @@ def _resolve_account_id(db_path: Path | str, parsed: dict) -> str | None:
                 return row["id"]
     last4 = parsed.get("account_last4") or parsed.get("last4")
     if last4:
+        # EXACT match on account.last4 only. Substring matching against
+        # the name field was incorrectly picking up the wrong account
+        # when the bank's reference number was a member-id-style shared
+        # number (e.g. Coastal's "*649" appears in two YNAB accounts
+        # ending in "9649"). If exact match misses, fall through to
+        # label-based matching instead.
         with storage.connect(db_path) as con:
-            # Prefer the explicit last4 column (populated via setup); fall
-            # back to substring match on the account name for accounts
-            # where the user encoded last4 in the name (e.g. "Blue Cash
-            # Everyday® - STEVEN HARRIS -81005").
             row = con.execute(
-                "SELECT id FROM account WHERE last4 = ?",
+                "SELECT id FROM account WHERE closed=0 AND last4 = ?",
                 (last4,),
             ).fetchone()
-            if not row:
-                row = con.execute(
-                    "SELECT id FROM account WHERE name LIKE ?",
-                    (f"%{last4}%",),
-                ).fetchone()
             if row:
                 return row["id"]
     # Coastal balance summaries and similar give us an account label
-    # like "JOINT CHECKING" rather than a real last4. Match by case-
-    # insensitive substring against the account name.
+    # like "JOINT CHECKING" rather than a real last4. Match — in priority
+    # order — against name + closed=0 accounts only:
+    #   1. Exact label match (case-insensitive, ignoring whitespace)
+    #   2. Alias table for bank-name → YNAB-name mismatches
+    #   3. "<label> -" prefix match — handles
+    #      "JOINT CHECKING - **********9649" reliably without matching
+    #      "OLD Joint Checking" or "JOINT CHECKING - JOINT CHECKING"
+    #   4. Substring fallback (single-result only — multi-match means
+    #      we'd guess wrong)
     label = parsed.get("account_label") or parsed.get("account_name")
     if label:
+        _LABEL_ALIASES = {
+            "SPECIAL SAVINGS": "Rainy Day Savings",
+            # Coastal account-name → YNAB-name translations go here.
+        }
+        norm = label.strip().upper()
         with storage.connect(db_path) as con:
+            # 1. Exact
             row = con.execute(
-                "SELECT id FROM account WHERE UPPER(name) LIKE UPPER(?)",
-                (f"%{label}%",),
+                "SELECT id FROM account WHERE closed=0 AND UPPER(name) = ?",
+                (norm,),
             ).fetchone()
             if row:
                 return row["id"]
+            # 2. Alias exact
+            if norm in _LABEL_ALIASES:
+                alias = _LABEL_ALIASES[norm]
+                row = con.execute(
+                    "SELECT id FROM account "
+                    "WHERE closed=0 AND UPPER(name) = UPPER(?)",
+                    (alias,),
+                ).fetchone()
+                if row:
+                    return row["id"]
+            # 3. "<label> -" prefix
+            row = con.execute(
+                "SELECT id FROM account "
+                "WHERE closed=0 AND UPPER(name) LIKE UPPER(?)",
+                (f"{label} -%",),
+            ).fetchone()
+            if row:
+                return row["id"]
+            # 4. Substring fallback — but ONLY if uniquely matched.
+            rows = con.execute(
+                "SELECT id FROM account "
+                "WHERE closed=0 AND UPPER(name) LIKE UPPER(?)",
+                (f"%{label}%",),
+            ).fetchall()
+            if len(rows) == 1:
+                return rows[0]["id"]
     return None
 
 

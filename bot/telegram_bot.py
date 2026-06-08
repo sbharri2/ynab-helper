@@ -1285,20 +1285,45 @@ async def _undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def _help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Commands:\n"
-        "  /start    — link this chat (one-time setup)\n"
-        "  /pending  — show the next queued item\n"
-        "  /digest   — force the next pending txn even outside digest window\n"
+        "*Slash commands*\n"
+        "  /start    — link this chat (one-time)\n"
+        "  /pending  — show next queued item\n"
+        "  /digest   — force-push next item regardless of window\n"
         "  /skip     — skip the current item\n"
-        "  /undo     — revert your last categorization (5-min window)\n"
+        "  /undo     — revert your last categorization (5 min window)\n"
         "  /quiet on|off — pause/resume notifications for 24h\n"
         "  /samples [<label>] [mark <id>] — Phase 0 sample inspection\n"
         "  /help     — this message\n\n"
-        "Replies during a categorization prompt:\n"
-        "  y / yes / ✅   — confirm the suggested category\n"
-        "  <category name> — use that category (e.g. 'Groceries')\n"
-        "  <free text>    — LLM picks the best-matching category\n"
-        "  skip           — defer this item"
+
+        "*During a categorize prompt*\n"
+        "  ✅ button or `y` / `yes` — confirm the suggestion\n"
+        "  tap a button — pick that category\n"
+        "  type a category name — `groceries`, `cell phone`, `sewing class`\n"
+        "  `skip` — defer\n\n"
+
+        "*Talk to the bot in plain English (AI agent)*\n"
+        "Queue navigation:\n"
+        "  `next` / `what's next?` — push the next pending item\n"
+        "  `pull new` / `check email` / `run catchup` — manual poll\n"
+        "  `unskip everything` / `revisit skipped`\n"
+        "  `unskip etsy ones` (payee filter)\n\n"
+        "Budget queries:\n"
+        "  `how much is left in groceries?`\n"
+        "  `where are we tight this month?`\n"
+        "  `show me amazon last 30 days`\n"
+        "  `joint checking balance`\n\n"
+        "Budget changes:\n"
+        "  `put $200 in groceries`\n"
+        "  `move $50 from dining to groceries`\n"
+        "  `apply historical budget` — seed all categories from last 12 months\n\n"
+        "Category management:\n"
+        "  `create a category for password manager` (defaults to Monthly Bills)\n"
+        "  `create Password Manager for $5/mo under Annual or Seasonal Costs`\n"
+        "  `move Password Manager to Annual or Seasonal Costs`\n"
+        "  `rename Password Manager to 1Password`\n\n"
+        "Notifications:\n"
+        "  `pause for 2 hours` / `quiet` / `mute`\n",
+        parse_mode="Markdown",
     )
 
 
