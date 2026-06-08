@@ -30,7 +30,15 @@ def _is_amazon_or_venmo(payee: str) -> str | None:
 
 
 def poll_once(settings: Settings) -> dict:
-    """Returns {matched: N, enqueued: M, expired: E}."""
+    """Returns {matched, enqueued, already_queued, expired}.
+
+    Counts:
+      matched         — Amazon/Venmo orders we resolved + pushed to YNAB
+      enqueued        — pending_txn rows ACTUALLY inserted (new)
+      already_queued  — uncategorized YNAB txns that we'd already pulled in
+                        a prior poll (the steady-state backlog)
+      expired         — pending_orders that aged out without matching
+    """
     storage.init_db(settings.paths.database)
     ynab = YnabClient(settings.ynab_token, settings.ynab.budget_id)
 
@@ -41,6 +49,7 @@ def poll_once(settings: Settings) -> dict:
 
     matched = 0
     enqueued = 0
+    already_queued = 0
 
     for txn in txns:
         source = _is_amazon_or_venmo(txn["payee"])
@@ -48,8 +57,10 @@ def poll_once(settings: Settings) -> dict:
             candidates = [o for o in pending_orders if o["source"] == source]
             best = find_best_match(candidates, txn, source=source)
             if best is None:
-                _enqueue(settings, txn)
-                enqueued += 1
+                if _enqueue(settings, txn):
+                    enqueued += 1
+                else:
+                    already_queued += 1
                 continue
             category_id = best["chosen_category"]
             if not category_id:
@@ -69,22 +80,36 @@ def poll_once(settings: Settings) -> dict:
             except Exception as e:
                 log.error("set_category failed: %s", e)
         else:
-            _enqueue(settings, txn)
-            enqueued += 1
+            if _enqueue(settings, txn):
+                enqueued += 1
+            else:
+                already_queued += 1
 
     expired = _expire_stale_orders(settings.paths.database, days=30)
-    storage.audit(settings.paths.database, "ynab_poll",
-                  {"matched": matched, "enqueued": enqueued, "expired": expired})
-    return {"matched": matched, "enqueued": enqueued, "expired": expired}
+
+    # Only audit when something interesting happened — every 5min poll
+    # logging "0/N/56/0" floods the audit log without adding value.
+    # Always-audit if expired or matched > 0 (rare events worth seeing).
+    if enqueued or matched or expired:
+        storage.audit(settings.paths.database, "ynab_poll", {
+            "matched": matched, "enqueued": enqueued,
+            "already_queued": already_queued, "expired": expired,
+        })
+    return {"matched": matched, "enqueued": enqueued,
+            "already_queued": already_queued, "expired": expired}
 
 
-def _enqueue(settings: Settings, txn: dict) -> None:
-    # TODO(MVP-1.1): gate enqueue/push on `settings.telegram.daily_digest_time`
-    #   so non-Amazon/Venmo txns batch at 9am instead of pushing in real-time.
-    #   Currently the bot's 30s push loop will surface them as soon as inserted.
+def _enqueue(settings: Settings, txn: dict) -> bool:
+    """Insert txn into pending_txn + mirror to ledger via ingest.
+
+    Returns True when the pending_txn row was actually new, False if
+    insert_pending_txn returned None (already present — dedup'd on
+    ynab_txn_id). poll_once uses this to count real intake vs the
+    steady-state backlog.
+    """
     # TODO(MVP-2): route to the correct user_id from the YNAB account, not the
     #   first gmail account (hard-codes single-user assumption).
-    storage.insert_pending_txn(
+    new_id = storage.insert_pending_txn(
         settings.paths.database,
         user_id=settings.gmail_accounts[0].user_id,
         ynab_txn_id=txn["ynab_txn_id"],
@@ -119,6 +144,7 @@ def _enqueue(settings: Settings, txn: dict) -> None:
     except Exception as e:  # noqa: BLE001 - never crash enqueue on ledger error
         log.warning("ledger ingest from ynab_watcher failed (%s): %s",
                     txn.get("ynab_txn_id"), e)
+    return new_id is not None
 
 
 def _expire_stale_orders(db_path, *, days: int = 30) -> int:

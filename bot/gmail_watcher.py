@@ -50,6 +50,12 @@ def _build_gmail_service(token_path: str):
     return build("gmail", "v1", credentials=creds, cache_discovery=False)
 
 
+# YNAB's canonical "Inflow: Ready to Assign" category id. Mirrored locally
+# from import_ynab_history. Venmo inflows route here automatically; the
+# user shouldn't be prompted to categorize income as a spending category.
+_INFLOW_READY_TO_ASSIGN_ID = "1fbde6be-7144-4752-ae25-6afa80b09f95"
+
+
 def _account_imap_password(account) -> str | None:
     """Resolve the App Password for an account from its env var name."""
     env_name = getattr(account, "imap_password_env", "")
@@ -246,6 +252,27 @@ def poll_once(settings: Settings) -> int:
                     )
                     new_count += 1
                 except sqlite3.IntegrityError:
+                    continue
+
+                # Venmo INFLOWS ("Jane paid you $20", charged_by) should
+                # never run through the LLM — they're not spending. The
+                # LLM was guessing Dining/Groceries because every option
+                # in the spending-only category list is a spending
+                # category. Short-circuit to Inflow: Ready to Assign so
+                # YNAB's normal income flow handles it.
+                if (parsed.get("source") == "venmo"
+                        and parsed.get("direction") in {"received", "charged_by"}):
+                    inflow_cat_id = _INFLOW_READY_TO_ASSIGN_ID
+                    with storage.connect(settings.paths.database) as con:
+                        con.execute(
+                            "UPDATE pending_order SET suggested_category = ?, "
+                            "suggested_confidence = 1.0 WHERE id = ?",
+                            (inflow_cat_id, row_id),
+                        )
+                    storage.audit(settings.paths.database, "pending_order_inserted",
+                                  {"id": row_id, "source": parsed["source"],
+                                   "auto_inflow": True})
+                    _mark_done()
                     continue
 
                 payee_for_priors = parsed.get("counterparty") or parsed["source"]
