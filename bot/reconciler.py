@@ -69,11 +69,23 @@ def reconcile_account(
             "SELECT balance_cents FROM account WHERE id = ?",
             (account_id,),
         ).fetchone()
+        # account.balance_cents is YNAB's current balance at IMPORT TIME.
+        # That number already incorporates every transaction in
+        # ledger_txn through the import date — adding them all again
+        # would inflate the expected balance by years of history. Only
+        # sum transactions AFTER the most recent ynab_history_import.
+        anchor_row = con.execute(
+            "SELECT MAX(ts) AS ts FROM audit_log WHERE event = 'ynab_history_import'"
+        ).fetchone()
+        anchor_ts = anchor_row["ts"] if anchor_row else None
+        anchor_date = (anchor_ts[:10] if anchor_ts else "1970-01-01")
         sum_row = con.execute(
             """SELECT COALESCE(SUM(amount_cents), 0) AS s
                FROM ledger_txn
-               WHERE account_id = ? AND posted_date <= ?""",
-            (account_id, as_of_date),
+               WHERE account_id = ?
+                 AND posted_date > ?
+                 AND posted_date <= ?""",
+            (account_id, anchor_date, as_of_date),
         ).fetchone()
 
     if observed_row is None:
@@ -87,16 +99,27 @@ def reconcile_account(
         }
 
     starting = int((acct_row or {"balance_cents": 0})["balance_cents"] or 0)
-    # NOTE: account.balance_cents is the YNAB-import snapshot (a "current"
-    # number as of import day). For a strict reconcile this would need to be
-    # the *beginning of history* anchor, but in practice this module is
-    # meant to be called daily against a recent date — so the comparison is
-    # really "did we move from yesterday's anchor by what we expected?"
-    # When Phase 7 cuts over, we'll re-anchor balance_cents to the cutover
-    # date and the math becomes exact.
+    # NOTE: account.balance_cents is the YNAB-import snapshot. Sum only
+    # transactions since that import (see anchor_date above).
     expected = starting + int(sum_row["s"] or 0)
     observed = int(observed_row["balance_cents"])
-    delta = observed - expected
+
+    # Sign-convention normalization for credit cards. YNAB returns the
+    # cardholder-view balance (positive when in credit / overpaid); our
+    # CC alert parsers store "Your balance is $X" as -X (debt convention).
+    # Comparing raw signed values produces nonsense mismatches. For CC
+    # accounts compare absolute values — the magnitude is what matters
+    # for reconciliation, the sign is just bookkeeping convention.
+    with storage.connect(db_path) as con:
+        acct_type_row = con.execute(
+            "SELECT type FROM account WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+    is_credit_card = (acct_type_row and acct_type_row["type"] == "credit_card")
+    if is_credit_card:
+        delta = abs(observed) - abs(expected)
+    else:
+        delta = observed - expected
 
     reconciled_count = 0
     if abs(delta) <= tolerance_cents:

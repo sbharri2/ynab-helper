@@ -316,8 +316,10 @@ def _resolve_account_id(db_path: Path | str, parsed: dict) -> str | None:
     label = parsed.get("account_label") or parsed.get("account_name")
     if label:
         _LABEL_ALIASES = {
-            "SPECIAL SAVINGS": "Rainy Day Savings",
             # Coastal account-name → YNAB-name translations go here.
+            # NOTE: "SPECIAL SAVINGS" is Coastal's $5 share-required
+            # membership account, NOT the Rainy Day Savings at the
+            # high-yield bank. Don't alias it — let it skip resolution.
         }
         norm = label.strip().upper()
         with storage.connect(db_path) as con:
