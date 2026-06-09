@@ -57,14 +57,26 @@ class YnabClient:
                 })
             return results
 
-    def set_category(self, ynab_txn_id: str, category_id: str) -> None:
+    def set_category(self, ynab_txn_id: str, category_id: str,
+                     approved: bool = True) -> None:
+        """Assign a category to a YNAB transaction and mark it approved.
+
+        YNAB transactions imported by the bank feed land as
+        approved=false — they still need a human (or a third-party) to
+        sign off. The bot's bot Telegram prompt IS that human signoff,
+        so we set approved=True in the same PATCH. The user can flip
+        ``approved`` back to False if they need a different workflow.
+        """
         with self._api() as api_client:
             api = ynab.TransactionsApi(api_client)
             api.update_transaction(
                 plan_id=self.budget_id,
                 transaction_id=ynab_txn_id,
                 data=ynab.PutTransactionWrapper(
-                    transaction=ynab.ExistingTransaction(category_id=category_id)
+                    transaction=ynab.ExistingTransaction(
+                        category_id=category_id,
+                        approved=approved,
+                    )
                 ),
             )
 
