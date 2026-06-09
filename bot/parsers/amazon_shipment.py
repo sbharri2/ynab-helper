@@ -91,6 +91,18 @@ def parse(
     summary = (f"{len(items)} item(s): " + ", ".join(items[:3])
                + (f" (+{len(items) - 3} more)" if len(items) > 3 else ""))
 
+    # Status: fail when both total + items are missing — Amazon
+    # occasionally changes the shipment template and the parser can't
+    # extract anything useful. Returning 'partial' for those let junk
+    # ($0.00 / "(could not parse items)") leak into the user's queue.
+    # 'fail' makes gmail_watcher skip them. amazon.py uses the same rule.
+    if not missing:
+        status = "ok"
+    elif total_cents is None and items == ["(could not parse items)"]:
+        status = "fail"
+    else:
+        status = "partial"
+
     return {
         "source": "amazon",  # Same source label - matcher treats it identically
         "order_id": order_id,
@@ -98,6 +110,6 @@ def parse(
         "order_date": order_date,
         "items": items,
         "summary": summary,
-        "parse_status": "ok" if not missing else "partial",
+        "parse_status": status,
         "missing_fields": missing,
     }
