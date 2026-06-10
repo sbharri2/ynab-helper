@@ -499,6 +499,14 @@ async def _push_next_item(
                 (chat_id, user_id, item["kind"], item["id"],
                  sent.message_id, _utcnow()),
             )
+            # Record that we just pushed this row so the queue rotates
+            # past it on the next pick (see next_item_for_user's
+            # last_pushed_at ordering).
+            table = "pending_order" if item["kind"] == "order" else "pending_txn"
+            con.execute(
+                f"UPDATE {table} SET last_pushed_at = ? WHERE id = ?",
+                (_utcnow(), item["id"]),
+            )
     return True
 
 
@@ -956,11 +964,12 @@ async def _push_loop(app: Application) -> None:
                         (chat_id,),
                     ).fetchone()
                 if row and row["last_asked_id"] is not None:
-                    # Staleness guard: if the user ignored the last DM for
-                    # more than IGNORED_TTL_MINUTES, treat the pointer as
-                    # abandoned and clear it so the queue keeps moving.
-                    # Otherwise the bot stalls forever on a single ignored
-                    # message (see project_bot_stalls_on_ignored_dm).
+                    # Staleness guard: if the user ignored the DM for more
+                    # than IGNORED_TTL_MINUTES, mark THAT row as 'skipped'
+                    # so the queue advances past it. Without this the bot
+                    # re-pushes the same lowest-id row every 60 min and the
+                    # user keeps seeing the same prompt. The skipped item
+                    # is recoverable via `unskip` agent tool.
                     last_action_at = row["last_action_at"]
                     IGNORED_TTL_MINUTES = 60
                     is_stale = False
@@ -971,17 +980,33 @@ async def _push_loop(app: Application) -> None:
                         is_stale = age.total_seconds() > IGNORED_TTL_MINUTES * 60
                     if not is_stale:
                         continue
-                    log.info("push_loop: clearing stale in-flight pointer for chat %s "
-                             "(last_action_at=%s)", chat_id, last_action_at)
+                    stale_id = row["last_asked_id"]
+                    stale_kind = row["last_asked_kind"]
+                    log.info("push_loop: ignored %s id=%s for chat %s; "
+                             "marking skipped + clearing pointer",
+                             stale_kind, stale_id, chat_id)
+                    stale_table = ("pending_order"
+                                   if stale_kind == "order"
+                                   else "pending_txn")
                     with storage.connect(settings.paths.database) as con:
+                        # status='skipped' on the row + clear pointer.
+                        # pending_order has expired as its analog status.
+                        new_status = ("expired"
+                                      if stale_kind == "order"
+                                      else "skipped")
+                        con.execute(
+                            f"UPDATE {stale_table} SET status = ? WHERE id = ?",
+                            (new_status, stale_id),
+                        )
                         con.execute(
                             "UPDATE bot_conversation SET last_asked_id = NULL, "
                             "last_asked_message_id = NULL WHERE chat_id = ?",
                             (chat_id,),
                         )
-                    storage.audit(settings.paths.database, "ignored_dm_cleared",
+                    storage.audit(settings.paths.database, "ignored_dm_skipped",
                                   {"chat_id": chat_id,
-                                   "stale_last_asked_id": row["last_asked_id"]})
+                                   "kind": stale_kind,
+                                   "id": stale_id})
                 if row and row["quiet_until"] is not None:
                     qu = row["quiet_until"]
                     # qu is a tz-naive datetime (stored as isoformat); compare

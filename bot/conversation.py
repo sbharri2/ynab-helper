@@ -24,10 +24,14 @@ def next_item_for_user(
     window (see ``_in_digest_window`` in telegram_bot).
     """
     with storage.connect(db_path) as con:
+        # Linear order by id — the natural arrival order. When the
+        # user ignores a DM, the push_loop's staleness guard marks the
+        # row as 'skipped' (see telegram_bot._push_loop) so it doesn't
+        # block the queue forever. User can `/unskip` to revisit.
         order = con.execute(
             """SELECT * FROM pending_order
                WHERE user_id = ? AND status = 'pending'
-               ORDER BY id LIMIT 1""",
+               ORDER BY id ASC LIMIT 1""",
             (user_id,),
         ).fetchone()
         if order:
@@ -39,14 +43,10 @@ def next_item_for_user(
         if not include_txns:
             return None
 
-        # No suggested_category filter: bot DMs even no-guess items with a
-        # "no guess — what category?" prompt. Better UX than silent queue.
-        # The 86 backlog rows where we wiped bad LLM defaults (Chase Amazon,
-        # Sewing Class, etc.) become DM-eligible again as no-guess prompts.
         txn = con.execute(
             """SELECT * FROM pending_txn
                WHERE user_id = ? AND status = 'pending'
-               ORDER BY id LIMIT 1""",
+               ORDER BY id ASC LIMIT 1""",
             (user_id,),
         ).fetchone()
         if txn:

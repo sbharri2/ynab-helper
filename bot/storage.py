@@ -285,6 +285,18 @@ def _migrate(con) -> None:
         # Ending In: NNNN" payload to a local account.id.
         con.execute("ALTER TABLE account ADD COLUMN last4 TEXT")
 
+    # pending_txn / pending_order get last_pushed_at so the push loop
+    # rotates through ignored items instead of re-pushing the lowest-id
+    # row over and over after the 60-min staleness guard fires.
+    txn_cols = {r[1] for r in con.execute("PRAGMA table_info(pending_txn)")}
+    if "last_pushed_at" not in txn_cols:
+        con.execute("ALTER TABLE pending_txn ADD COLUMN last_pushed_at TIMESTAMP")
+    order_cols = {r[1] for r in con.execute("PRAGMA table_info(pending_order)")}
+    if "last_pushed_at" not in order_cols:
+        con.execute(
+            "ALTER TABLE pending_order ADD COLUMN last_pushed_at TIMESTAMP"
+        )
+
 
 def insert_pending_order(
     db_path: Path | str,

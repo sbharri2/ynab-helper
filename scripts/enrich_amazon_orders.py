@@ -51,8 +51,10 @@ def parse_args():
                    help="skip backfilling ledger_txn.memo for historical rows")
     p.add_argument("--skip-pending", action="store_true",
                    help="skip enriching pending_txn / re-running categorizer")
-    p.add_argument("--window-days", type=int, default=5,
-                   help="match txn_date within [order_date, order_date+N]")
+    p.add_argument("--window-days", type=int, default=14,
+                   help="match txn_date within [order_date, order_date+N]. "
+                        "Default 14 — Amazon Subscribe & Save / multi-shipment "
+                        "orders can post 7-14 days after the order date.")
     return p.parse_args()
 
 
