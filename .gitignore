@@ -52,3 +52,12 @@ tests/fixtures/venmo_emails/*
 __pycache__/
 *.egg-info/
 *.pyc
+
+# Secrets & local-only artifacts (never commit)
+_LOCAL_SECRETS_/
+ui_api_token.txt
+*.bak
+*.pre-move-bak
+
+# Local agent / editor config
+.claude/
