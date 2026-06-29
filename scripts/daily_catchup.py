@@ -1,15 +1,19 @@
-"""Daily catch-up: add LLM suggestions to N pending_txn rows so the bot DMs
-them in the daily-digest window.
+"""Daily catch-up: add LLM suggestions to N pending_txn rows that lack
+one, so the bot's HOT-lane push loop can DM them.
 
-How it fits in:
-  - ynab_watcher enqueues uncategorized YNAB transactions into pending_txn with
-    no suggestion. Those rows are NOT eligible for DM (next_item_for_user
-    requires suggested_category IS NOT NULL).
-  - This script picks the N oldest such rows, enriches Amazon/Venmo with the
+How it fits in (Phase 7+):
+  - bot.gmail_watcher (in-process, 60s cadence) is the only source that
+    enqueues new pending_txn rows. Most arrive with a suggestion via the
+    override map, strong-prior matcher, or the LLM categorizer running
+    inside ingest_signal.
+  - Any row that still has suggested_category=NULL — usually because
+    Ollama was slow or the LLM aborted — gets retried by THIS script.
+  - It picks the N oldest such rows, enriches Amazon/Venmo with the
     matching email's parsed summary (when available), runs the LLM, and
-    writes suggested_category back. Bot then picks them up.
+    writes suggested_category back. The push loop picks them up next.
 
-Scheduled to run once per day. --limit controls the daily quota (default 20).
+Scheduled to run once per day at 7:30am. --limit controls the daily
+quota (default 20).
 """
 from __future__ import annotations
 
@@ -19,6 +23,8 @@ import re
 import time
 from datetime import date, timedelta
 from pathlib import Path
+
+import os
 
 from bot import storage
 from bot.categorizer import Categorizer
@@ -57,39 +63,41 @@ def parse_args():
     return p.parse_args()
 
 
-def fetch_email_ids(svc, query: str, since_d: date) -> list[dict]:
-    """Paginated Gmail message-id list for `query` filtered to after since_d."""
-    full_query = f"{query} after:{since_d.strftime('%Y/%m/%d')}"
-    out, page_token = [], None
-    while True:
-        resp = svc.users().messages().list(
-            userId="me", q=full_query, maxResults=100, pageToken=page_token,
-        ).execute()
-        out.extend(resp.get("messages", []))
-        page_token = resp.get("nextPageToken")
-        if not page_token:
-            break
-    return out
+def _rewrite_query_for_window(query: str, since_d: date) -> str:
+    """Replace any `newer_than:Nd` clause with `after:YYYY/MM/DD` so the
+    Gmail-syntax search is anchored to our backfill window, not the
+    rolling "last N days" the live watcher uses.
+    """
+    stripped = re.sub(r"\s*newer_than:\S+\s*", " ", query).strip()
+    return f"{stripped} after:{since_d.strftime('%Y/%m/%d')}".strip()
 
 
-def scrape_orders(settings, since_d: date) -> list[dict]:
-    """Returns parsed pending-order-shaped dicts from Amazon + Venmo emails since."""
-    orders = []
-    for account in settings.gmail_accounts:
-        svc = _build_gmail_service(account.token_path)
+def _scrape_via_imap(account, settings, since_d: date) -> list[dict]:
+    """IMAP path: matches gmail_watcher.poll_once's _iter_imap behavior."""
+    from bot.gmail_imap import (
+        GmailIMAP,
+        extract_body as imap_extract_body,
+        extract_headers as imap_extract_headers,
+    )
+    pw = os.environ.get(account.imap_password_env, "")
+    if not pw:
+        log.warning("imap password env %r empty for %s; skipping",
+                    account.imap_password_env, account.email)
+        return []
+    out: list[dict] = []
+    with GmailIMAP(account.email, pw) as imap:
         for source in settings.email_sources:
-            base_query = re.sub(r"\s*newer_than:\S+\s*", " ", source.query).strip()
-            log.info("scraping %s from %s ...", source.name, account.email)
-            ids = fetch_email_ids(svc, base_query, since_d)
-            log.info("  found %d %s emails", len(ids), source.name)
+            full_query = _rewrite_query_for_window(source.query, since_d)
+            log.info("scraping %s from %s (imap)...", source.name, account.email)
+            uids = imap.search(full_query)
+            log.info("  found %d %s emails", len(uids), source.name)
             parser = _load_parser(source.parser)
-            for m in ids:
-                msg = svc.users().messages().get(
-                    userId="me", id=m["id"], format="full",
-                ).execute()
-                body = _extract_body(msg)
-                headers = {h["name"]: h["value"]
-                           for h in msg["payload"].get("headers", [])}
+            for uid in uids:
+                msg = imap.fetch_message(uid)
+                if msg is None:
+                    continue
+                body = imap_extract_body(msg)
+                headers = imap_extract_headers(msg)
                 parsed = parser(
                     body,
                     subject=headers.get("Subject", ""),
@@ -97,7 +105,7 @@ def scrape_orders(settings, since_d: date) -> list[dict]:
                 )
                 if parsed["parse_status"] not in {"ok", "partial"}:
                     continue
-                orders.append({
+                out.append({
                     "source": parsed["source"],
                     "parser": source.parser,
                     "external_id": parsed.get("order_id")
@@ -107,6 +115,71 @@ def scrape_orders(settings, since_d: date) -> list[dict]:
                                    or parsed.get("amount_cents") or 0,
                     "summary": parsed.get("summary", ""),
                 })
+    return out
+
+
+def _scrape_via_oauth(account, settings, since_d: date) -> list[dict]:
+    """Legacy OAuth path. Kept so accounts without an App Password still
+    work — but in practice the OAuth tokens expire weekly, so this is
+    expected to fail with invalid_grant for the main account until the
+    user migrates it to IMAP (set imap_password_env on the account).
+    """
+    svc = _build_gmail_service(account.token_path)
+    out: list[dict] = []
+    for source in settings.email_sources:
+        full_query = _rewrite_query_for_window(source.query, since_d)
+        log.info("scraping %s from %s (oauth)...", source.name, account.email)
+        ids, page_token = [], None
+        while True:
+            resp = svc.users().messages().list(
+                userId="me", q=full_query, maxResults=100, pageToken=page_token,
+            ).execute()
+            ids.extend(resp.get("messages", []))
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        log.info("  found %d %s emails", len(ids), source.name)
+        parser = _load_parser(source.parser)
+        for m in ids:
+            msg = svc.users().messages().get(
+                userId="me", id=m["id"], format="full",
+            ).execute()
+            body = _extract_body(msg)
+            headers = {h["name"]: h["value"]
+                       for h in msg["payload"].get("headers", [])}
+            parsed = parser(
+                body,
+                subject=headers.get("Subject", ""),
+                date_header=headers.get("Date", ""),
+            )
+            if parsed["parse_status"] not in {"ok", "partial"}:
+                continue
+            out.append({
+                "source": parsed["source"],
+                "parser": source.parser,
+                "external_id": parsed.get("order_id")
+                               or parsed.get("counterparty") or "",
+                "order_date": parsed.get("order_date") or date.today(),
+                "total_cents": parsed.get("total_cents")
+                               or parsed.get("amount_cents") or 0,
+                "summary": parsed.get("summary", ""),
+            })
+    return out
+
+
+def scrape_orders(settings, since_d: date) -> list[dict]:
+    """Returns parsed pending-order-shaped dicts from Amazon + Venmo emails since."""
+    orders: list[dict] = []
+    for account in settings.gmail_accounts:
+        use_imap = bool(os.environ.get(getattr(account, "imap_password_env", ""), ""))
+        try:
+            if use_imap:
+                orders.extend(_scrape_via_imap(account, settings, since_d))
+            else:
+                orders.extend(_scrape_via_oauth(account, settings, since_d))
+        except Exception as e:  # noqa: BLE001
+            log.error("scrape failed for %s (%s): %s",
+                      account.email, "imap" if use_imap else "oauth", e)
     return _dedupe_amazon_orders(orders)
 
 

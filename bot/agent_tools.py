@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
@@ -126,7 +127,7 @@ def get_account_balance(db_path: str, *, account_name: str) -> str:
             """SELECT
                  COALESCE(SUM(amount_cents), 0) AS total,
                  COALESCE(SUM(CASE WHEN cleared IN ('cleared','reconciled') THEN amount_cents ELSE 0 END), 0) AS cleared_total
-               FROM ledger_txn WHERE account_id = ?""",
+               FROM ledger_txn WHERE account_id = ? AND is_split = 0""",
             (acct["id"],),
         ).fetchone()
     cleared = int(row["cleared_total"])
@@ -136,6 +137,78 @@ def get_account_balance(db_path: str, *, account_name: str) -> str:
     if pending:
         msg += f", {_fmt_money(pending)} pending → {_fmt_money(total)} total"
     return msg
+
+
+# Steven's standard "flex" categories — the discretionary spending pots he
+# checks most often. Add a category-name string here to include it in the
+# default flex snapshot. Matches LOWER(name) exactly, so keep these in sync
+# with what your YNAB calls them.
+FLEX_CATEGORY_NAMES: list[str] = [
+    "Dining Out/Entertainment",
+    "Gifts",
+    "Household Items",
+    "Vacation",
+    "Home Maintenance and Improvement",
+    "Steven Personal Savings",
+    "Allison Personal Savings",
+]
+
+
+def get_flex_budget(db_path: str) -> str:
+    """Return current-month balance for Steven's standard 'flex' categories.
+
+    These are the discretionary pots he checks together: dining, gifts,
+    household, vacation, home improvement, and the two personal-savings
+    buckets. One DM-friendly block, with budget / spent / available for
+    each row.
+    """
+    month = _current_month()
+    # Recompute these categories first so the numbers reflect every
+    # categorize-tap up to the moment the user asked.
+    with storage.connect(db_path) as con:
+        cat_ids = [
+            r["id"] for r in con.execute(
+                "SELECT id FROM category "
+                "WHERE LOWER(name) IN ({}) AND hidden = 0".format(
+                    ",".join(["?"] * len(FLEX_CATEGORY_NAMES))
+                ),
+                [n.lower() for n in FLEX_CATEGORY_NAMES],
+            ).fetchall()
+        ]
+    if cat_ids:
+        envelope.recompute_month(db_path, month, category_ids=cat_ids)
+
+    with storage.connect(db_path) as con:
+        rows = con.execute(
+            "SELECT c.name, "
+            "       COALESCE(mc.budgeted_cents, 0) AS bud, "
+            "       COALESCE(mc.activity_cents, 0) AS act, "
+            "       COALESCE(mc.available_cents, 0) AS avail "
+            "FROM category c "
+            "LEFT JOIN month_category mc "
+            "  ON mc.category_id = c.id AND mc.month = ? "
+            "WHERE LOWER(c.name) IN ({}) AND c.hidden = 0 "
+            "ORDER BY c.name".format(
+                ",".join(["?"] * len(FLEX_CATEGORY_NAMES))
+            ),
+            [month, *(n.lower() for n in FLEX_CATEGORY_NAMES)],
+        ).fetchall()
+
+    if not rows:
+        return "No flex categories matched. Check the FLEX_CATEGORY_NAMES list."
+
+    lines = [f"📊 Flex budget — {month}:"]
+    for r in rows:
+        bud = int(r["bud"])
+        act = int(r["act"])
+        avail = int(r["avail"])
+        spent = -act if act < 0 else 0
+        pct = f" ({spent / bud * 100:.0f}%)" if bud > 0 else ""
+        lines.append(
+            f"  {r['name']}: {_fmt_money(avail)} left  "
+            f"(spent {_fmt_money(-spent)} of {_fmt_money(bud)}{pct})"
+        )
+    return "\n".join(lines)
 
 
 def list_categories_overview(db_path: str, *, group_filter: str | None = None) -> str:
@@ -202,6 +275,7 @@ def show_drill_down(
                 """SELECT posted_date, payee, amount_cents, memo, category_id
                    FROM ledger_txn
                    WHERE LOWER(payee) LIKE ? AND posted_date >= ?
+                     AND parent_txn_id IS NULL
                    ORDER BY posted_date DESC LIMIT ?""",
                 (f"%{target.lower()}%", cutoff, limit),
             ).fetchall()
@@ -214,6 +288,7 @@ def show_drill_down(
                 """SELECT posted_date, payee, amount_cents, memo
                    FROM ledger_txn
                    WHERE account_id = ? AND posted_date >= ?
+                     AND parent_txn_id IS NULL
                    ORDER BY posted_date DESC LIMIT ?""",
                 (acct["id"], cutoff, limit),
             ).fetchall()
@@ -435,7 +510,18 @@ def categorize_pending_tool(
         {"kind": row["last_asked_kind"], "id": row["last_asked_id"],
          "category_id": cat["id"], "via": "agent"},
     )
-    return f"Categorized as {cat['name']}. Moving to next."
+
+    try:
+        remaining = envelope.available_for_category(
+            db_path, category_id=cat["id"],
+        )
+        return (
+            f"Categorized as {cat['name']}. "
+            f"{cat['name']}: {_fmt_money(remaining)} left this month. "
+            f"Moving to next."
+        )
+    except Exception:  # noqa: BLE001
+        return f"Categorized as {cat['name']}. Moving to next."
 
 
 def skip_pending_tool(db_path: str, *, chat_id: int) -> str:
@@ -512,6 +598,201 @@ def _title_case_category(raw: str) -> str:
         else:
             out.append(word[:1].upper() + word[1:].lower())
     return " ".join(out)
+
+
+def list_pending_tool(db_path: str, *, chat_id: int) -> str:
+    """Summarize the current pending queue WITHOUT consuming it.
+
+    Numbering starts at 1 every time — fresh, not stitched against any
+    older batch. Overwrites last_batch_json with the freshly-numbered
+    items so a follow-up like "1. Vacation 3. Groceries" hits the same
+    pt_ids the user just saw.
+
+    Use when the user asks meta questions: "what's pending?", "how many
+    uncategorized?", "show me the queue".
+    """
+    with storage.connect(db_path) as con:
+        # Resolve chat_id → user_id so list_pending shows the SAME rows
+        # /batch does for this user. Each user only sees their own queue
+        # (joint household but per-user assignment from the inflow router).
+        user_row = con.execute(
+            """SELECT user_id FROM bot_conversation WHERE chat_id = ?""",
+            (chat_id,),
+        ).fetchone()
+        user_id = user_row["user_id"] if user_row else None
+
+        # Match /batch exactly per 2026-06-28 directive: this user's queue
+        # only, skip Amazon (has /amazon), skip 'hold' lane (waiting for
+        # receipt).
+        rows = con.execute(
+            """SELECT id, payee, amount_cents, txn_date, suggested_category
+               FROM pending_txn WHERE status = 'pending'
+                  AND assigned_to_user_id = ?
+                  AND queue_lane <> 'hold'
+                  AND NOT (UPPER(payee) LIKE '%AMAZON%' OR UPPER(payee) LIKE '%AMZN%')
+               ORDER BY txn_date DESC, id DESC
+               LIMIT 25""",
+            (user_id,),
+        ).fetchall()
+        orders = con.execute(
+            """SELECT id, source, total_cents AS amount_cents, order_date AS txn_date,
+                      raw_summary
+               FROM pending_order WHERE status = 'pending'
+                  AND assigned_to_user_id = ?
+                  AND source <> 'amazon'
+               ORDER BY order_date DESC, id DESC LIMIT 10""",
+            (user_id,),
+        ).fetchall()
+
+    if not rows and not orders:
+        # Wipe any stale batch so a follow-up like "1. Vacation" can't
+        # accidentally hit an old item.
+        with storage.connect(db_path) as con:
+            con.execute(
+                "UPDATE bot_conversation SET last_batch_json = NULL WHERE chat_id = ?",
+                (chat_id,),
+            )
+        return "Queue is empty — nothing pending. ✨"
+
+    lines = [f"{len(rows)} pending transactions" +
+             (f" + {len(orders)} unmatched orders" if orders else "") + ":"]
+    # Build the persisted mapping in lockstep with the user-visible numbers.
+    persisted_items: list[dict] = []
+    for i, r in enumerate(rows, start=1):
+        cat_hint = ""
+        if r["suggested_category"]:
+            sug = _resolve_category_by_id(db_path, r["suggested_category"])
+            if sug:
+                cat_hint = f" → suggest {sug['name']}"
+        lines.append(
+            f"  {i}. ${abs(r['amount_cents'])/100:.2f} {r['payee']} "
+            f"({r['txn_date']}){cat_hint}"
+        )
+        persisted_items.append({"n": i, "pt_id": int(r["id"]), "checked": False})
+
+    if orders:
+        lines.append("Unmatched orders:")
+        for o in orders:
+            label = (o["raw_summary"] or o["source"] or "?")[:40]
+            lines.append(
+                f"  • ${o['amount_cents']/100:.2f} {label} ({o['txn_date']})"
+            )
+    lines.append("")
+    lines.append('Reply like "1. Vacation 3. Groceries" to categorize multiple at once, '
+                 'or "next" to triage one-by-one.')
+
+    # Overwrite last_batch_json so categorize_batch_numbered sees the SAME
+    # numbers the user just saw. message_id=None — this batch backs a text
+    # reply, not a keyboard; the batch-callback path (bt:N taps) checks
+    # for message_id before trying to edit.
+    payload = {
+        "items": persisted_items,
+        "message_id": None,
+        "sent_at": None,
+        "consumed": False,
+        "verbose": False,
+        "header_label": "list",
+        "source": "list_pending",
+    }
+    with storage.connect(db_path) as con:
+        con.execute(
+            "UPDATE bot_conversation SET last_batch_json = ? WHERE chat_id = ?",
+            (json.dumps(payload), chat_id),
+        )
+
+    return "\n".join(lines)
+
+
+def _resolve_category_by_id(db_path: str, category_id: str) -> dict | None:
+    with storage.connect(db_path) as con:
+        return con.execute(
+            "SELECT id, name FROM category WHERE id = ?", (category_id,),
+        ).fetchone()
+
+
+# Matches the numbered batch reply pattern: "2. Vacation 5. Steven Personal".
+# Splits on "<int>. " boundaries. Tolerates trailing fragments like
+# "12. Not enough information" (those are kept as a category name and will
+# fail _resolve_category, which the tool surfaces gracefully).
+_BATCH_REPLY_RE = re.compile(r"(\d+)\.\s*([^\d]+?)(?=\s+\d+\.|$)")
+
+
+def categorize_batch_numbered_tool(
+    db_path: str, *, chat_id: int, mapping_text: str,
+) -> str:
+    """Apply a numbered batch reply like "2. Vacation 5. Groceries".
+
+    Looks up each number in the most recent batch (or list_pending output)
+    to find the pt_id, resolves the category name, and categorizes each.
+    Use when the user replies with multiple numbered assignments at once.
+    """
+    with storage.connect(db_path) as con:
+        bc = con.execute(
+            "SELECT last_batch_json FROM bot_conversation WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        if not bc or not bc["last_batch_json"]:
+            return ("No active batch — call list_pending first so the items "
+                    "have numbers, then reply with the numbered mapping.")
+        try:
+            batch = json.loads(bc["last_batch_json"])
+        except (ValueError, TypeError):
+            return "Couldn't read the active batch."
+        n_to_pt = {int(it["n"]): int(it["pt_id"]) for it in batch.get("items", [])}
+
+    matches = list(_BATCH_REPLY_RE.finditer(mapping_text))
+    if not matches:
+        return ('Couldn\'t parse — try a format like "2. Vacation 5. Groceries". '
+                'Or use "next" to triage one at a time.')
+
+    applied: list[str] = []
+    failed: list[str] = []
+    for m in matches:
+        n = int(m.group(1))
+        cat_name = m.group(2).strip().rstrip(".").rstrip(",")
+        pt_id = n_to_pt.get(n)
+        if pt_id is None:
+            failed.append(f"#{n}: no such batch item")
+            continue
+        cat = _resolve_category(db_path, cat_name)
+        if cat is None:
+            failed.append(f"#{n}: no category matched '{cat_name}'")
+            continue
+        # Apply
+        with storage.connect(db_path) as con:
+            row = con.execute(
+                "SELECT id, payee, amount_cents, status FROM pending_txn WHERE id = ?",
+                (pt_id,),
+            ).fetchone()
+            if row is None:
+                failed.append(f"#{n}: pt_id {pt_id} gone")
+                continue
+            if row["status"] != "pending":
+                failed.append(f"#{n}: already {row['status']}")
+                continue
+            con.execute(
+                """UPDATE pending_txn
+                   SET chosen_category = ?, status = 'categorized', chosen_at = ?
+                   WHERE id = ?""",
+                (cat["id"], datetime.now(), pt_id),
+            )
+        storage.audit(
+            db_path, "categorized",
+            {"kind": "txn", "id": pt_id, "category_id": cat["id"],
+             "via": "agent_batch"},
+        )
+        applied.append(
+            f"#{n} ${abs(row['amount_cents'])/100:.2f} {row['payee']} → {cat['name']}"
+        )
+
+    lines = []
+    if applied:
+        lines.append(f"Categorized {len(applied)}:")
+        lines.extend(applied)
+    if failed:
+        lines.append("Couldn't apply:")
+        lines.extend(f"  {f}" for f in failed)
+    return "\n".join(lines) if lines else "Nothing to apply."
 
 
 def next_pending_tool(db_path: str, *, chat_id: int) -> str:
@@ -753,38 +1034,32 @@ def move_category_to_group_tool(
 def run_catchup_tool(
     db_path: str, *, limit: int = 30, settings: Any = None,
 ) -> str:
-    """Manually run the catchup pipeline: scrape new Amazon/Venmo emails
-    and add LLM suggestions to pending_txn rows that don't have one yet.
+    """Manually scrape Gmail for new transaction emails and ingest them
+    into the queue.
 
-    Use when the user says "catch up", "run catchup", "fill in suggestions",
-    "go scrape", "pull new". This used to run automatically every morning
-    but the user wants explicit control over it.
+    Use when the user says "catch up", "run catchup", "go scrape", "pull
+    new". The bot's gmail poll already runs every 60s, so this is mainly
+    useful as a forcing function before a /batch session.
 
-    Returns a one-line summary. Subsequent items surface through the
-    push loop within seconds.
+    Returns a one-line summary of what's now waiting.
     """
     if settings is None:
         return "Can't run catchup without settings loaded."
     try:
-        from bot import gmail_watcher, ynab_watcher
-        # Pull new YNAB charges first
-        ynab_result = ynab_watcher.poll_once(settings)
-        # Then scrape Gmail for new emails
+        from bot import gmail_watcher
         gmail_count = gmail_watcher.poll_once(settings)
     except Exception as e:  # noqa: BLE001
         log.exception("run_catchup failed: %s", e)
         return f"Catchup hit an error: {e}"
 
-    # Count what's now in the queue
-    with storage.connect(db_path) as con:
-        pending = con.execute(
-            "SELECT COUNT(*) FROM pending_txn WHERE status = 'pending'"
-        ).fetchone()[0]
+    # Count what's now in the queue — split by /batch vs /amazon backlog
+    from bot.batch_processor import count_cold_batch, count_amazon_ready
+    batch_n = count_cold_batch(db_path, user_id="steven")
+    amazon_n = count_amazon_ready(db_path, user_id="steven")
 
     return (
-        f"Catchup done. New YNAB charges: {ynab_result.get('enqueued', 0)}, "
-        f"new emails parsed: {gmail_count}. "
-        f"Queue: {pending} pending. Type 'next' to start triaging."
+        f"Scraped Gmail — {gmail_count} new emails parsed.\n"
+        f"Queue: {batch_n} in /batch, {amazon_n} in /amazon."
     )
 
 

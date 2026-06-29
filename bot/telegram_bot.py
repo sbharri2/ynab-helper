@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, time as dtime, timedelta, timezone
 
 
@@ -151,16 +152,74 @@ def _norm_cat_name(name: str) -> str:
     return _DAY_OF_MONTH_SUFFIX_RE.sub("", name).strip().lower()
 
 
+# Short hand-curated aliases for common categories the user types frequently.
+# Case-insensitive lookup. Add entries here for any typo / shorthand that
+# the substring + Levenshtein fallback don't catch on their own.
+_CATEGORY_ALIASES: dict[str, str] = {
+    "rta": "Inflow: Ready to Assign",
+    "ready to assign": "Inflow: Ready to Assign",
+    "ready": "Inflow: Ready to Assign",
+    "inflow": "Inflow: Ready to Assign",
+    "income": "Inflow: Ready to Assign",
+    "paycheck": "Inflow: Ready to Assign",
+    "salary": "Inflow: Ready to Assign",
+    "dining": "Dining Out/Entertainment",
+    "entertainment": "Dining Out/Entertainment",
+    "restaurants": "Dining Out/Entertainment",
+    "groceries": "Groceries",
+    "household": "Household Items",
+    "gifts": "Gifts",
+    "kids": "Kids Necessities  and Activities",
+    "medical": "Medical",
+    "vacation": "Vacation",
+    "home improvement": "Home Maintenance and Improvement",
+    "home maintenance": "Home Maintenance and Improvement",
+}
+
+
+def _levenshtein(a: str, b: str, cap: int = 3) -> int:
+    """Compute Levenshtein distance between ``a`` and ``b``, short-circuiting
+    at ``cap`` for performance. Returns ``cap+1`` when the real distance
+    exceeds the cap.
+    """
+    if a == b:
+        return 0
+    la, lb = len(a), len(b)
+    if abs(la - lb) > cap:
+        return cap + 1
+    # Standard DP, single-row optimization.
+    prev = list(range(lb + 1))
+    for i in range(1, la + 1):
+        cur = [i] + [0] * lb
+        row_min = cur[0]
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            cur[j] = min(
+                prev[j] + 1,         # deletion
+                cur[j - 1] + 1,      # insertion
+                prev[j - 1] + cost,  # substitution
+            )
+            if cur[j] < row_min:
+                row_min = cur[j]
+        if row_min > cap:
+            return cap + 1
+        prev = cur
+    return prev[lb]
+
+
 def _match_category_by_name(
     db_path: str, query: str, categories: list[dict],
 ) -> str | None:
     """Match user-typed text against any category (incl. non-spending).
 
     Strategy, in priority order:
-      1. Exact case-insensitive match against full name
-      2. Exact match after stripping parenthesized day-of-month suffixes
-      3. Substring match (query is contained in normalized category name)
-      4. None — caller falls through to LLM
+      1. Hand-curated alias map (rta → Ready to Assign, dining → ...)
+      2. Exact case-insensitive match against full name
+      3. Exact match after stripping parenthesized day-of-month suffixes
+      4. Substring match (query is contained in normalized category name)
+      5. Levenshtein distance ≤ 2 against the normalized name — catches
+         typos like "Read to assign" → "Ready to Assign"
+      6. None — caller falls through to LLM
 
     User has explicitly typed a category name, so non-spending categories
     (scheduled bills, savings, etc.) are eligible — the spending-only
@@ -183,6 +242,13 @@ def _match_category_by_name(
         if r["id"] not in seen_ids:
             pool.append({"id": r["id"], "name": r["name"]})
 
+    # Tier 0: alias map (catches "rta", "ready to assign", "dining" etc.)
+    alias_target = _CATEGORY_ALIASES.get(q)
+    if alias_target:
+        for c in pool:
+            if c["name"].lower() == alias_target.lower():
+                return c["id"]
+
     # Tier 1: exact full-name match
     for c in pool:
         if c["name"].lower() == q:
@@ -196,6 +262,59 @@ def _match_category_by_name(
     candidates = [c for c in pool if q_norm and q_norm in _norm_cat_name(c["name"])]
     if len(candidates) == 1:
         return candidates[0]["id"]
+    # Tier 4: Levenshtein-distance fallback for whole-string typos. Cap at
+    # 2 so we don't falsely match arbitrary short strings; gate on
+    # |query| >= 4 to avoid two-letter wildcard matches.
+    if not candidates and len(q_norm) >= 4:
+        best_id, best_dist = None, 3
+        ambiguous = False
+        for c in pool:
+            name_norm = _norm_cat_name(c["name"])
+            if abs(len(name_norm) - len(q_norm)) > 2:
+                continue
+            d = _levenshtein(q_norm, name_norm, cap=2)
+            if d < best_dist:
+                best_id, best_dist = c["id"], d
+                ambiguous = False
+            elif d == best_dist and d <= 2:
+                ambiguous = True
+        if best_id is not None and best_dist <= 2 and not ambiguous:
+            return best_id
+
+    # Tier 5: fuzzy substring — slide a window through each category looking
+    # for a place where the query approximately appears. Catches "Read to
+    # assign" inside "Inflow: Ready to Assign" — the substring check from
+    # Tier 3 missed because of the 'y' diff in "Read" vs "Ready".
+    if not candidates and len(q_norm) >= 4:
+        n = len(q_norm)
+        best_id, best_dist = None, 3
+        ambiguous = False
+        for c in pool:
+            name_norm = _norm_cat_name(c["name"])
+            if len(name_norm) < n - 2:
+                continue
+            # Try windows around the query length, ±2.
+            local_best = 3
+            for w in range(max(1, n - 2), n + 3):
+                if w > len(name_norm):
+                    break
+                for start in range(0, len(name_norm) - w + 1):
+                    window = name_norm[start:start + w]
+                    d = _levenshtein(q_norm, window, cap=2)
+                    if d < local_best:
+                        local_best = d
+                    if local_best == 0:
+                        break
+                if local_best == 0:
+                    break
+            if local_best < best_dist:
+                best_id, best_dist = c["id"], local_best
+                ambiguous = False
+            elif local_best == best_dist and local_best <= 2:
+                ambiguous = True
+        if best_id is not None and best_dist <= 2 and not ambiguous:
+            return best_id
+
     # Multiple substring hits → ambiguous, let LLM disambiguate
     return None
 
@@ -263,12 +382,22 @@ def _build_keyboard(
     we deliberately avoid padding with random categories, because that's
     what made the old "first 3 in the list" alternatives feel useless.
 
-    Callback-data conventions:
-      ``cat:<id>``  — pick a specific category by id
-      ``skip``      — skip this item
-      ``other``     — user wants to type a free-text category
+    Callback-data conventions (current — stamps the item's kind+id so taps
+    on old DMs resolve to the right row, not whatever's currently in-flight):
+      ``cat:<kind>:<item_id>:<cat_id>``  — pick a specific category by id
+      ``skip:<kind>:<item_id>``          — skip this item
+      ``other:<kind>:<item_id>``         — user wants to type a free-text category
+
+    Backward compat: ``cat:<id>``, ``skip``, ``other`` (no kind/id segments)
+    is the LEGACY format from older DMs. Still parsed by _handle_callback,
+    which falls back to the bot_conversation.last_asked_id pointer.
     """
     name_by_id = {c["id"]: c["name"] for c in categories}
+    item_kind = item.get("kind") or "txn"
+    item_id = item.get("id")
+    # 64-byte Telegram limit on callback_data — category UUIDs are 36 chars;
+    # prefix + kind + numeric id puts us around ~50 bytes. Comfortable.
+    item_tag = f"{item_kind}:{item_id}"
     suggested_id = item.get("suggested_category")
 
     picks: list[str] = []
@@ -301,7 +430,7 @@ def _build_keyboard(
         label = name_by_id[cid]
         if i == 0 and suggested_id == cid:
             label = f"✅ {label}"
-        row.append(InlineKeyboardButton(label, callback_data=f"cat:{cid}"))
+        row.append(InlineKeyboardButton(label, callback_data=f"cat:{item_tag}:{cid}"))
         if len(row) == 2:
             buttons.append(row)
             row = []
@@ -309,8 +438,25 @@ def _build_keyboard(
         buttons.append(row)
 
     buttons.append([
-        InlineKeyboardButton("🔤 Other", callback_data="other"),
-        InlineKeyboardButton("⏭ Skip", callback_data="skip"),
+        InlineKeyboardButton("🔤 Other", callback_data=f"other:{item_tag}"),
+        InlineKeyboardButton("⏭ Skip", callback_data=f"skip:{item_tag}"),
+    ])
+    # Phase 6.5 multi-user routing: a single "route to the OTHER spouse"
+    # button. Its label flips based on who currently owns the row so the
+    # text reads naturally — Steven sees "➡ For Allison", Allison sees
+    # "↩ Back to Steven". Resolver in _handle_callback swaps assigned_to.
+    assigned_to = (item.get("assigned_to_user_id") or "steven").lower()
+    if assigned_to == "steven":
+        route_label = "➡ For Allison"
+        route_target = "allison"
+    else:
+        route_label = "↩ Back to Steven"
+        route_target = "steven"
+    buttons.append([
+        InlineKeyboardButton(
+            route_label,
+            callback_data=f"route:{item_tag}:{route_target}",
+        ),
     ])
     return InlineKeyboardMarkup(buttons)
 
@@ -326,12 +472,44 @@ def _resolve_user_id_for_chat(settings: Settings, chat_id: int) -> str | None:
     return None
 
 
-def _annotate_with_suggestion_name(item: dict, categories: list[dict]) -> dict:
-    """Attach the human-readable suggestion name for prompt rendering."""
+def _bot_for_chat(app: Application, chat_id: int):
+    """Return the Bot instance that can DM ``chat_id``.
+
+    With the multi-bot setup (one bot per spouse), every chat_id is
+    reachable through exactly one Application. The map is built at
+    startup in :func:`run` and stored on ``app.bot_data["chat_to_bot"]``.
+    Falls back to the caller's own ``app.bot`` if the chat isn't
+    registered — preserves single-bot behavior for any pre-multi-bot
+    code paths.
+    """
+    chat_to_bot = app.bot_data.get("chat_to_bot") or {}
+    return chat_to_bot.get(int(chat_id), app.bot)
+
+
+def _annotate_with_suggestion_name(
+    item: dict, categories: list[dict], db_path: str | None = None,
+) -> dict:
+    """Attach the human-readable suggestion name for prompt rendering.
+
+    The cached `categories` list passed in by the bot is spending-only —
+    so when the categorizer's override or strong-prior picked a non-
+    spending bill envelope (e.g. "Mass Mutual Insurances (17th)" or
+    "Mosquito Treatment (16th)"), the lookup missed and the DM rendered
+    "No guess yet" despite a perfectly valid suggestion sitting on the
+    row. Fall back to the local DB so every visible category resolves.
+    """
     sid = item.get("suggested_category")
-    if sid:
-        name = next((c["name"] for c in categories if c["id"] == sid), None)
-        item["suggested_category_name"] = name
+    if not sid:
+        return item
+    name = next((c["name"] for c in categories if c["id"] == sid), None)
+    if not name and db_path:
+        with storage.connect(db_path) as con:
+            row = con.execute(
+                "SELECT name FROM category WHERE id = ?", (sid,),
+            ).fetchone()
+            if row:
+                name = row["name"]
+    item["suggested_category_name"] = name
     return item
 
 
@@ -361,7 +539,7 @@ async def _strip_previous_keyboard(
     if not message_id:
         return
     try:
-        await app.bot.edit_message_reply_markup(
+        await _bot_for_chat(app, chat_id).edit_message_reply_markup(
             chat_id=chat_id, message_id=message_id, reply_markup=None,
         )
     except Exception as e:  # noqa: BLE001 - best-effort cleanup
@@ -416,32 +594,22 @@ async def _push_next_item(
         if row and row["last_asked_id"] == item["id"]:
             return False
 
-        # Defensive: if the row's suggested_category points to a
-        # non-spending category (named-goal / scheduled-bill / CC-payment
-        # bucket), drop the suggestion before rendering. The LLM is told
-        # never to pick these, but the hardening isn't 100% — we'd
-        # rather show "no suggestion" than confuse the user with a
-        # button like "Amazon Prime" for a $19 grocery run.
-        sug = item.get("suggested_category")
-        if sug:
-            with storage.connect(settings.paths.database) as con:
-                cat_row = con.execute(
-                    "SELECT is_spending FROM category WHERE id = ?",
-                    (sug,),
-                ).fetchone()
-            if cat_row is not None and not cat_row["is_spending"]:
-                item["suggested_category"] = None
-                # Also clear the persisted suggestion so the row doesn't
-                # keep surfacing the bad pick on later push attempts.
-                table = "pending_order" if item["kind"] == "order" else "pending_txn"
-                with storage.connect(settings.paths.database) as con:
-                    con.execute(
-                        f"UPDATE {table} SET suggested_category = NULL "
-                        f"WHERE id = ?",
-                        (item["id"],),
-                    )
-
-        item = _annotate_with_suggestion_name(item, categories)
+        # NOTE: an earlier guard here used to NULL out any suggestion that
+        # landed in a non-spending category (CC-payment / scheduled-bill /
+        # named-goal envelope). That guard was correct when the LLM was
+        # the only suggester — the LLM is restricted to is_spending=1
+        # rows, so a non-spending suggestion meant a bug.
+        #
+        # The override map + strong-prior matcher now DELIBERATELY route to
+        # non-spending bill envelopes (Mass Mutual Insurances (17th),
+        # Cell Phone (4th), Water and Trash (16th), Mosquito Treatment
+        # (16th), Hulu (7th), Amica Car Insurance (27th), etc.). Wiping
+        # those was destroying every override-driven suggestion since
+        # those layers shipped — see audit incidents on pt#985, pt#987,
+        # pt#1032. The guard is intentionally removed.
+        item = _annotate_with_suggestion_name(
+            item, categories, db_path=settings.paths.database,
+        )
         body = format_item_prompt(item)
         # Educated-guess buttons: pull this payee's historical priors so the
         # 4 non-skip buttons are real candidates instead of arbitrary
@@ -475,7 +643,7 @@ async def _push_next_item(
         await _strip_previous_keyboard(app, chat_id, prev_msg_id)
 
         try:
-            sent = await app.bot.send_message(
+            sent = await _bot_for_chat(app, chat_id).send_message(
                 chat_id=chat_id, text=body, reply_markup=keyboard,
             )
         except Exception as e:  # noqa: BLE001 - never crash the push loop
@@ -510,6 +678,54 @@ async def _push_next_item(
     return True
 
 
+# _propagate_order_category_to_ledger removed in the 2026-06-26 cleanup —
+# pending_orders no longer go through the categorize path. They serve
+# only as enrichment data for bot.ingest._enrich_from_pending_order.
+
+
+def _apply_route(
+    settings: Settings, *,
+    chat_id: int, kind: str, item_id: int, to_user: str,
+) -> str:
+    """Move a pending row to another user's queue and free the current chat
+    to push its next item. Audits every routing decision so we can later
+    spot mis-routed charges in the daily summary.
+    """
+    table = "pending_order" if kind == "order" else "pending_txn"
+    with storage.connect(settings.paths.database) as con:
+        row = con.execute(
+            f"SELECT assigned_to_user_id, status FROM {table} WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        if row is None:
+            return "Couldn't find that item anymore."
+        if row["status"] != "pending":
+            return f"Already handled — status was '{row['status']}'."
+        from_user = row["assigned_to_user_id"]
+        if from_user == to_user:
+            return f"Already on {to_user}'s queue."
+        con.execute(
+            f"UPDATE {table} SET assigned_to_user_id = ?, "
+            "last_pushed_at = NULL "
+            "WHERE id = ?",
+            (to_user, item_id),
+        )
+        # Clear the in-flight pointer ONLY if this row was the one the
+        # current chat was waiting on — otherwise leave it alone (mirrors
+        # the same rule used in _apply_choice for stale-DM taps).
+        con.execute(
+            "UPDATE bot_conversation SET last_asked_id = NULL "
+            "WHERE chat_id = ? AND last_asked_id = ?",
+            (chat_id, item_id),
+        )
+    storage.audit(settings.paths.database, "routed", {
+        "kind": kind, "id": item_id,
+        "from_user": from_user, "to_user": to_user,
+    })
+    nice = "Allison" if to_user == "allison" else "Steven"
+    return f"Routed to {nice}."
+
+
 def _apply_choice(
     settings: Settings,
     categorizer: Categorizer,
@@ -519,8 +735,10 @@ def _apply_choice(
     user_id: str,
     choice_kind: str,
     payload: Any,
+    override_kind: str | None = None,
+    override_id: int | None = None,
 ) -> str:
-    """Apply a user's choice to the *current* pending item.
+    """Apply a user's choice to a specific pending item.
 
     Resolves the chosen category from one of three sources:
       - ``"confirm"`` — use the row's stored ``suggested_category``
@@ -528,20 +746,32 @@ def _apply_choice(
       - ``"text"`` — free-text. Try a case-insensitive name match first,
         then fall back to the Categorizer to disambiguate.
 
+    Item targeting:
+      - If ``override_kind`` + ``override_id`` are provided (modern inline
+        buttons stamp the item kind+id on every callback), apply the choice
+        to THAT row regardless of bot_conversation state — this is what
+        lets taps on old/stale DMs resolve to the right item.
+      - Otherwise (free-text replies, legacy buttons), fall back to the
+        bot_conversation.last_asked_id pointer.
+
     Returns a short human-readable status string for the bot to echo.
     """
-    # Look up what we last asked this chat about.
-    with storage.connect(settings.paths.database) as con:
-        row = con.execute(
-            "SELECT last_asked_kind, last_asked_id FROM bot_conversation "
-            "WHERE chat_id = ?",
-            (chat_id,),
-        ).fetchone()
-    if row is None or row["last_asked_id"] is None:
-        return "Nothing pending — try /pending."
+    if override_id is not None and override_kind is not None:
+        kind = override_kind
+        item_id = override_id
+    else:
+        # Look up what we last asked this chat about.
+        with storage.connect(settings.paths.database) as con:
+            row = con.execute(
+                "SELECT last_asked_kind, last_asked_id FROM bot_conversation "
+                "WHERE chat_id = ?",
+                (chat_id,),
+            ).fetchone()
+        if row is None or row["last_asked_id"] is None:
+            return "Nothing pending — try /pending."
+        kind = row["last_asked_kind"]
+        item_id = row["last_asked_id"]
 
-    kind = row["last_asked_kind"]
-    item_id = row["last_asked_id"]
     table = "pending_order" if kind == "order" else "pending_txn"
 
     # Pull the row so we have access to suggested_category, summary, etc.
@@ -552,6 +782,13 @@ def _apply_choice(
     if item_row is None:
         return "Couldn't find that item anymore."
     item = dict(item_row)
+
+    # When targeting via the button-stamped item_id, guard against double-
+    # taps / stale DMs whose item has already been handled. (For the
+    # last_asked_id path, we know it was pending when we asked.)
+    if (override_id is not None and item.get("status")
+            and item["status"] not in {"pending", "matched"}):
+        return f"Already handled — status was '{item['status']}'."
 
     # --- skip -----------------------------------------------------------
     if choice_kind == "skip":
@@ -575,11 +812,14 @@ def _apply_choice(
                     "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
                     (item_id,),
                 )
+        # Only clear the in-flight pointer if THIS item is what the bot was
+        # waiting on. Skip-tap on a stale DM shouldn't drag the queue.
         with storage.connect(settings.paths.database) as con:
             con.execute(
                 "UPDATE bot_conversation SET last_asked_id = NULL, "
-                "last_asked_message_id = NULL WHERE chat_id = ?",
-                (chat_id,),
+                "last_asked_message_id = NULL "
+                "WHERE chat_id = ? AND last_asked_id = ?",
+                (chat_id, item_id),
             )
         storage.audit(settings.paths.database, "skipped",
                       {"kind": kind, "id": item_id})
@@ -631,17 +871,24 @@ def _apply_choice(
     # --- persist --------------------------------------------------------
     cat_name = next((c["name"] for c in categories if c["id"] == category_id),
                     category_id)
-    if kind == "order":
-        storage.mark_order_categorized(
-            settings.paths.database, item_id, chosen_category=category_id,
-        )
+    # kind=="order" is now unreachable — pending_orders no longer flow
+    # through the push loop (see conversation.next_item_for_user) and
+    # /amazon operates on pending_txn rows. The old branch + the
+    # _propagate_order_category_to_ledger helper were removed in this
+    # cleanup pass; pending_orders remain in the DB strictly as
+    # enrichment data for bot.ingest._enrich_from_pending_order.
+    if False:  # kind == "order" — removed
+        pass
     else:
-        # txn — categorize. Two paths:
-        #   - real YNAB id → push category to YNAB
-        #   - synthetic "ledger:N" id (from a CC alert ingested ahead of
-        #     YNAB sync) → update the ledger_txn row directly; YNAB will
-        #     pick up the eventual sync independently and ynab_watcher
-        #     will dedupe to the same ledger row.
+        # txn — categorize locally only. The daily ynab_writer pushes
+        # the choice to YNAB overnight; we no longer talk to YNAB
+        # synchronously on every tap (Phase 7+ writer redesign).
+        #
+        # For synthetic "ledger:N" ids the bot owns the ledger_txn row
+        # directly; we update its category_id. For real YNAB UUIDs we
+        # update the local mirror so envelope math reflects the choice
+        # immediately. Either way, ynab_writer.run_once stamps
+        # synced_to_ynab_at after pushing tomorrow.
         with storage.connect(settings.paths.database) as con:
             con.execute(
                 "UPDATE pending_txn SET chosen_category = ?, "
@@ -660,22 +907,53 @@ def _apply_choice(
                     )
             except (ValueError, IndexError):
                 log.warning("malformed ledger: id %s", ynab_id)
-        else:
+        elif ynab_id:
+            # Real YNAB UUID — mirror the choice into local ledger_txn
+            # so envelope math reflects it instantly.
             try:
-                ynab = YnabClient(settings.ynab_token, settings.ynab.budget_id)
-                ynab.set_category(ynab_id, category_id)
+                with storage.connect(settings.paths.database) as con:
+                    con.execute(
+                        "UPDATE ledger_txn SET category_id = ?, "
+                        "updated_at = CURRENT_TIMESTAMP "
+                        "WHERE ynab_txn_id = ?",
+                        (category_id, ynab_id),
+                    )
             except Exception as e:  # noqa: BLE001
-                log.error("YNAB set_category failed: %s", e)
+                log.warning("local ledger update for ynab_id %s failed: %s",
+                            ynab_id, e)
 
-    # Clear the conversation pointer so the next push grabs the next item.
+    # Clear the conversation pointer ONLY when the row we just categorized is
+    # the one the bot is currently waiting on. A tap on a stale DM (where
+    # override_id != last_asked_id) should leave the current in-flight
+    # question alone, not drag the queue along behind it.
     with storage.connect(settings.paths.database) as con:
         con.execute(
-            "UPDATE bot_conversation SET last_asked_id = NULL WHERE chat_id = ?",
-            (chat_id,),
+            "UPDATE bot_conversation SET last_asked_id = NULL "
+            "WHERE chat_id = ? AND last_asked_id = ?",
+            (chat_id, item_id),
         )
     storage.audit(settings.paths.database, "categorized",
                   {"kind": kind, "id": item_id, "category": category_id})
-    return f"Categorized as {cat_name}."
+
+    # Show the envelope balance so the user knows where the pot stands. We
+    # recompute the single category first so the number reflects the txn
+    # that was just categorized (synthetic ledger: case already updated
+    # ledger_txn above; real-YNAB case will sync within ~5 min, so the
+    # number may be one txn stale for a few minutes — acceptable).
+    try:
+        from bot.envelope import available_for_category
+        remaining = available_for_category(
+            settings.paths.database, category_id=category_id,
+        )
+        sign = "-" if remaining < 0 else ""
+        remaining_str = f"{sign}${abs(remaining) / 100:,.2f}"
+        return (
+            f"Categorized as {cat_name}.\n"
+            f"{cat_name}: {remaining_str} left this month."
+        )
+    except Exception as e:  # noqa: BLE001 — never let a display lookup break categorization
+        log.warning("remaining-balance lookup failed: %s", e)
+        return f"Categorized as {cat_name}."
 
 
 # ---------------------------------------------------------------------------
@@ -698,20 +976,104 @@ async def _start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
-async def _pending_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    settings: Settings = context.application.bot_data["settings"]
-    categories: list[dict] = context.application.bot_data["categories"]
-    chat_id = update.effective_chat.id
-    user_id = _resolve_user_id_for_chat(settings, chat_id)
-    if user_id is None:
-        await update.message.reply_text("This chat isn't linked. See /start.")
-        return
-    sent = await _push_next_item(
-        context.application, settings, categories, chat_id, user_id,
-        include_txns=True,
+# /pending and /digest commands removed in the Phase 7 redesign — the
+# bulk surfaces (/batch, /amazon) replaced their "show me what's queued"
+# function, and the push loop handles HOT items automatically. The
+# handlers were dead UX.
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Telegram 409 Conflict watchdog — auto-kills Claude Code's Telegram
+# plugin (bun.exe) when it steals our long-poll lease. Per the memory
+# project_telegram_409_debug: a 409 means another process is calling
+# getUpdates on the same bot token. On Steven's machine that's always
+# bun.exe (Claude Code's Telegram plugin which auto-restarts).
+#
+# Threshold-based to avoid killing bun on a single transient conflict
+# (e.g., the user testing something). 3+ conflicts in 60s triggers the
+# kill. After killing, the bot wins the lease on the next poll cycle.
+# ──────────────────────────────────────────────────────────────────────
+
+from collections import deque
+import subprocess
+import time
+
+# Module-level state — async error_handler doesn't have a clean place for
+# instance state.
+_CONFLICT_TIMESTAMPS: deque[float] = deque(maxlen=20)
+_LAST_BUN_KILL_AT: float = 0.0
+_BUN_KILL_COOLDOWN_S = 30.0  # don't re-kill within 30s of a successful kill
+
+def _kill_bun_processes() -> int:
+    """Send taskkill to every bun.exe. Returns kill count.
+
+    Runs under the bot's user. Most cases bun.exe is owned by the same
+    Windows user so no elevation needed. If elevation IS required, the
+    kill fails silently and we just log it — the user gets a Telegram
+    notification (via the audit log → daily summary) but the bot keeps
+    running.
+    """
+    try:
+        # /F = force, /IM = image name. Returns 0 if killed, 128 if not found.
+        result = subprocess.run(
+            ["taskkill", "/F", "/IM", "bun.exe"],
+            capture_output=True, text=True, timeout=5,
+        )
+        # stdout looks like "SUCCESS: The process \"bun.exe\" with PID NNNN has been terminated."
+        killed = result.stdout.count("SUCCESS")
+        return killed
+    except Exception as e:  # noqa: BLE001
+        log.warning("taskkill bun.exe failed: %s", e)
+        return 0
+
+
+async def _handle_telegram_error(
+    update: object, context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Telegram error handler. Detects 409 Conflict (lease hijack) and
+    runs the bun.exe kill recipe when persistent."""
+    global _LAST_BUN_KILL_AT
+    err = context.error
+    err_str = str(err) if err else ""
+    is_conflict = (
+        "Conflict" in err_str
+        or "409" in err_str
+        or "terminated by other getUpdates" in err_str.lower()
     )
-    if not sent:
-        await update.message.reply_text("Nothing pending. ✨")
+
+    if not is_conflict:
+        # Pass through to default logging — other errors should be loud
+        log.warning("telegram error: %s", err)
+        return
+
+    now = time.time()
+    _CONFLICT_TIMESTAMPS.append(now)
+
+    # Count conflicts in the last 60s
+    recent = sum(1 for t in _CONFLICT_TIMESTAMPS if now - t <= 60)
+    log.warning("Telegram 409 Conflict #%d in last 60s: %s", recent, err_str[:200])
+
+    # Cooldown to prevent kill-storm
+    if now - _LAST_BUN_KILL_AT < _BUN_KILL_COOLDOWN_S:
+        return
+
+    # Threshold: 3+ in 60s = real hijack
+    if recent < 3:
+        return
+
+    settings: Settings = context.application.bot_data["settings"]
+    log.info("conflict threshold hit — attempting to kill bun.exe")
+    killed = _kill_bun_processes()
+    _LAST_BUN_KILL_AT = now
+    storage.audit(
+        settings.paths.database, "watchdog_killed_bun",
+        {"killed_count": killed, "conflicts_in_window": recent,
+         "trigger_error": err_str[:200]},
+    )
+    if killed > 0:
+        log.info("watchdog killed %d bun.exe process(es)", killed)
+        # Clear the window so we don't immediately re-trigger
+        _CONFLICT_TIMESTAMPS.clear()
 
 
 async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -728,24 +1090,92 @@ async def _handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
 
     data = query.data or ""
-    if data == "skip":
-        status = _apply_choice(
-            settings, categorizer, categories,
-            chat_id=chat_id, user_id=user_id,
-            choice_kind="skip", payload=None,
+    parts = data.split(":")
+    target_kind: str | None = None
+    target_id: int | None = None
+    # Parse the kind+id stamp from any of the new-format actions.
+    #   cat:<kind>:<id>:<cat_id>  (4 parts)
+    #   skip:<kind>:<id>           (3 parts)
+    #   other:<kind>:<id>          (3 parts)
+    #   route:<kind>:<id>:<to_user> (4 parts)
+    if len(parts) >= 3 and parts[0] in {"cat", "skip", "other", "route"}:
+        target_kind = parts[1]
+        try:
+            target_id = int(parts[2])
+        except ValueError:
+            target_kind = None
+            target_id = None
+
+    # Phase 7 checkbox-batch — bt:<n> toggles, bsub commits, bcan cancels.
+    if parts[0] in {"bt", "bsub", "bcan"}:
+        await _handle_batch_callback(update, context, parts)
+        return
+
+    # Phase 6.5 — route this row to the other user's queue.
+    if parts[0] == "route" and target_id is not None and len(parts) >= 4:
+        to_user = parts[3]
+        status = _apply_route(
+            settings,
+            chat_id=chat_id,
+            kind=target_kind or "txn",
+            item_id=target_id,
+            to_user=to_user,
         )
-    elif data == "other":
+        try:
+            await query.answer(text=status[:200], show_alert=False)
+        except Exception as e:  # noqa: BLE001
+            log.warning("query.answer failed: %s", e)
+        try:
+            await query.edit_message_text(
+                (query.message.text or "") + f"\n\n→ {status}"
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("edit_message_text failed: %s", e)
+        # Push the next item to the current chat so Steven keeps moving
+        await _push_next_item(
+            context.application, settings, categories, chat_id, user_id,
+            include_txns=True,
+        )
+        return
+
+    # For "other": adopt the tapped item as the in-flight question so the
+    # subsequent free-text reply resolves against THIS row, not whatever
+    # was last asked. Then prompt the user to type.
+    if parts[0] == "other":
+        if target_id is not None and target_kind is not None:
+            with storage.connect(settings.paths.database) as con:
+                con.execute(
+                    """UPDATE bot_conversation
+                       SET last_asked_kind = ?, last_asked_id = ?,
+                           last_action_at = ?
+                       WHERE chat_id = ?""",
+                    (target_kind, target_id, _utcnow(), chat_id),
+                )
         await query.answer()
         await query.edit_message_text(
             (query.message.text or "") + "\n\nType the category name…"
         )
         return
-    elif data.startswith("cat:"):
-        cat_id = data.split(":", 1)[1]
+
+    if parts[0] == "skip":
+        status = _apply_choice(
+            settings, categorizer, categories,
+            chat_id=chat_id, user_id=user_id,
+            choice_kind="skip", payload=None,
+            override_kind=target_kind, override_id=target_id,
+        )
+    elif parts[0] == "cat":
+        # New format: cat:<kind>:<id>:<cat_id> → cat_id is parts[3:]
+        # Legacy format: cat:<cat_id> → cat_id is parts[1:]
+        if len(parts) >= 4:
+            cat_id = ":".join(parts[3:])
+        else:
+            cat_id = ":".join(parts[1:])
         status = _apply_choice(
             settings, categorizer, categories,
             chat_id=chat_id, user_id=user_id,
             choice_kind=f"callback:{cat_id}", payload=None,
+            override_kind=target_kind, override_id=target_id,
         )
     else:
         status = "Unknown action."
@@ -790,6 +1220,246 @@ def _is_trivial_reply(text: str) -> bool:
     )
 
 
+def _looks_like_batch_reply(text: str) -> bool:
+    """Heuristic: a batch reply either starts with 'all' or contains a digit
+    followed by '=' / 'skip' / 'back' / space-then-number. Avoids false
+    positives on category names like '1Password' (no digit-after pattern).
+    """
+    t = text.strip().lower()
+    if not t:
+        return False
+    if re.match(r"^all\b", t):
+        return True
+    # Numbered specifiers — a digit followed by a separator, end of string,
+    # or another digit somewhere later in the string.
+    if re.search(r"\b\d+\s*=\s*\S", t):
+        return True
+    if re.search(r"\b\d+\s+(skip|back|s|b)\b", t):
+        return True
+    # Plain space-separated numbers: "1 2 4 5"
+    if re.match(r"^\d+(\s+\d+){1,}\s*$", t):
+        return True
+    return False
+
+
+async def _handle_batch_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, parts: list[str],
+) -> None:
+    """Phase 7 checkbox batch — handle ``bt:<n>`` (toggle), ``bsub``
+    (commit checked + DM each flagged row), and ``bcan`` (drop the batch).
+    """
+    from bot import batch_processor
+    settings: Settings = context.application.bot_data["settings"]
+    categorizer: Categorizer = context.application.bot_data["categorizer"]
+    categories: list[dict] = context.application.bot_data["categories"]
+    query = update.callback_query
+    chat_id = query.message.chat.id
+    user_id = _resolve_user_id_for_chat(settings, chat_id)
+    db_path = settings.paths.database
+
+    if parts[0] == "bcan":
+        batch_processor.mark_batch_consumed(db_path, chat_id)
+        await query.answer(text="Batch cancelled.")
+        try:
+            await query.edit_message_text(
+                (query.message.text or "")
+                + "\n\n❌ Cancelled. Nothing changed."
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("edit on cancel failed: %s", e)
+        return
+
+    if parts[0] == "bt" and len(parts) >= 2:
+        try:
+            n = int(parts[1])
+        except ValueError:
+            await query.answer()
+            return
+        payload = batch_processor.toggle_batch_item(db_path, chat_id, n)
+        if payload is None:
+            await query.answer(text="Batch context expired. Try /batch again.")
+            return
+        # Re-render BOTH body and keyboard so the ☑/☐ marker stays inline
+        # with each row's data. Lock items to the saved payload's pt_ids
+        # so the body matches what the user originally saw even if new
+        # COLD items arrived since the DM. Use the batch's own builder
+        # (Amazon or general) so we filter the right side.
+        is_amazon_batch = payload.get("header_label") == "Amazon"
+        if is_amazon_batch:
+            items = batch_processor.build_amazon_batch(db_path, user_id=user_id)
+            total = batch_processor.count_amazon_ready(db_path, user_id=user_id)
+        else:
+            items = batch_processor.build_batch(db_path, user_id=user_id)
+            total = batch_processor.count_cold_batch(db_path, user_id=user_id)
+        payload_pt_ids = {it["pt_id"] for it in payload.get("items", [])}
+        items_filtered = [it for it in items if it["pt_id"] in payload_pt_ids]
+        order = {it["pt_id"]: it["n"] for it in payload.get("items", [])}
+        items_filtered.sort(key=lambda it: order.get(it["pt_id"], 9999))
+
+        new_body = batch_processor.render_batch_body(
+            items_filtered, total, payload.get("items", []),
+            verbose=payload.get("verbose", False),
+            header_emoji=payload.get("header_emoji", "📦"),
+            header_label=payload.get("header_label", "Batch"),
+        )
+        new_keyboard = batch_processor.render_batch_buttons(
+            items_filtered, payload.get("items", []),
+        )
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                new_body, reply_markup=new_keyboard, parse_mode="Markdown",
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("edit_message_text(toggle) failed: %s", e)
+        return
+
+    if parts[0] == "bsub":
+        payload = batch_processor.load_batch_context(db_path, chat_id)
+        if not payload:
+            await query.answer(text="Batch context expired. Try /batch again.")
+            return
+        confirmed_pt_ids = [it["pt_id"] for it in payload.get("items", [])
+                             if it.get("checked")]
+        flagged_pt_ids = [it["pt_id"] for it in payload.get("items", [])
+                          if not it.get("checked")]
+        # Build decisions for the checked rows
+        decisions = [{"pt_id": pid, "action": "confirm", "value": None}
+                     for pid in confirmed_pt_ids]
+        result = await asyncio.to_thread(
+            batch_processor.apply_decisions,
+            db_path,
+            decisions=decisions,
+            settings=settings,
+            categorizer=categorizer,
+            categories=categories,
+            chat_id=chat_id,
+            user_id=user_id,
+        )
+        batch_processor.mark_batch_consumed(db_path, chat_id)
+
+        # Count remaining /batch + /amazon backlog for the footer summary
+        remaining = batch_processor.count_cold_batch(db_path, user_id=user_id)
+        amazon_ready = batch_processor.count_amazon_ready(db_path, user_id=user_id)
+        summary = batch_processor.format_summary(
+            result, remaining, amazon_ready=amazon_ready,
+        )
+        if flagged_pt_ids:
+            summary = (f"{summary}\n\n"
+                       f"Will DM {len(flagged_pt_ids)} flagged item(s) "
+                       f"one-by-one for review.")
+        await query.answer()
+        try:
+            await query.edit_message_text(
+                (query.message.text or "") + "\n\n" + summary
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning("edit on submit failed: %s", e)
+
+        # Stash the flagged ids on bot_conversation so the push loop
+        # picks them up next. Easier than a new column: mark each
+        # flagged row's queue_lane back to 'hot' so the normal push
+        # loop DMs them with the single-item keyboard.
+        if flagged_pt_ids:
+            with storage.connect(db_path) as con:
+                placeholders = ",".join(["?"] * len(flagged_pt_ids))
+                con.execute(
+                    f"UPDATE pending_txn SET queue_lane = 'hot', "
+                    f"lane_changed_at = ?, last_pushed_at = NULL "
+                    f"WHERE id IN ({placeholders})",
+                    [datetime.now(timezone.utc), *flagged_pt_ids],
+                )
+            storage.audit(db_path, "batch_flagged_for_review", {
+                "pt_ids": flagged_pt_ids,
+            })
+
+        # Auto-rebuild: if there are still cold-lane items waiting (more
+        # than the one batch could fit, OR new items that arrived during
+        # this batch's lifetime), immediately send the next batch so the
+        # user doesn't have to type /batch again.
+        if remaining > 0:
+            new_items = batch_processor.build_batch(db_path, user_id=user_id)
+            with storage.connect(db_path) as con:
+                new_total = con.execute(
+                    "SELECT COUNT(*) FROM pending_txn "
+                    "WHERE assigned_to_user_id = ? AND status='pending' "
+                    "  AND queue_lane='cold'",
+                    (user_id,),
+                ).fetchone()[0]
+            if new_items:
+                initial_payload = [
+                    {"n": i + 1, "pt_id": it["pt_id"], "checked": True}
+                    for i, it in enumerate(new_items)
+                ]
+                next_body = batch_processor.render_batch_body(
+                    new_items, new_total, initial_payload,
+                )
+                next_kb = batch_processor.render_batch_buttons(
+                    new_items, initial_payload,
+                )
+                try:
+                    sent = await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=next_body,
+                        reply_markup=next_kb,
+                        parse_mode="Markdown",
+                    )
+                    batch_processor.save_batch_context(
+                        db_path, chat_id, new_items, sent.message_id,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("auto-batch follow-up failed: %s", e)
+        return
+
+
+async def _handle_batch_reply(
+    update: Update, context: ContextTypes.DEFAULT_TYPE,
+    batch: dict, text: str,
+) -> None:
+    """Parse a batch reply, apply decisions, send summary."""
+    from bot import batch_processor
+    settings: Settings = context.application.bot_data["settings"]
+    categorizer: Categorizer = context.application.bot_data["categorizer"]
+    categories: list[dict] = context.application.bot_data["categories"]
+    chat_id = update.effective_chat.id
+    user_id = _resolve_user_id_for_chat(settings, chat_id)
+
+    items_meta = batch.get("items", [])
+    parsed = batch_processor.parse_reply(text, items_meta)
+    if not parsed["decisions"]:
+        msg = "Couldn't read any decisions from that reply."
+        if parsed["unparsed"]:
+            msg += f" Unparsed: {parsed['unparsed'][:4]}"
+        await update.message.reply_text(msg)
+        return
+
+    result = await asyncio.to_thread(
+        batch_processor.apply_decisions,
+        settings.paths.database,
+        decisions=parsed["decisions"],
+        settings=settings,
+        categorizer=categorizer,
+        categories=categories,
+        chat_id=chat_id,
+        user_id=user_id,
+    )
+    batch_processor.mark_batch_consumed(settings.paths.database, chat_id)
+
+    # Count remaining /batch + /amazon backlog for the footer
+    remaining = batch_processor.count_cold_batch(
+        settings.paths.database, user_id=user_id,
+    )
+    amazon_ready = batch_processor.count_amazon_ready(
+        settings.paths.database, user_id=user_id,
+    )
+    body = batch_processor.format_summary(
+        result, remaining, amazon_ready=amazon_ready,
+    )
+    if parsed["unparsed"]:
+        body += f"\n\n(ignored: {parsed['unparsed'][:4]})"
+    await update.message.reply_text(body)
+
+
 async def _handle_ai_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Phase 3.5: free-text Telegram → qwen3:32b with tools.
 
@@ -810,6 +1480,17 @@ async def _handle_ai_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if _is_trivial_reply(text):
         await _handle_text(update, context)
+        return
+
+    # Phase 7 /batch reply — if there's an unconsumed batch context for
+    # this chat AND the text looks like a batch reply (contains 'all' or
+    # a digit), parse and apply. Anything else falls through to the AI.
+    from bot import batch_processor
+    batch = batch_processor.load_batch_context(
+        settings.paths.database, chat_id,
+    )
+    if batch and _looks_like_batch_reply(text):
+        await _handle_batch_reply(update, context, batch, text)
         return
 
     # If the user is mid-categorization, almost any short reply is a
@@ -959,54 +1640,19 @@ async def _push_loop(app: Application) -> None:
                 # per-chat /quiet (quiet_until column).
                 with storage.connect(settings.paths.database) as con:
                     row = con.execute(
-                        "SELECT last_asked_id, quiet_until, last_action_at "
+                        "SELECT last_asked_id, last_asked_kind, "
+                        "       quiet_until, last_action_at "
                         "FROM bot_conversation WHERE chat_id = ?",
                         (chat_id,),
                     ).fetchone()
                 if row and row["last_asked_id"] is not None:
-                    # Staleness guard: if the user ignored the DM for more
-                    # than IGNORED_TTL_MINUTES, mark THAT row as 'skipped'
-                    # so the queue advances past it. Without this the bot
-                    # re-pushes the same lowest-id row every 60 min and the
-                    # user keeps seeing the same prompt. The skipped item
-                    # is recoverable via `unskip` agent tool.
-                    last_action_at = row["last_action_at"]
-                    IGNORED_TTL_MINUTES = 60
-                    is_stale = False
-                    if isinstance(last_action_at, datetime):
-                        age = (datetime.now(timezone.utc) - last_action_at
-                               if last_action_at.tzinfo
-                               else datetime.now() - last_action_at)
-                        is_stale = age.total_seconds() > IGNORED_TTL_MINUTES * 60
-                    if not is_stale:
-                        continue
-                    stale_id = row["last_asked_id"]
-                    stale_kind = row["last_asked_kind"]
-                    log.info("push_loop: ignored %s id=%s for chat %s; "
-                             "marking skipped + clearing pointer",
-                             stale_kind, stale_id, chat_id)
-                    stale_table = ("pending_order"
-                                   if stale_kind == "order"
-                                   else "pending_txn")
-                    with storage.connect(settings.paths.database) as con:
-                        # status='skipped' on the row + clear pointer.
-                        # pending_order has expired as its analog status.
-                        new_status = ("expired"
-                                      if stale_kind == "order"
-                                      else "skipped")
-                        con.execute(
-                            f"UPDATE {stale_table} SET status = ? WHERE id = ?",
-                            (new_status, stale_id),
-                        )
-                        con.execute(
-                            "UPDATE bot_conversation SET last_asked_id = NULL, "
-                            "last_asked_message_id = NULL WHERE chat_id = ?",
-                            (chat_id,),
-                        )
-                    storage.audit(settings.paths.database, "ignored_dm_skipped",
-                                  {"chat_id": chat_id,
-                                   "kind": stale_kind,
-                                   "id": stale_id})
+                    # An in-flight question is waiting for a user reply.
+                    # Don't double-prompt — wait. Staleness is owned by
+                    # bot.queue_lane.demote_hot_to_cold (runs every 30
+                    # min from _lane_sweep_loop) which also clears this
+                    # pointer when the row's HOT_TTL elapses, so we just
+                    # skip and let that path unblock us.
+                    continue
                 if row and row["quiet_until"] is not None:
                     qu = row["quiet_until"]
                     # qu is a tz-naive datetime (stored as isoformat); compare
@@ -1044,8 +1690,22 @@ async def _post_init(app: Application) -> None:
     # arrival, not whenever the user happens to /pending.
     app.bot_data["gmail_task"] = asyncio.create_task(_gmail_poll_loop(app))
     log.info("gmail poll loop started")
-    app.bot_data["ynab_task"] = asyncio.create_task(_ynab_poll_loop(app))
-    log.info("ynab poll loop started")
+    # ynab_watcher's 5-min polling loop was removed in the Phase 7+
+    # writer redesign — the bot no longer asks YNAB "what's
+    # uncategorized?" because we don't react to YNAB-only charges
+    # anymore. The daily ynab_writer pushes bot decisions to YNAB; the
+    # 6-hour ynab_full_sync pulls YNAB state for our local mirror.
+    app.bot_data["ynab_full_task"] = asyncio.create_task(_ynab_full_sync_loop(app))
+    log.info("ynab full-sync loop started")
+    app.bot_data["lane_sweep_task"] = asyncio.create_task(_lane_sweep_loop(app))
+    log.info("queue-lane sweep loop started")
+    app.bot_data["awareness_task"] = asyncio.create_task(_awareness_ping_loop(app))
+    log.info("awareness ping loop started")
+    # Phase 3 (UI writes) — localhost HTTP API for the Tauri desktop app.
+    # Stays loopback-only with a shared secret. The UI calls /categorize,
+    # /envelope/move, /budget/set; the bot is still the single writer.
+    app.bot_data["ui_api_task"] = asyncio.create_task(_ui_api_loop(app))
+    log.info("ui_api server task started")
 
 
 async def _gmail_poll_loop(app: Application) -> None:
@@ -1064,18 +1724,156 @@ async def _gmail_poll_loop(app: Application) -> None:
         await asyncio.sleep(INTERVAL)
 
 
-async def _ynab_poll_loop(app: Application) -> None:
-    """Every 5 minutes, call ynab_watcher.poll_once to pull new YNAB charges."""
+# _ynab_poll_loop and bot/ynab_watcher.py were removed in Phase 7+. The
+# bot no longer reacts to YNAB-uncategorized charges in real-time.
+# ynab_writer.run_once (called from _daily_summary_loop) is now the
+# single push-to-YNAB path. /ynab triggers it on demand.
+
+
+AWARENESS_PING_HOURS = (10, 14, 19)  # local-time hours when ping fires
+
+
+def _next_awareness_fire_at(now: datetime | None = None) -> datetime:
+    """Return the next local datetime when an awareness ping should fire."""
+    if now is None:
+        now = datetime.now()
+    today_candidates = [
+        now.replace(hour=h, minute=0, second=0, microsecond=0)
+        for h in AWARENESS_PING_HOURS
+    ]
+    future = [t for t in today_candidates if t > now]
+    if future:
+        return min(future)
+    # All today's slots are past — go to tomorrow's earliest
+    tomorrow = (now + timedelta(days=1)).replace(
+        hour=AWARENESS_PING_HOURS[0], minute=0, second=0, microsecond=0,
+    )
+    return tomorrow
+
+
+async def _awareness_ping_loop(app: Application) -> None:
+    """Phase 7 Slice 3 — fire 'N items in your batch queue' DMs at three
+    fixed local times: 10:00, 14:00, 19:00.
+
+    For each user, the ping is suppressed when:
+      * COLD queue is empty (nothing to nudge about), OR
+      * The user is in their configured quiet hours.
+
+    Body comes from ``bot.batch_processor.build_awareness_body`` so the
+    formatting stays in one place.
+    """
+    from bot import batch_processor
     settings: Settings = app.bot_data["settings"]
-    from bot import ynab_watcher
-    INTERVAL = 300
     while True:
         try:
-            await asyncio.to_thread(ynab_watcher.poll_once, settings)
+            fire_at = _next_awareness_fire_at()
+            sleep_for = max(1.0, (fire_at - datetime.now()).total_seconds())
+            log.info("awareness ping next at %s (in %.0fs)", fire_at, sleep_for)
+            await asyncio.sleep(sleep_for)
+
+            now = datetime.now()
+            for account in settings.gmail_accounts:
+                chat_id = account.chat_id
+                user_id = account.user_id
+                if not chat_id:
+                    continue
+                # Respect this user's quiet hours if configured; else the
+                # bot-wide telegram quiet_hours setting.
+                user_pref_row = storage.get_or_create_user_pref(
+                    settings.paths.database, user_id,
+                )
+                quiet = (user_pref_row.get("quiet_hours")
+                          or settings.telegram.quiet_hours)
+                if _in_quiet_hours(now, quiet):
+                    continue
+
+                body = batch_processor.build_awareness_body(
+                    settings.paths.database, user_id=user_id,
+                )
+                if not body:
+                    continue
+                try:
+                    await _bot_for_chat(app, chat_id).send_message(
+                        chat_id=chat_id, text=body,
+                    )
+                    storage.audit(settings.paths.database, "awareness_ping_sent",
+                                  {"user_id": user_id, "hour": now.hour})
+                except Exception as e:  # noqa: BLE001
+                    log.warning("awareness ping send to %s failed: %s",
+                                 user_id, e)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
-            log.exception("ynab_poll iteration failed: %s", e)
+            log.exception("awareness_ping iteration failed: %s", e)
+            await asyncio.sleep(60)
+
+
+async def _ui_api_loop(app: Application) -> None:
+    """Run the Tauri UI's HTTP API. Restarts on crash (10 s back-off)."""
+    settings: Settings = app.bot_data["settings"]
+    from bot import http_api
+    while True:
+        try:
+            await http_api.serve(settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("ui_api crashed: %s", e)
+            await asyncio.sleep(10)
+
+
+async def _lane_sweep_loop(app: Application) -> None:
+    """Phase 7 queue redesign — every 30 minutes:
+
+      * Re-run Phase 2 enrichment on HOLD rows; promote to HOT on success.
+      * Demote HOT rows the user has ignored for 2h+ to COLD.
+      * Give up on HOLD rows older than 24h and drop them to COLD.
+
+    Cheap to run: each sweep is 3 SQL statements + (for promotions) one
+    matcher call per HOLD row. With a healthy queue these all return
+    fast no-ops.
+    """
+    settings: Settings = app.bot_data["settings"]
+    from bot import queue_lane
+    INTERVAL = 30 * 60  # 30 minutes
+    while True:
+        try:
+            counts = await asyncio.to_thread(
+                queue_lane.sweep_lanes, settings.paths.database,
+                settings=settings,
+            )
+            if any(counts.values()):
+                log.info("lane_sweep: %s", counts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("lane_sweep iteration failed: %s", e)
+        await asyncio.sleep(INTERVAL)
+
+
+async def _ynab_full_sync_loop(app: Application) -> None:
+    """Mirror every YNAB transaction into the local ledger every 6 hours.
+
+    The 5-minute ``_ynab_poll_loop`` only pulls UNCATEGORIZED txns for the
+    user-prompt flow. This loop is the long-term shadow ledger: it pulls
+    ALL transactions (categorized + transfers) so the bot's reconciler
+    can validate its math against YNAB and the bank, and so the bot has
+    a complete copy when YNAB eventually gets turned off (Phase 7).
+
+    Runs once at startup, then every 6 hours. 6h cadence is plenty —
+    YNAB updates aren't that frequent and the full sync replays a 7-day
+    overlap window each time to forgive late edits.
+    """
+    settings: Settings = app.bot_data["settings"]
+    from bot import ynab_full_sync
+    INTERVAL = 6 * 3600  # 6 hours
+    while True:
+        try:
+            await asyncio.to_thread(ynab_full_sync.full_sync, settings)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.exception("ynab_full_sync iteration failed: %s", e)
         await asyncio.sleep(INTERVAL)
 
 
@@ -1101,48 +1899,91 @@ def _next_fire_at(target_time: str, target_weekday: int | None = None) -> dateti
 
 
 async def _daily_summary_loop(app: Application) -> None:
-    """Background coroutine: at config.telegram.daily_summary_time every day,
-    DM the daily summary to opted-in recipients.
+    """Background coroutine: fire each user's daily summary at THEIR
+    configured ``user_pref.daily_summary_time`` (falling back to the
+    global ``settings.telegram.daily_summary_time``).
 
-    Order of operations each morning:
-      1. Recompute current month's envelope state (activity / available).
-      2. Reconcile yesterday's bank-observed balances against the ledger
-         sum. ``reconcile_ok`` audits clear balances; ``reconcile_mismatch``
-         audits surface in the summary text.
-      3. Build + send the daily summary to opted-in recipients.
+    Steven wants his report at 06:30 and Allison's at 08:00 — two distinct
+    fires per day, not one global fire that loops recipients. We rebuild
+    the schedule at the start of each iteration so an edit to user_pref
+    (via a script or the UI) takes effect on the next firing without a
+    bot restart.
+
+    On the EARLIEST fire of the day we also run the shared per-day work
+    (recompute envelopes + reconcile yesterday + YNAB writer + Amazon
+    aged-out alert). Later fires just send that user's summary; rerunning
+    the writer for every user would push the same write batch N times.
     """
     settings: Settings = app.bot_data["settings"]
     from bot.reporters.daily import send_daily_summaries
     from bot.envelope import recompute_month
     from bot.reconciler import reconcile_all_observed
+    last_shared_run_date: "str | None" = None
     while True:
         try:
-            fire_at = _next_fire_at(settings.telegram.daily_summary_time)
-            sleep_for = max(1.0, (fire_at - datetime.now()).total_seconds())
-            log.info("daily summary will fire at %s (in %.0fs)", fire_at, sleep_for)
+            # Build today's schedule: list of (fire_at, user_id) sorted.
+            recipients = storage.list_recipients_for_period(
+                settings.paths.database, "daily",
+            )
+            now = datetime.now()
+            schedule: list[tuple[datetime, str]] = []
+            for r in recipients:
+                fire_str = (r.get("daily_summary_time")
+                            or settings.telegram.daily_summary_time)
+                schedule.append((_next_fire_at(fire_str), r["user_id"]))
+            if not schedule:
+                log.info("daily: no opted-in recipients; sleeping 1h")
+                await asyncio.sleep(3600)
+                continue
+            schedule.sort(key=lambda t: t[0])
+
+            fire_at, user_id = schedule[0]
+            sleep_for = max(1.0, (fire_at - now).total_seconds())
+            log.info("daily summary for %s will fire at %s (in %.0fs)",
+                     user_id, fire_at, sleep_for)
             await asyncio.sleep(sleep_for)
-            try:
-                recompute_month(
-                    settings.paths.database,
-                    datetime.now().strftime("%Y-%m"),
-                )
-            except Exception as e:  # noqa: BLE001
-                log.warning("daily: recompute failed: %s", e)
-            # Reconcile against yesterday — the previous evening's bank
-            # Balance Summary email should already be ingested by now.
-            try:
-                from datetime import date as _date_cls, timedelta as _td
-                yesterday = _date_cls.today() - _td(days=1)
-                results = await asyncio.to_thread(
-                    reconcile_all_observed,
-                    settings.paths.database, yesterday,
-                )
-                ok = sum(1 for r in results if r["status"] == "ok")
-                mm = sum(1 for r in results if r["status"] == "mismatch")
-                log.info("daily reconcile: %d ok, %d mismatch", ok, mm)
-            except Exception as e:  # noqa: BLE001
-                log.warning("daily: reconcile failed: %s", e)
-            await send_daily_summaries(app)
+
+            today_key = datetime.now().strftime("%Y-%m-%d")
+            is_first_today = last_shared_run_date != today_key
+            if is_first_today:
+                try:
+                    recompute_month(
+                        settings.paths.database,
+                        datetime.now().strftime("%Y-%m"),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("daily: recompute failed: %s", e)
+                try:
+                    from datetime import date as _date_cls, timedelta as _td
+                    yesterday = _date_cls.today() - _td(days=1)
+                    results = await asyncio.to_thread(
+                        reconcile_all_observed,
+                        settings.paths.database, yesterday,
+                    )
+                    ok = sum(1 for r in results if r["status"] == "ok")
+                    mm = sum(1 for r in results if r["status"] == "mismatch")
+                    log.info("daily reconcile: %d ok, %d mismatch", ok, mm)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("daily: reconcile failed: %s", e)
+
+            await send_daily_summaries(app, only_user_id=user_id)
+
+            if is_first_today:
+                # Writer + Amazon aged-out alert are once-per-day, shared
+                # operations — run them right after the earliest fire so
+                # later-firing users get the most-recent state in their
+                # report too.
+                try:
+                    from bot.ynab_writer import send_writer_report
+                    await send_writer_report(app)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("ynab_writer report send failed: %s", e)
+                try:
+                    from bot.amazon_tracker import send_aged_out_alert_if_new
+                    await send_aged_out_alert_if_new(app)
+                except Exception as e:  # noqa: BLE001
+                    log.warning("amazon aged-out alert failed: %s", e)
+                last_shared_run_date = today_key
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -1166,6 +2007,15 @@ async def _weekly_summary_loop(app: Application) -> None:
             log.info("weekly summary will fire at %s (in %.0fs)", fire_at, sleep_for)
             await asyncio.sleep(sleep_for)
             await send_weekly_summaries(app)
+            # Phase 7+ — Sunday evening also DMs the YNAB-sunset
+            # progress report so Steven sees the email-first-coverage
+            # trend climbing toward the threshold at which he can flip
+            # ynab.mode to read_only.
+            try:
+                from bot.reporters.ynab_progress import send_progress_report
+                await send_progress_report(app)
+            except Exception as e:  # noqa: BLE001
+                log.warning("ynab_progress send failed: %s", e)
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -1197,26 +2047,7 @@ async def _skip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
-async def _digest_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Force-push the next item including pending_txns regardless of window.
-
-    Useful when the user wants to clear their digest queue outside the
-    configured daily_digest_time window.
-    """
-    settings: Settings = context.application.bot_data["settings"]
-    categories: list[dict] = context.application.bot_data["categories"]
-    chat_id = update.effective_chat.id
-    user_id = _resolve_user_id_for_chat(settings, chat_id)
-    if user_id is None:
-        await update.message.reply_text("This chat isn't linked. See /start.")
-        return
-
-    sent = await _push_next_item(
-        context.application, settings, categories, chat_id, user_id,
-        include_txns=True,
-    )
-    if not sent:
-        await update.message.reply_text("Queue is empty. ✨")
+# /digest handler removed — see comment near _pending_cmd.
 
 
 async def _quiet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1352,6 +2183,123 @@ async def _help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def _ynab_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Manually trigger the YNAB writer NOW (don't wait for tomorrow's
+    daily run). Useful when Steven wants YNAB updated before opening the
+    YNAB app at a specific moment.
+    """
+    from bot import ynab_writer
+    settings: Settings = context.application.bot_data["settings"]
+    chat_id = update.effective_chat.id
+    user_id = _resolve_user_id_for_chat(settings, chat_id)
+    if user_id is None:
+        await update.message.reply_text("This chat isn't linked. See /start.")
+        return
+    await update.message.reply_text("🔄 Running YNAB writer…")
+    try:
+        report = await asyncio.to_thread(ynab_writer.run_once, settings)
+        body = ynab_writer.format_report(report)
+    except Exception as e:  # noqa: BLE001
+        log.exception("ynab_writer manual run failed: %s", e)
+        body = f"❌ YNAB writer crashed: {e}"
+    await update.message.reply_text(body)
+
+
+async def _amazon_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Phase 7 dedicated Amazon UI — checkbox-batch with verbose per-item
+    detail. Two DMs sent in sequence:
+
+      1. Status header: ready/waiting/aged-out counts.
+      2. Rich /batch-style DM scoped to Amazon items only (if any are
+         ready to categorize). Same checkbox tile UX as /batch.
+    """
+    from bot import amazon_tracker, batch_processor
+    settings: Settings = context.application.bot_data["settings"]
+    chat_id = update.effective_chat.id
+    user_id = _resolve_user_id_for_chat(settings, chat_id)
+    if user_id is None:
+        await update.message.reply_text("This chat isn't linked. See /start.")
+        return
+    db_path = settings.paths.database
+
+    # Header: tracker counts (always sent first)
+    snapshot = amazon_tracker.get_tracker_snapshot(db_path)
+    header_body = amazon_tracker.format_tracker_message(snapshot)
+    await update.message.reply_text(header_body)
+
+    # Then: the actionable Amazon-only batch
+    items = batch_processor.build_amazon_batch(db_path, user_id=user_id)
+    if not items:
+        # Status header already covered it; nothing to action
+        return
+    total = batch_processor.count_amazon_ready(db_path, user_id=user_id)
+    initial_payload = [
+        {"n": i + 1, "pt_id": it["pt_id"], "checked": True}
+        for i, it in enumerate(items)
+    ]
+    body = batch_processor.render_batch_body(
+        items, total, initial_payload,
+        verbose=True, header_emoji="📦", header_label="Amazon",
+    )
+    keyboard = batch_processor.render_batch_buttons(items, initial_payload)
+    sent = await update.message.reply_text(
+        body, reply_markup=keyboard, parse_mode="Markdown",
+    )
+    batch_processor.save_batch_context(
+        db_path, chat_id, items, sent.message_id,
+        verbose=True, header_emoji="📦", header_label="Amazon",
+    )
+
+
+async def _batch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Phase 7 /batch command — bulk-process COLD-lane pending_txns.
+
+    Sends a single DM listing up to 15 oldest COLD items numbered, with
+    each item's best-guess category. The user replies with a shorthand
+    string (see bot.batch_processor.parse_reply) and the bot applies all
+    decisions in one transaction.
+    """
+    from bot import batch_processor
+    settings: Settings = context.application.bot_data["settings"]
+    chat_id = update.effective_chat.id
+    user_id = _resolve_user_id_for_chat(settings, chat_id)
+    if user_id is None:
+        await update.message.reply_text("This chat isn't linked. See /start.")
+        return
+
+    items = batch_processor.build_batch(
+        settings.paths.database, user_id=user_id,
+    )
+    with storage.connect(settings.paths.database) as con:
+        total = con.execute(
+            "SELECT COUNT(*) FROM pending_txn "
+            "WHERE assigned_to_user_id = ? AND status='pending' "
+            "  AND queue_lane='cold'",
+            (user_id,),
+        ).fetchone()[0]
+
+    if items:
+        # All start checked; payload_items mirrors initial state.
+        initial_payload = [
+            {"n": i + 1, "pt_id": it["pt_id"], "checked": True}
+            for i, it in enumerate(items)
+        ]
+        body = batch_processor.render_batch_body(items, total, initial_payload)
+        keyboard = batch_processor.render_batch_buttons(items, initial_payload)
+        # parse_mode='Markdown' renders the ```code block``` as monospace
+        # so the columns align even on a phone screen.
+        sent = await update.message.reply_text(
+            body, reply_markup=keyboard, parse_mode="Markdown",
+        )
+        batch_processor.save_batch_context(
+            settings.paths.database, chat_id, items, sent.message_id,
+        )
+    else:
+        await update.message.reply_text(
+            batch_processor.render_batch_body([], 0),
+        )
+
+
 async def _samples_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Phase 0 operator command. Inspect raw_email_sample contents.
 
@@ -1442,8 +2390,85 @@ async def _samples_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _register_handlers(app: Application) -> None:
+    """Attach the same handler set to every Application instance.
+
+    With per-user bot tokens (one bot per spouse), inbound messages route
+    to whichever Application owns the bot the user is DM'ing. Handlers
+    themselves are bot-agnostic — they look up the right outbound bot via
+    ``_bot_for_chat`` and operate on the shared DB.
+    """
+    app.add_handler(CommandHandler("start", _start_cmd))
+    app.add_handler(CommandHandler("skip", _skip_cmd))
+    app.add_handler(CommandHandler("quiet", _quiet_cmd))
+    app.add_handler(CommandHandler("undo", _undo_cmd))
+    app.add_handler(CommandHandler("help", _help_cmd))
+    app.add_handler(CommandHandler("samples", _samples_cmd))
+    app.add_handler(CommandHandler("batch", _batch_cmd))
+    app.add_handler(CommandHandler("amazon", _amazon_cmd))
+    app.add_handler(CommandHandler("ynab", _ynab_cmd))
+    app.add_handler(CallbackQueryHandler(_handle_callback))
+    app.add_error_handler(_handle_telegram_error)
+    # AI-mediated chat (Phase 3.5) — qwen3:32b processes free text. Registered
+    # before _handle_text so it gets first crack at non-trivial messages.
+    # Trivial replies (y/skip/undo) and short single-word category names
+    # during in-flight categorization are forwarded back to _handle_text.
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_ai_agent))
+
+
+async def _run_apps(apps: list[Application]) -> None:
+    """Drive N Applications concurrently in one event loop.
+
+    PTB v22's ``Application.run_polling`` is synchronous and manages its
+    own loop, which won't fit a multi-Application setup. The manual
+    initialize/start/start_polling lifecycle (same pattern as
+    first_run_setup.py) lets us run several Apps side-by-side and shut
+    them all down cleanly on SIGTERM.
+    """
+    for app in apps:
+        await app.initialize()
+        # PTB only invokes post_init from run_polling()/run_webhook(), never
+        # from the manual initialize()/start() lifecycle we use here for the
+        # multi-Application setup. Without this call _post_init never runs, so
+        # NONE of the background loops (push, daily/weekly, gmail, ynab sync,
+        # lane sweep, awareness, and the localhost ui_api on :8765) start —
+        # the bot answers DMs but does nothing proactive and Bot Control sees
+        # a dead API. Mirror run_polling's behavior explicitly.
+        if app.post_init:
+            await app.post_init(app)
+        await app.start()
+        await app.updater.start_polling(drop_pending_updates=True)
+    log.info("telegram long-poll active on %d application(s)", len(apps))
+    try:
+        await asyncio.Event().wait()
+    finally:
+        for app in apps:
+            try:
+                await app.updater.stop()
+            except Exception as e:  # noqa: BLE001
+                log.warning("updater.stop failed: %s", e)
+            try:
+                await app.stop()
+            except Exception as e:  # noqa: BLE001
+                log.warning("app.stop failed: %s", e)
+            try:
+                await app.shutdown()
+            except Exception as e:  # noqa: BLE001
+                log.warning("app.shutdown failed: %s", e)
+
+
 def run(settings: Settings | None = None) -> None:
-    """Build the Application, register handlers, and block on long-polling."""
+    """Build all Applications (one per distinct bot token), register
+    handlers, and block on long-polling.
+
+    Multi-bot mode kicks in when any ``gmail_accounts`` entry sets
+    ``telegram_bot_token_env`` — that user gets their own Application on
+    that token. The "primary" Application (the one whose token matches
+    ``settings.telegram_bot_token``) hosts ALL background loops — push,
+    daily/weekly summaries, gmail/ynab poll, queue-lane sweep, UI API.
+    Other Applications are input-only; their outbound DMs are routed
+    through them via the shared ``chat_to_bot`` map.
+    """
     if settings is None:
         settings = load_settings()
     storage.init_db(settings.paths.database)
@@ -1456,33 +2481,69 @@ def run(settings: Settings | None = None) -> None:
         settings.ollama.temperature,
     )
 
-    app = (
-        ApplicationBuilder()
-        .token(settings.telegram_bot_token)
-        .post_init(_post_init)
-        .build()
+    from bot.config import resolve_user_bot_token
+    token_to_accounts: dict[str, list] = {}
+    for acct in settings.gmail_accounts:
+        tok = resolve_user_bot_token(settings, acct.user_id)
+        if not tok:
+            log.warning("no bot token resolvable for user %s — skipping",
+                        acct.user_id)
+            continue
+        token_to_accounts.setdefault(tok, []).append(acct)
+
+    if not token_to_accounts:
+        raise RuntimeError(
+            "No Telegram bot tokens configured. Set TELEGRAM_BOT_TOKEN in "
+            ".env or telegram_bot_token_env on a gmail_accounts entry."
+        )
+
+    # Primary app = the one whose token matches settings.telegram_bot_token,
+    # if that token is in use; otherwise the first app we build. The primary
+    # owns all background loops.
+    primary_token = (
+        settings.telegram_bot_token
+        if settings.telegram_bot_token in token_to_accounts
+        else next(iter(token_to_accounts))
     )
-    app.bot_data["settings"] = settings
-    app.bot_data["categories"] = categories
-    app.bot_data["categorizer"] = categorizer
 
-    app.add_handler(CommandHandler("start", _start_cmd))
-    app.add_handler(CommandHandler("pending", _pending_cmd))
-    app.add_handler(CommandHandler("skip", _skip_cmd))
-    app.add_handler(CommandHandler("digest", _digest_cmd))
-    app.add_handler(CommandHandler("quiet", _quiet_cmd))
-    app.add_handler(CommandHandler("undo", _undo_cmd))
-    app.add_handler(CommandHandler("help", _help_cmd))
-    app.add_handler(CommandHandler("samples", _samples_cmd))
-    app.add_handler(CallbackQueryHandler(_handle_callback))
-    # AI-mediated chat (Phase 3.5) — qwen3:32b processes free text. Registered
-    # before _handle_text so it gets first crack at non-trivial messages.
-    # Trivial replies (y/skip/undo) and short single-word category names
-    # during in-flight categorization are forwarded back to _handle_text.
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, _handle_ai_agent))
+    # Single shared push-lock dict across all Apps so a callback on bot A
+    # and a background push on bot B for the SAME chat_id can't race —
+    # both call _get_push_lock and end up serialized on the same lock.
+    shared_push_locks: dict[int, asyncio.Lock] = {}
 
-    log.info("starting telegram long-poll")
-    app.run_polling()
+    apps: list[Application] = []
+    apps_by_token: dict[str, Application] = {}
+    for tok, accounts in token_to_accounts.items():
+        is_primary = (tok == primary_token)
+        builder = ApplicationBuilder().token(tok)
+        if is_primary:
+            builder = builder.post_init(_post_init)
+        app = builder.build()
+        app.bot_data["settings"] = settings
+        app.bot_data["categories"] = categories
+        app.bot_data["categorizer"] = categorizer
+        app.bot_data["is_primary_bot"] = is_primary
+        app.bot_data["push_locks"] = shared_push_locks
+        apps_by_token[tok] = app
+        apps.append(app)
+        _register_handlers(app)
+        log.info("telegram app built for %d account(s); primary=%s; "
+                 "users=%s",
+                 len(accounts), is_primary,
+                 [a.user_id for a in accounts])
+
+    # chat_id → Bot map shared across every Application so any handler /
+    # background loop can resolve the right outbound bot regardless of
+    # which app it's running on.
+    chat_to_bot: dict[int, "object"] = {}
+    for tok, accounts in token_to_accounts.items():
+        for acct in accounts:
+            chat_to_bot[int(acct.chat_id)] = apps_by_token[tok].bot
+    for app in apps:
+        app.bot_data["chat_to_bot"] = chat_to_bot
+
+    log.info("starting telegram long-poll (%d app(s))", len(apps))
+    asyncio.run(_run_apps(apps))
 
 
 if __name__ == "__main__":

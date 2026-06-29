@@ -26,6 +26,13 @@ class GmailAccount(BaseModel):
     # passwords require 2-Step Verification to be enabled on the
     # account, generate at https://myaccount.google.com/apppasswords.
     imap_password_env: str = ""
+    # Optional: name of an env var holding a dedicated Telegram bot token
+    # for THIS user. When set, the bot launches a second Application on
+    # that token and routes all outbound DMs for this chat_id through it.
+    # When unset, the user is served by the default ``telegram_bot_token``
+    # Application. Used to give Allison her own bot identity
+    # (@HarrisBudgetBot) without sharing Steven's bot.
+    telegram_bot_token_env: str = ""
 
 
 class EmailSource(BaseModel):
@@ -33,7 +40,9 @@ class EmailSource(BaseModel):
     query: str
     parser: Literal[
         "amazon", "amazon_shipment", "venmo", "retailer_order",
+        "apple_receipt",
         "citi_alert", "chase_alert", "chase_balance_summary",
+        "citi_balance_summary",
         "coastal_transaction_alert", "coastal_balance_summary",
         "paypal_payment",
     ]
@@ -103,3 +112,21 @@ def load_settings(config_path: Path | str = "config.yaml") -> Settings:
     data["ynab_token"] = os.getenv("YNAB_TOKEN", "")
     data["telegram_bot_token"] = os.getenv("TELEGRAM_BOT_TOKEN", "")
     return Settings.model_validate(data)
+
+
+def resolve_user_bot_token(settings: "Settings", user_id: str) -> str:
+    """Return the Telegram bot token that serves ``user_id``.
+
+    Falls back to ``settings.telegram_bot_token`` when the user's account
+    has no ``telegram_bot_token_env`` set or that env var is empty.
+    """
+    for acct in settings.gmail_accounts:
+        if acct.user_id != user_id:
+            continue
+        env_name = (acct.telegram_bot_token_env or "").strip()
+        if env_name:
+            tok = os.environ.get(env_name, "").strip()
+            if tok:
+                return tok
+        break
+    return settings.telegram_bot_token

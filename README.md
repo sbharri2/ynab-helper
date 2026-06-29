@@ -1,22 +1,49 @@
 # YNAB Helper
 
-Personal Telegram assistant that categorizes YNAB transactions while purchases are still fresh in memory. Pulls Amazon and Venmo receipts from Gmail in real time, asks for daily review on everything else, suggests categories using a local LLM (Ollama), and writes the chosen category back to YNAB via API.
+Personal Telegram assistant + local YNAB-replacement-in-progress. Ingests
+CC alerts, bank balance emails, and merchant receipt emails from Gmail
+in real time; categorizes via override map → strong-prior matcher →
+local LLM (qwen3:32b on Ollama); pushes decisions to YNAB once daily.
+The bot is the system of record; YNAB is a mirror being phased out.
 
-See `docs/superpowers/specs/2026-05-16-ynab-helper-design.md` for the full design.
+## Architecture (Phase 7+, as of 2026-06-26)
 
-## Status
+Pipeline:
+1. **gmail_watcher** (in-process, 60s cadence) — polls Gmail via IMAP,
+   parses with per-sender modules in `bot/parsers/`, calls
+   `bot.ingest.ingest_signal` to create ledger_txn + pending_txn rows.
+2. **categorizer** — three-tier cascade inside `ingest_signal`:
+   - `bot.payee_overrides.resolve_payee_override` — hard-coded
+     biller→category map (AT&T, Hulu, Duke Energy, etc.)
+   - `bot.storage.get_strongest_payee_category` — historical prior
+     bypass for any payee with ≥3 hits at ≥70% to one category
+   - `bot.categorizer.Categorizer.suggest` — Ollama LLM with priors
+3. **Telegram UX** (`bot/telegram_bot.py`):
+   - HOT lane: real-time DM as items arrive
+   - `/batch` — checkbox-tile bulk processing of COLD-lane items
+   - `/amazon` — verbose multi-line view for Amazon items only
+   - AI agent (`bot/agent.py`) — free-text NL queries via qwen3:32b
+4. **ynab_writer** (`bot/ynab_writer.py`) — runs once daily after the
+   morning summary. Pushes every unsynced categorized pending_txn to
+   YNAB. Bot wins on conflict; conflicts logged in the daily report.
+   `/ynab` triggers manual run.
+5. **ynab_full_sync** (in-process, 6h cadence) — pulls every YNAB
+   transaction into local `ledger_txn` so the bot's mirror is current.
 
-- MVP-1 (Steven's flow): in development per `docs/superpowers/plans/2026-05-16-ynab-helper-mvp1.md`
-- MVP-2 (wife's Gmail): planned
-- MVP-3 (weekly digest): planned
+Reports DM'd to opted-in users:
+- Daily summary at 7:30am (yesterday's activity, balances, queue counts)
+- Daily YNAB writer report at 7:35am (pushed/conflicts/waiting)
+- Awareness pings at 10am/2pm/7pm (/batch + /amazon counts)
+- Weekly summary Sunday 6pm (top categories/payees/anomalies)
+- Weekly YNAB sunset-progress report Sunday 6pm (coverage trend)
 
-## Architecture
-
-- **gmail_watcher** (scheduled, every 5 min) — polls Gmail for new Amazon/Venmo emails, parses, queues
-- **ynab_watcher** (scheduled, every 30 min) — matches pending categorized orders to new YNAB charges, queues non-Amazon/Venmo for daily digest
-- **telegram_bot** (long-running) — pushes items to user, parses replies, applies categories
-- **categorizer** (Ollama HTTP) — local LLM suggests YNAB category from items + history
-- **matcher** — pure scoring function linking emails to YNAB charges
+Removed in Phase 7:
+- `bot/ynab_watcher.py` — used to enqueue pending_txns from
+  YNAB-uncategorized list; now obsolete (writer pushes the other way)
+- Synchronous `ynab.set_category` in `_apply_choice` — bot taps no
+  longer talk to YNAB
+- `bot/reporters/ynab_qa.py` — superseded by writer's daily report
+- `/digest`, `/pending` commands — replaced by `/batch` + `/amazon`
 
 ## Requirements (deployment machine)
 

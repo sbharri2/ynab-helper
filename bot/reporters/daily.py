@@ -50,8 +50,23 @@ def _clean_payee(raw: str) -> str:
     return " ".join(w.capitalize() for w in s.split())
 
 
-def build_daily_summary(db_path: str, *, as_of: date | None = None) -> str:
-    """Returns the morning-summary text. No I/O beyond SQLite reads."""
+def build_daily_summary(
+    db_path: str, *, user_id: str = "steven", as_of: date | None = None,
+) -> str:
+    """Returns the morning-summary text. No I/O beyond SQLite reads.
+
+    The body shape depends on ``user_id``. Steven gets the full household
+    snapshot (yesterday's activity, all balances, reconciliation, queues).
+    Allison gets a tailored view: her personal-budget envelope, the family
+    dining/entertainment envelope (MTD + yesterday's line items), and her
+    own pending-queue count.
+    """
+    if user_id == "allison":
+        return _build_allison_summary(db_path, as_of=as_of)
+    return _build_steven_summary(db_path, as_of=as_of)
+
+
+def _build_steven_summary(db_path: str, *, as_of: date | None = None) -> str:
     today = as_of or date.today()
     yesterday = today - timedelta(days=1)
     month = today.strftime("%Y-%m")
@@ -61,9 +76,12 @@ def build_daily_summary(db_path: str, *, as_of: date | None = None) -> str:
         # all our ledger_txn entries have no transfer_account_id concept;
         # ledger_txn already excludes those by Phase 2 design.)
         rows_y = con.execute(
+            # parent_txn_id IS NULL → one row per bank transaction (split
+            # children hidden); the parent carries the full amount so the
+            # net total stays correct.
             """SELECT amount_cents, payee, category_id
                FROM ledger_txn
-               WHERE posted_date = ?""",
+               WHERE posted_date = ? AND parent_txn_id IS NULL""",
             (yesterday,),
         ).fetchall()
 
@@ -81,6 +99,18 @@ def build_daily_summary(db_path: str, *, as_of: date | None = None) -> str:
                         ORDER BY as_of_date DESC LIMIT 1) AS observed
                FROM account a
                WHERE a.closed = 0 AND a.on_budget = 1
+               ORDER BY a.name""",
+        ).fetchall()
+
+        tracking = con.execute(
+            """SELECT a.id, a.name, a.type, a.on_budget,
+                      a.balance_cents AS imported_balance,
+                      (SELECT balance_cents
+                         FROM account_balance_observed
+                        WHERE account_id = a.id
+                        ORDER BY as_of_date DESC LIMIT 1) AS observed
+               FROM account a
+               WHERE a.closed = 0 AND a.on_budget = 0
                ORDER BY a.name""",
         ).fetchall()
 
@@ -107,10 +137,20 @@ def build_daily_summary(db_path: str, *, as_of: date | None = None) -> str:
     # Outstanding queue — items waiting for the user to categorize.
     # Surfaced at the top so the user sees "you have N items waiting"
     # right when they open the morning DM.
+    #
+    # The /batch and /amazon queues are tracked separately. Daily
+    # summary always shows both so Steven never has to remember to run
+    # /amazon — the count is right there next to the /batch one.
+    from bot.batch_processor import (
+        count_cold_batch, count_amazon_ready, count_amazon_held,
+    )
+    # NOTE: settings.gmail_accounts has user_id; the daily summary is
+    # currently single-user (Steven), so reading the first account's
+    # user_id is correct. Multi-user fan-out lives at the loop level.
+    batch_n = count_cold_batch(db_path, user_id="steven")
+    amazon_ready = count_amazon_ready(db_path, user_id="steven")
+    amazon_held = count_amazon_held(db_path, user_id="steven")
     with storage.connect(db_path) as con:
-        outstanding = con.execute(
-            "SELECT COUNT(*) FROM pending_txn WHERE status = 'pending'"
-        ).fetchone()[0]
         outstanding_orders = con.execute(
             "SELECT COUNT(*) FROM pending_order WHERE status = 'pending'"
         ).fetchone()[0]
@@ -119,12 +159,24 @@ def build_daily_summary(db_path: str, *, as_of: date | None = None) -> str:
     lines.append(f"☀️ {today.strftime('%A %B %d')}")
     lines.append("")
 
-    total_outstanding = outstanding + outstanding_orders
-    if total_outstanding:
-        lines.append(
-            f"📥 {total_outstanding} item{'s' if total_outstanding != 1 else ''} "
-            f"waiting for you to categorize. Type 'next' to triage."
+    queue_lines: list[str] = []
+    if batch_n:
+        queue_lines.append(
+            f"📥 {batch_n} batch item{'s' if batch_n != 1 else ''} ready — /batch"
         )
+    if amazon_ready or amazon_held:
+        parts: list[str] = []
+        if amazon_ready:
+            parts.append(f"{amazon_ready} ready")
+        if amazon_held:
+            parts.append(f"{amazon_held} waiting for receipt")
+        queue_lines.append(f"📦 Amazon: {' · '.join(parts)} — /amazon")
+    if outstanding_orders:
+        queue_lines.append(
+            f"🛒 {outstanding_orders} order item{'s' if outstanding_orders != 1 else ''} pending"
+        )
+    if queue_lines:
+        lines.extend(queue_lines)
         lines.append("")
 
     # Yesterday — show ALL outflows (largest first), then any inflows
@@ -175,41 +227,68 @@ def build_daily_summary(db_path: str, *, as_of: date | None = None) -> str:
                 line = f"  {a['name'][:30]}: {_fmt(imported)} (YNAB)"
             lines.append(line)
 
-    # Reconciliation status — read from yesterday's audit_log events. When
-    # the bot's daily loop calls reconcile_all_observed, each account
-    # produces either reconcile_ok or reconcile_mismatch. Surface a tight
-    # summary: ✅ count, ⚠ any mismatches with delta.
+    if tracking:
+        lines.append("")
+        lines.append("🏦 Tracking:")
+        for a in tracking:
+            observed = a["observed"]
+            imported = int(a["imported_balance"] or 0)
+            if observed is not None:
+                line = f"  {a['name'][:30]}: {_fmt(int(observed))}"
+            else:
+                line = f"  {a['name'][:30]}: {_fmt(imported)} (YNAB)"
+            lines.append(line)
+
+    # Reconciliation status — read latest event per (account_id, as_of_date)
+    # from today's audit_log. The reconciler may run multiple times per day
+    # (after backfills, after manual triggers); we want the MOST RECENT
+    # state per account, not every run.
     with storage.connect(db_path) as con:
         recon_rows = con.execute(
-            """SELECT event, details FROM audit_log
+            """SELECT event, details, ts FROM audit_log
                WHERE event IN ('reconcile_ok', 'reconcile_mismatch')
-                 AND date(ts) = ?""",
+                 AND date(ts) = ?
+               ORDER BY id ASC""",
             (today.isoformat(),),
         ).fetchall()
     if recon_rows:
-        ok_count = 0
-        mismatches: list[tuple[str, int]] = []  # (account_label, delta_cents)
+        # Dedupe to latest per account_id
+        import json as _json
+        latest: dict[str, dict] = {}
         for r in recon_rows:
             try:
-                d = __import__("json").loads(r["details"] or "{}")
+                d = _json.loads(r["details"] or "{}")
             except (ValueError, TypeError):
                 continue
-            if r["event"] == "reconcile_ok":
+            acct = d.get("account_id")
+            if not acct:
+                continue
+            latest[acct] = {"event": r["event"], "details": d, "ts": r["ts"]}
+
+        ok_count = 0
+        mismatches: list[tuple[str, int]] = []
+        for acct_id, info in latest.items():
+            if info["event"] == "reconcile_ok":
                 ok_count += 1
             else:
-                # Look up the account name for a friendly label
                 with storage.connect(db_path) as con2:
                     arow = con2.execute(
                         "SELECT name FROM account WHERE id = ?",
-                        (d.get("account_id"),),
+                        (acct_id,),
                     ).fetchone()
-                label = (arow["name"] if arow else d.get("account_id"))[:30]
-                mismatches.append((label, int(d.get("delta_cents") or 0)))
+                label = (arow["name"] if arow else acct_id)[:30]
+                mismatches.append((label, int(info["details"].get("delta_cents") or 0)))
+
         if mismatches:
             lines.append("")
-            lines.append("⚠ Reconciliation mismatches:")
+            lines.append("⚠ Bank balance doesn't match the ledger:")
             for label, delta in mismatches:
-                lines.append(f"  {label}: bank says {_fmt(delta)} from expected")
+                # Reconciler stores delta = observed - expected. So a NEGATIVE
+                # delta means bank reports LESS than the ledger (ledger over).
+                direction = "under" if delta > 0 else "over"
+                lines.append(
+                    f"  {label}: ledger is {_fmt(abs(delta))} {direction} bank"
+                )
         if ok_count:
             lines.append("")
             lines.append(
@@ -241,22 +320,159 @@ def build_daily_summary(db_path: str, *, as_of: date | None = None) -> str:
     return "\n".join(lines)
 
 
-async def send_daily_summaries(app) -> None:
+# Hard-coded category names for Allison's tailored daily. Two users, two
+# categories — config indirection would be more ceremony than the data
+# justifies. If a third user shows up, lift these into user_pref or a
+# small dict keyed on user_id.
+_ALLISON_ENVELOPE_NAME = "Allison Personal Savings"
+_FAMILY_DINING_NAME = "Dining Out/Entertainment"
+
+
+def _lookup_category_id(con, name: str) -> str | None:
+    row = con.execute(
+        "SELECT id FROM category WHERE name = ? AND hidden = 0",
+        (name,),
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def _build_allison_summary(db_path: str, *, as_of: date | None = None) -> str:
+    """Allison's morning DM: her personal envelope + the family dining
+    envelope (MTD + yesterday's line items) + her own pending queue count.
+
+    Deliberately omits household-level balances, reconciliation status, and
+    other categories' overspent/tight signals — those are Steven's lane.
+    """
+    today = as_of or date.today()
+    yesterday = today - timedelta(days=1)
+    month = today.strftime("%Y-%m")
+
+    # Recompute the two envelopes we're about to display so the numbers
+    # reflect any newly-categorized activity (the bot may have categorized
+    # transactions overnight that haven't been rolled into month_category
+    # yet on a cold DB).
+    from bot.envelope import available_for_category
+
+    with storage.connect(db_path) as con:
+        allison_env_id = _lookup_category_id(con, _ALLISON_ENVELOPE_NAME)
+        dining_id = _lookup_category_id(con, _FAMILY_DINING_NAME)
+
+    if allison_env_id:
+        available_for_category(db_path, category_id=allison_env_id, month=month)
+    if dining_id:
+        available_for_category(db_path, category_id=dining_id, month=month)
+
+    with storage.connect(db_path) as con:
+        allison_env = con.execute(
+            "SELECT budgeted_cents, activity_cents, available_cents "
+            "FROM month_category WHERE month = ? AND category_id = ?",
+            (month, allison_env_id),
+        ).fetchone() if allison_env_id else None
+
+        dining_env = con.execute(
+            "SELECT budgeted_cents, activity_cents, available_cents "
+            "FROM month_category WHERE month = ? AND category_id = ?",
+            (month, dining_id),
+        ).fetchone() if dining_id else None
+
+        # Yesterday's dining/entertainment line items. parent_txn_id IS NULL
+        # so split children don't double-count; is_split=0 keeps split
+        # parents out (their children carry the category).
+        dining_lines = con.execute(
+            """SELECT amount_cents, payee
+               FROM ledger_txn
+               WHERE category_id = ?
+                 AND posted_date = ?
+                 AND parent_txn_id IS NULL
+                 AND is_split = 0
+               ORDER BY amount_cents ASC""",
+            (dining_id, yesterday),
+        ).fetchall() if dining_id else []
+
+        # Her pending queue — items assigned to her, still waiting on input.
+        # Both pending_txn (interactive queue) and pending_order (raw email
+        # rows). pending_order is on its way out per Steven's 2026-06-26
+        # directive, so we don't render it as a separate line; just include
+        # it in the count so she sees a non-zero number if anything is
+        # genuinely waiting on her.
+        pending_count = con.execute(
+            "SELECT COUNT(*) FROM pending_txn "
+            "WHERE assigned_to_user_id = ? AND status = 'pending'",
+            ("allison",),
+        ).fetchone()[0]
+
+    lines: list[str] = []
+    lines.append(f"☀️ {today.strftime('%A %B %d')}")
+    lines.append("")
+
+    if pending_count:
+        lines.append(
+            f"📥 {pending_count} item{'s' if pending_count != 1 else ''} "
+            f"waiting for you"
+        )
+        lines.append("")
+
+    # Allison's personal envelope.
+    if allison_env:
+        avail = int(allison_env["available_cents"] or 0)
+        budgeted = int(allison_env["budgeted_cents"] or 0)
+        lines.append(f"💰 {_ALLISON_ENVELOPE_NAME}")
+        lines.append(f"   {_fmt(avail)} available")
+        if budgeted:
+            lines.append(f"   ({_fmt(budgeted)} assigned this month)")
+    else:
+        lines.append(f"💰 {_ALLISON_ENVELOPE_NAME}: (envelope not found)")
+
+    # Family dining/entertainment.
+    lines.append("")
+    if dining_env:
+        avail = int(dining_env["available_cents"] or 0)
+        budgeted = int(dining_env["budgeted_cents"] or 0)
+        activity = int(dining_env["activity_cents"] or 0)
+        # activity is signed (negative = outflow). Render the absolute
+        # spent for clarity.
+        spent = -activity if activity < 0 else 0
+        lines.append(f"🍽 {_FAMILY_DINING_NAME} (this month)")
+        lines.append(
+            f"   {_fmt(avail)} left · {_fmt(spent)} spent of "
+            f"{_fmt(budgeted)} budgeted"
+        )
+    else:
+        lines.append(f"🍽 {_FAMILY_DINING_NAME}: (envelope not found)")
+
+    if dining_lines:
+        lines.append("")
+        lines.append("   Yesterday:")
+        for r in dining_lines:
+            amt = int(r["amount_cents"])
+            lines.append(
+                f"     {_fmt(amt):>10}  {_clean_payee(r['payee'] or '(no payee)')}"
+            )
+
+    return "\n".join(lines)
+
+
+async def send_daily_summaries(app, *, only_user_id: str | None = None) -> None:
     """Loop opted-in recipients and DM the daily summary.
 
     `app` is the telegram Application instance (has bot_data["settings"]).
     Honors per-user quiet hours. Audits each send so it can be inspected via
     audit_log later.
+
+    When ``only_user_id`` is set, only that user is DM'd — used by the
+    per-user fire-time loop so each spouse gets their report at their own
+    time without one user's quiet-hours suppression also blocking the other.
     """
     settings = app.bot_data["settings"]
     db_path = settings.paths.database
 
     recipients = storage.list_recipients_for_period(db_path, "daily")
+    if only_user_id is not None:
+        recipients = [r for r in recipients if r["user_id"] == only_user_id]
     if not recipients:
-        log.info("daily: no recipients opted in")
+        log.info("daily: no recipients opted in"
+                 + (f" for user={only_user_id}" if only_user_id else ""))
         return
-
-    text = build_daily_summary(db_path)
 
     # Map user_id → chat_id from settings.gmail_accounts
     user_to_chat = {acct.user_id: acct.chat_id for acct in settings.gmail_accounts}
@@ -277,8 +493,14 @@ async def send_daily_summaries(app) -> None:
         if _in_quiet_hours(now, r["quiet_hours"]):
             skipped += 1
             continue
+        # Body shape is per-user — Allison gets a tailored slice, everyone
+        # else gets the full household summary.
+        text = build_daily_summary(db_path, user_id=user_id)
         try:
-            await app.bot.send_message(chat_id=chat_id, text=text)
+            from bot.telegram_bot import _bot_for_chat
+            await _bot_for_chat(app, chat_id).send_message(
+                chat_id=chat_id, text=text,
+            )
             sent += 1
         except Exception as e:  # noqa: BLE001
             log.warning("daily: send to %s failed: %s", user_id, e)

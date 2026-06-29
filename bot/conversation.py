@@ -24,28 +24,27 @@ def next_item_for_user(
     window (see ``_in_digest_window`` in telegram_bot).
     """
     with storage.connect(db_path) as con:
-        # Linear order by id — the natural arrival order. When the
-        # user ignores a DM, the push_loop's staleness guard marks the
-        # row as 'skipped' (see telegram_bot._push_loop) so it doesn't
-        # block the queue forever. User can `/unskip` to revisit.
-        order = con.execute(
-            """SELECT * FROM pending_order
-               WHERE user_id = ? AND status = 'pending'
-               ORDER BY id ASC LIMIT 1""",
-            (user_id,),
-        ).fetchone()
-        if order:
-            d = dict(order)
-            d["kind"] = "order"
-            d["raw_payload"] = json.loads(d.get("raw_payload") or "{}")
-            return d
+        # NOTE: pending_orders are NO LONGER returned to the push loop.
+        # Per Steven's 2026-06-26 directive, Amazon items live in
+        # /amazon and other order emails are matched against ledger_txn
+        # rows via Phase 2 enrichment (bot.ingest._enrich_from_pending_order).
+        # The push loop only ever DMs pending_txn rows in the HOT lane.
+        #
+        # ``include_txns`` arg used to gate pending_order vs pending_txn
+        # routing in the digest-window era; it's now a no-op kept so
+        # existing callers don't break.
 
         if not include_txns:
             return None
 
+        # Phase 7: the push loop only DMs items in the HOT lane. COLD and
+        # HOLD items wait for /batch or for the HOLD-sweep to promote them
+        # — see bot.queue_lane for the lane state machine.
         txn = con.execute(
             """SELECT * FROM pending_txn
-               WHERE user_id = ? AND status = 'pending'
+               WHERE assigned_to_user_id = ?
+                 AND status = 'pending'
+                 AND queue_lane = 'hot'
                ORDER BY id ASC LIMIT 1""",
             (user_id,),
         ).fetchone()

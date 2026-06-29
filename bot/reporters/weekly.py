@@ -28,9 +28,12 @@ def build_weekly_summary(db_path: str, *, as_of: date | None = None) -> str:
     with storage.connect(db_path) as con:
         # 7-day rows
         rows = con.execute(
+            # is_split = 0 → split children (which carry the per-category
+            # money) are rolled up into their categories; split parents
+            # are excluded so nothing double-counts.
             """SELECT posted_date, amount_cents, payee, category_id
                FROM ledger_txn
-               WHERE posted_date >= ?""",
+               WHERE posted_date >= ? AND is_split = 0""",
             (week_start,),
         ).fetchall()
 
@@ -92,30 +95,37 @@ def build_weekly_summary(db_path: str, *, as_of: date | None = None) -> str:
         for payee, total in top_payees:
             lines.append(f"  {_fmt(total):>10}  {payee}")
 
-    # Anomalies — check the biggest-spend payees this week
+    # Anomalies — call out payees where spending SPIKED above their
+    # 12-week median. We deliberately DON'T flag "below typical" — a quiet
+    # week at a restaurant is a non-event, not an alert. Three filters:
+    #   1. z > 2.0   (real spike vs baseline noise)
+    #   2. this_week_cents < 0    (actual outflow, not a refund-week)
+    #   3. spend - median ≥ $25   (filters tiny absolute deltas that
+    #      score high z because the merchant's normal-week is near zero)
     payees_to_check = [p for p, _ in
                        sorted(payee_totals.items(), key=lambda kv: kv[1])[:10]]
     anomalies: list[dict] = []
     for p in payees_to_check:
         result = anomaly.z_score_for_payee(db_path, p, window_weeks=12)
-        if result["z"] is not None and abs(result["z"]) > 2.0:
-            anomalies.append(result)
+        if result["z"] is None:
+            continue
+        if result["z"] <= 2.0:
+            continue
+        if result["this_week_cents"] >= 0:
+            continue
+        delta_cents = abs(result["this_week_cents"]) - abs(result["median_cents"])
+        if delta_cents < 2500:
+            continue
+        anomalies.append(result)
     if anomalies:
         lines.append("")
-        lines.append("⚠️  Unusual this week:")
+        lines.append("⚠️  Spending spikes at these merchants:")
         for a in anomalies[:3]:
-            direction = "higher" if a["this_week_cents"] < a["median_cents"] else "lower"
-            # Recall amounts are negative for outflows. More-negative = bigger spend.
-            spend = -a["this_week_cents"] if a["this_week_cents"] < 0 else 0
-            median_spend = -a["median_cents"] if a["median_cents"] < 0 else 0
-            # Determine direction in spend terms
-            if spend > median_spend:
-                dir_str = "above"
-            else:
-                dir_str = "below"
+            spend = -a["this_week_cents"]
+            median_spend = -a["median_cents"]
             lines.append(
-                f"  {a['payee']}: {_fmt(-spend)} spent, {dir_str} typical "
-                f"({_fmt(-median_spend)} median)"
+                f"  {a['payee']}: {_fmt(-spend)} this week "
+                f"(usually {_fmt(-median_spend)})"
             )
 
     # Categories burning fast
@@ -161,7 +171,10 @@ async def send_weekly_summaries(app) -> None:
             skipped += 1
             continue
         try:
-            await app.bot.send_message(chat_id=chat_id, text=text)
+            from bot.telegram_bot import _bot_for_chat
+            await _bot_for_chat(app, chat_id).send_message(
+                chat_id=chat_id, text=text,
+            )
             sent += 1
         except Exception as e:  # noqa: BLE001
             log.warning("weekly: send to %s failed: %s", r["user_id"], e)

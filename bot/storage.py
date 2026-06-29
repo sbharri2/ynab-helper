@@ -85,6 +85,28 @@ CREATE TABLE IF NOT EXISTS audit_log (
   details TEXT
 );
 
+-- Manual overrides on the auto-detected income source list.
+-- The UI's Job Change flow writes here: 'retired' rows hide the source
+-- from RTA expectations even if it's still in the 6mo detection window;
+-- 'active' rows add a user-defined source before enough actual paychecks
+-- have arrived for auto-detection to kick in.
+--
+-- payee_key is the matcher (UPPER(TRIM(payee))). For active overrides
+-- entered manually before any paycheck has arrived, the user-typed name
+-- is used as the key; once a real paycheck arrives the actual payee
+-- variant will end up alongside it and auto-detection will take over.
+CREATE TABLE IF NOT EXISTS income_source_override (
+  payee_key TEXT PRIMARY KEY,
+  status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired')),
+  display_name TEXT,
+  expected_amount_cents INTEGER,
+  cadence TEXT,
+  first_expected_date DATE,
+  median_delta_days INTEGER,
+  retired_at TIMESTAMP,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE INDEX IF NOT EXISTS idx_pending_order_status
   ON pending_order(status, source, user_id);
 CREATE INDEX IF NOT EXISTS idx_pending_txn_status
@@ -159,11 +181,23 @@ CREATE TABLE IF NOT EXISTS ledger_txn (
   source_email_id TEXT,
   ynab_txn_id TEXT,
   dedupe_key TEXT,
+  -- Split-transaction modeling. A YNAB split is stored as a PARENT row
+  -- (is_split=1, category_id NULL, amount = full charge) plus one CHILD
+  -- row per subtransaction (parent_txn_id set, category_id + portion
+  -- amount). Money-math sums filter `is_split = 0` (children sum to the
+  -- parent, so totals are preserved); registers filter
+  -- `parent_txn_id IS NULL` (one row per bank txn).
+  parent_txn_id INTEGER REFERENCES ledger_txn(id),
+  is_split INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   UNIQUE (ynab_txn_id)
 );
 CREATE INDEX IF NOT EXISTS idx_ledger_dedupe ON ledger_txn(dedupe_key, posted_date);
+-- idx_ledger_parent is created in _migrate(), not here: on an existing DB
+-- executescript(SCHEMA) runs before the ALTER TABLE that adds
+-- parent_txn_id, so creating the index here would fail with "no such
+-- column". _migrate() adds the column first, then the index.
 CREATE INDEX IF NOT EXISTS idx_ledger_account_date ON ledger_txn(account_id, posted_date);
 CREATE INDEX IF NOT EXISTS idx_ledger_category ON ledger_txn(category_id, posted_date);
 CREATE INDEX IF NOT EXISTS idx_ledger_payee ON ledger_txn(payee);
@@ -269,6 +303,16 @@ def _migrate(con) -> None:
         con.execute(
             "ALTER TABLE bot_conversation ADD COLUMN last_asked_message_id INTEGER"
         )
+    if "last_batch_json" not in bot_conv_cols:
+        # Phase 7 /batch UI: stores the list of pending_txn IDs that were
+        # numbered in the most recent /batch DM, plus the message_id.
+        # Format: {"items": [{"n": 1, "pt_id": 988}, ...], "message_id": N,
+        #          "sent_at": "ISO", "consumed": false}
+        # When the user replies with shorthand ("all", "1 2 4", "3=cat"),
+        # bot.batch_processor reads this row to map numbers→ids.
+        con.execute(
+            "ALTER TABLE bot_conversation ADD COLUMN last_batch_json TEXT"
+        )
 
     account_cols = {
         r[1] for r in con.execute("PRAGMA table_info(account)")
@@ -297,6 +341,115 @@ def _migrate(con) -> None:
             "ALTER TABLE pending_order ADD COLUMN last_pushed_at TIMESTAMP"
         )
 
+    # Phase 6.5 multi-user routing — pending_txn rows carry an
+    # ``assigned_to_user_id`` so the push loop only DMs items belonging to
+    # the current chat's user. Steven assigns Allison's purchases to her
+    # via the "➡ For Allison" inline-keyboard button; Allison kicks rows
+    # back via "↩ Back to Steven". Default 'steven' so existing rows
+    # behave as they did before the routing landed.
+    if "assigned_to_user_id" not in txn_cols:
+        con.execute(
+            "ALTER TABLE pending_txn ADD COLUMN "
+            "assigned_to_user_id TEXT NOT NULL DEFAULT 'steven'"
+        )
+    if "assigned_to_user_id" not in order_cols:
+        con.execute(
+            "ALTER TABLE pending_order ADD COLUMN "
+            "assigned_to_user_id TEXT NOT NULL DEFAULT 'steven'"
+        )
+
+    # Phase 7 (queue redesign) — two queues, not one.
+    #
+    #   HOT  → push immediately, one-at-a-time as DMs
+    #   COLD → wait in a backlog for /batch processing
+    #   HOLD → Amazon CC alert without a matched order yet; sweep promotes
+    #          to HOT once the order email arrives, or COLD after 24h.
+    #
+    # The push loop filters WHERE queue_lane='hot'. Items the user ignores
+    # for >2h get demoted to COLD by a TTL sweep (not skipped — recoverable
+    # via /batch). Default 'hot' so existing rows behave as today.
+    #
+    # ``lane_changed_at`` powers TTL math: HOT->COLD after 2h, HOLD->COLD
+    # after 24h. Defaults to row creation time when missing.
+    if "queue_lane" not in txn_cols:
+        con.execute(
+            "ALTER TABLE pending_txn ADD COLUMN "
+            "queue_lane TEXT NOT NULL DEFAULT 'hot'"
+        )
+        con.execute(
+            "ALTER TABLE pending_txn ADD COLUMN lane_changed_at TIMESTAMP"
+        )
+
+    # Phase 7+ ynab_writer — daily batch push to YNAB. Each row gets a
+    # stamp the first time the writer confirms it's in sync with YNAB.
+    # Rows with status='categorized' AND synced_to_ynab_at IS NULL form
+    # the writer's work queue. Once stamped, the writer doesn't re-touch
+    # the row unless YNAB drift forces a re-push (see ynab_writer.run_once).
+    if "synced_to_ynab_at" not in txn_cols:
+        con.execute(
+            "ALTER TABLE pending_txn ADD COLUMN synced_to_ynab_at TIMESTAMP"
+        )
+
+    # Per-user daily-summary fire time (2026-06-28). The single global
+    # settings.telegram.daily_summary_time becomes a fallback default when
+    # this column is NULL on a user_pref row. Lets Steven get his report
+    # at 06:30 and Allison hers at 08:00 without forking the loop config.
+    pref_cols = {r[1] for r in con.execute("PRAGMA table_info(user_pref)")}
+    if "daily_summary_time" not in pref_cols:
+        con.execute(
+            "ALTER TABLE user_pref ADD COLUMN daily_summary_time TEXT"
+        )
+
+    # First-class transfers (2026-06-27). YNAB models a transfer as TWO
+    # ledger entries — outflow on the source account, matching inflow on
+    # the destination — linked by transfer_transaction_id. We mirror
+    # that link so the UI can click through.
+    #
+    # transfer_account_id     : the OTHER account's id (the counterparty)
+    # transfer_transaction_id : the OTHER row's ynab_txn_id
+    #
+    # Pre-existing transfer rows (sync'd before this migration) have
+    # NULL here; the next ynab_full_sync run repopulates them since the
+    # sync's UPSERT touches every row in YNAB's window. To be safe a
+    # one-shot backfill script can run too — see
+    # scripts/backfill_transfer_links.py.
+    txn_cols_now = {r[1] for r in con.execute("PRAGMA table_info(ledger_txn)")}
+    if "transfer_account_id" not in txn_cols_now:
+        con.execute("ALTER TABLE ledger_txn ADD COLUMN transfer_account_id TEXT")
+    if "transfer_transaction_id" not in txn_cols_now:
+        con.execute(
+            "ALTER TABLE ledger_txn ADD COLUMN transfer_transaction_id TEXT"
+        )
+
+    # Split transactions (2026-06-28). YNAB models a split as a parent
+    # transaction (category "Split", no single category) with N
+    # subtransactions that each carry a category + a portion of the
+    # amount. Previously we stored only the parent — category_id NULL —
+    # so every split looked "uncategorized" and its spend was invisible
+    # to per-category activity math.
+    #
+    # parent_txn_id : child rows point at their parent ledger_txn.id
+    # is_split      : 1 on the parent row (its children carry the money)
+    #
+    # Money-math sums use `is_split = 0` (parent excluded; children, which
+    # sum to the parent, included). Registers/per-account sums use
+    # `parent_txn_id IS NULL` (children hidden; one row per bank txn).
+    # The next ynab_full_sync over the relevant window populates children
+    # for existing split parents; scripts/backfill_split_children.py forces
+    # a full-history pass.
+    if "parent_txn_id" not in txn_cols_now:
+        con.execute("ALTER TABLE ledger_txn ADD COLUMN parent_txn_id INTEGER")
+    if "is_split" not in txn_cols_now:
+        con.execute(
+            "ALTER TABLE ledger_txn ADD COLUMN is_split INTEGER NOT NULL DEFAULT 0"
+        )
+    existing_idx = {r[1] for r in con.execute("PRAGMA index_list(ledger_txn)")}
+    if "idx_ledger_parent" not in existing_idx:
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ledger_parent "
+            "ON ledger_txn(parent_txn_id)"
+        )
+
 
 def insert_pending_order(
     db_path: Path | str,
@@ -309,8 +462,17 @@ def insert_pending_order(
     total_cents: int,
     raw_summary: str,
     raw_payload: dict[str, Any],
+    assigned_to_user_id: str | None = None,
 ) -> int:
-    """Idempotent on email_id - returns existing id if already inserted."""
+    """Idempotent on email_id - returns existing id if already inserted.
+
+    Phase 6.5: ``assigned_to_user_id`` defaults to ``user_id`` so a row
+    inserted by gmail_watcher polling Allison's inbox auto-routes to her
+    (no "For Allison" tap required), while CC/bank alerts that come
+    through Steven's inbox default to him.
+    """
+    if assigned_to_user_id is None:
+        assigned_to_user_id = user_id
     with connect(db_path) as con:
         existing = con.execute(
             "SELECT id FROM pending_order WHERE email_id = ?", (email_id,)
@@ -321,11 +483,12 @@ def insert_pending_order(
             """
             INSERT INTO pending_order
               (user_id, source, external_id, email_id, order_date,
-               total_cents, raw_summary, raw_payload)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               total_cents, raw_summary, raw_payload, assigned_to_user_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (user_id, source, external_id, email_id, order_date,
-             total_cents, raw_summary, json.dumps(raw_payload, default=str)),
+             total_cents, raw_summary, json.dumps(raw_payload, default=str),
+             assigned_to_user_id),
         )
         return cur.lastrowid
 
@@ -365,38 +528,56 @@ def insert_pending_txn(
     amount_cents: int,
     txn_date: date,
     memo: str,
+    assigned_to_user_id: str | None = None,
 ) -> int | None:
-    """Returns new id, or None if ynab_txn_id already exists."""
+    """Returns new id, or None if ynab_txn_id already exists.
+
+    Phase 6.5: ``assigned_to_user_id`` defaults to ``user_id`` so items
+    from Allison's inbox auto-route to her queue. Steven's CC/bank alerts
+    therefore default to him.
+    """
+    if assigned_to_user_id is None:
+        assigned_to_user_id = user_id
     with connect(db_path) as con:
         try:
             cur = con.execute(
                 """
                 INSERT INTO pending_txn
                   (user_id, ynab_txn_id, ynab_account_id, payee,
-                   amount_cents, txn_date, memo)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                   amount_cents, txn_date, memo, assigned_to_user_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (user_id, ynab_txn_id, ynab_account_id, payee,
-                 amount_cents, txn_date, memo),
+                 amount_cents, txn_date, memo, assigned_to_user_id),
             )
             return cur.lastrowid
         except sqlite3.IntegrityError:
             return None
 
 
-def list_unmatched_amazon_orders(db_path: Path | str) -> list[dict]:
-    """Orders that have been categorized but not yet linked to a YNAB charge."""
+def list_unmatched_pending_orders(db_path: Path | str) -> list[dict]:
+    """Orders that have been categorized but not yet linked to a YNAB charge.
+
+    Returns all enrichable sources (amazon, venmo, apple, ...). The caller
+    typically filters by source after calling — the union here keeps the
+    SQL simple and lets us add new sources by extending the matcher's
+    `_PAYEE_PATTERNS` without touching this query.
+    """
     with connect(db_path) as con:
         rows = con.execute(
             """
             SELECT po.* FROM pending_order po
             LEFT JOIN matched_charge mc ON mc.pending_order_id = po.id
-            WHERE po.source = 'amazon'
+            WHERE po.source IN ('amazon', 'venmo', 'apple')
               AND po.status = 'categorized'
               AND mc.pending_order_id IS NULL
             """
         ).fetchall()
         return [dict(r) for r in rows]
+
+
+# Backwards-compatible alias; old call sites still work.
+list_unmatched_amazon_orders = list_unmatched_pending_orders
 
 
 def record_match(
@@ -532,6 +713,108 @@ def get_category_priors_for_payee(
     ]
 
 
+def get_strongest_payee_category(
+    db_path: Path | str,
+    payee: str,
+    *,
+    limit_history_days: int = 730,
+    min_count: int = 3,
+    min_pct: float = 0.7,
+) -> dict | None:
+    """Return the dominant historical category for a payee, regardless of
+    is_spending — or None if no category clears the confidence bar.
+
+    Unlike `get_category_priors_for_payee` (which filters to is_spending=1
+    because it feeds the LLM's restricted candidate pool), this helper is
+    used BEFORE the LLM runs to short-circuit categorization for payees
+    with a clear historical home — including non-spending bills like
+    "Cell Phone (4th)" that the LLM would never pick on its own.
+
+    Thresholds:
+      - ``min_count`` confirmed historical txns for this payee
+      - ``min_pct`` share going to the dominant category (default 0.7)
+
+    Returns ``{"category_id", "category_name", "count", "pct"}`` or None.
+    """
+    norm = (payee or "").strip().lower()
+    if not norm:
+        return None
+    # Try a CASCADE of LIKE prefixes from most-narrow to most-broad. The
+    # bot's CC alerts and YNAB's payee strings drift in format over time
+    # (e.g. "HOLLYSPRINGS*UTILITIES HOLLY SPRINGS USA" today vs the older
+    # "Holly Springs Utilities"), so a single fixed prefix misses real
+    # history. We take the first prefix that:
+    #   - returns at least min_count rows AND
+    #   - has a dominant category at >= min_pct share
+    # which lets a wider prefix kick in when the narrow one whiffs.
+    tokens = norm.split()
+    # 1. first-two-tokens narrows fast-food chain noise ("HARRIS TEETER #...")
+    # 2. first token only catches "DUKEENERGY", "HOLLYSPRINGS*UTILITIES"
+    # 3. first 6 chars of token 0 catches "MASSMUTUAL" vs "MASSACHUSETTS MU"
+    # Processor / acquirer prefixes — these are NEVER the merchant
+    # identity (they're written by the card network), so falling back to
+    # them as the only LIKE token would match unrelated merchants.
+    # Example: 'SQ *Atlantic Beach Coffee' shares 'sq' with Squarespace
+    # but they're totally different merchants.
+    PROCESSOR_PREFIXES = {"sq", "tst", "sp", "paypal", "pp", "pos",
+                           "apl", "amzn", "sq*", "tst*"}
+
+    prefixes: list[str] = []
+    if len(tokens) >= 2:
+        prefixes.append(f"{tokens[0]} {tokens[1]}")
+    # Only fall back to single-token when token 0 is the actual merchant
+    # name, not a payment-processor prefix.
+    if tokens[0] not in PROCESSOR_PREFIXES and not tokens[0].endswith("*"):
+        prefixes.append(tokens[0])
+        if len(tokens[0]) >= 6:
+            prefixes.append(tokens[0][:6])
+    # Dedup while preserving order
+    seen: set[str] = set()
+    prefixes = [p for p in prefixes if not (p in seen or seen.add(p))]
+
+    with connect(db_path) as con:
+        for prefix in prefixes:
+            pattern = f"{prefix}%"
+            rows = con.execute(
+                """SELECT category_id, category_name, SUM(n) AS n
+                   FROM (
+                     SELECT t.category_id,
+                            c.name AS category_name,
+                            1 AS n
+                     FROM ledger_txn t
+                     JOIN category c ON c.id = t.category_id
+                     WHERE LOWER(t.payee) LIKE ?
+                       AND t.posted_date >= date('now', ?)
+                     UNION ALL
+                     SELECT p.chosen_category AS category_id,
+                            c.name AS category_name,
+                            1 AS n
+                     FROM pending_txn p
+                     JOIN category c ON c.id = p.chosen_category
+                     WHERE p.status = 'categorized'
+                       AND LOWER(p.payee) LIKE ?
+                   )
+                   GROUP BY category_id, category_name
+                   ORDER BY n DESC""",
+                (pattern, f"-{int(limit_history_days)} days", pattern),
+            ).fetchall()
+            if not rows:
+                continue
+            total = sum(r["n"] for r in rows)
+            top = rows[0]
+            if top["n"] < min_count or (top["n"] / total) < min_pct:
+                continue
+            return {
+                "category_id": top["category_id"],
+                "category_name": top["category_name"],
+                "count": top["n"],
+                "total_count": total,
+                "pct": round(top["n"] / total, 3),
+                "prefix_used": prefix,
+            }
+    return None
+
+
 def get_or_create_user_pref(db_path: Path | str, user_id: str) -> dict:
     """Ensure a user_pref row exists for `user_id`, return it.
 
@@ -570,7 +853,8 @@ def list_recipients_for_period(
         raise ValueError(f"unknown period: {period}")
     with connect(db_path) as con:
         rows = con.execute(
-            f"SELECT user_id, quiet_hours FROM user_pref WHERE {col} = 1",
+            f"SELECT user_id, quiet_hours, daily_summary_time "
+            f"FROM user_pref WHERE {col} = 1",
         ).fetchall()
         return [dict(r) for r in rows]
 

@@ -69,23 +69,24 @@ def reconcile_account(
             "SELECT balance_cents FROM account WHERE id = ?",
             (account_id,),
         ).fetchone()
-        # account.balance_cents is YNAB's current balance at IMPORT TIME.
-        # That number already incorporates every transaction in
-        # ledger_txn through the import date — adding them all again
-        # would inflate the expected balance by years of history. Only
-        # sum transactions AFTER the most recent ynab_history_import.
-        anchor_row = con.execute(
-            "SELECT MAX(ts) AS ts FROM audit_log WHERE event = 'ynab_history_import'"
-        ).fetchone()
-        anchor_ts = anchor_row["ts"] if anchor_row else None
-        anchor_date = (anchor_ts[:10] if anchor_ts else "1970-01-01")
+        # ``account.balance_cents`` is now refreshed daily by
+        # ``bot.ynab_full_sync`` — it always reflects YNAB's current
+        # balance. So "expected at end-of-`as_of_date`" =
+        #     YNAB-current  −  sum(ledger_txn posted_date > as_of_date)
+        # i.e. peel back any post-`as_of_date` activity from the live
+        # balance. Previously this added the post-anchor sum to a stale
+        # snapshot, which double-counted years of history once the snapshot
+        # was refreshed.
         sum_row = con.execute(
+            # is_split = 0 excludes split PARENT rows; their child legs
+            # (which sum to the parent) are counted instead, so the total
+            # is right and never double-counted.
             """SELECT COALESCE(SUM(amount_cents), 0) AS s
                FROM ledger_txn
                WHERE account_id = ?
                  AND posted_date > ?
-                 AND posted_date <= ?""",
-            (account_id, anchor_date, as_of_date),
+                 AND is_split = 0""",
+            (account_id, as_of_date),
         ).fetchone()
 
     if observed_row is None:
@@ -98,10 +99,10 @@ def reconcile_account(
             "reconciled_count": 0,
         }
 
-    starting = int((acct_row or {"balance_cents": 0})["balance_cents"] or 0)
-    # NOTE: account.balance_cents is the YNAB-import snapshot. Sum only
-    # transactions since that import (see anchor_date above).
-    expected = starting + int(sum_row["s"] or 0)
+    ynab_current = int((acct_row or {"balance_cents": 0})["balance_cents"] or 0)
+    post_asof_activity = int(sum_row["s"] or 0)
+    # Roll YNAB's current balance back to end-of-`as_of_date`.
+    expected = ynab_current - post_asof_activity
     observed = int(observed_row["balance_cents"])
 
     # Sign-convention normalization for credit cards. YNAB returns the
@@ -154,6 +155,82 @@ def reconcile_account(
             "(expected %d, bank says %d)",
             account_id, as_of_date, delta, expected, observed,
         )
+
+    return {
+        "account_id": account_id, "as_of_date": as_of_date,
+        "expected_cents": expected, "observed_cents": observed,
+        "delta_cents": delta, "status": status,
+        "reconciled_count": reconciled_count,
+    }
+
+
+def reconcile_preview(
+    db_path: Path | str,
+    account_id: str,
+    as_of_date: date,
+    *,
+    tolerance_cents: int = DEFAULT_TOLERANCE_CENTS,
+) -> dict:
+    """Read-only twin of :func:`reconcile_account` — never writes.
+
+    Same expected/observed/delta/status math, but it does NOT mark rows
+    ``reconciled`` and does NOT audit. The Tauri reconciler-inspector tab
+    calls this so the operator can eyeball every account's drift without
+    side effects. ``reconciled_count`` is reported as how many rows WOULD
+    be marked on an OK pass.
+    """
+    with storage.connect(db_path) as con:
+        observed_row = con.execute(
+            """SELECT balance_cents FROM account_balance_observed
+               WHERE account_id = ? AND as_of_date = ?""",
+            (account_id, as_of_date),
+        ).fetchone()
+        acct_row = con.execute(
+            "SELECT balance_cents, type FROM account WHERE id = ?",
+            (account_id,),
+        ).fetchone()
+        sum_row = con.execute(
+            # is_split = 0: count split children (which sum to the parent),
+            # not the parent, so the running total never double-counts.
+            """SELECT COALESCE(SUM(amount_cents), 0) AS s
+               FROM ledger_txn
+               WHERE account_id = ? AND posted_date > ?
+                 AND is_split = 0""",
+            (account_id, as_of_date),
+        ).fetchone()
+
+    if observed_row is None:
+        return {
+            "account_id": account_id, "as_of_date": as_of_date,
+            "expected_cents": None, "observed_cents": None,
+            "delta_cents": None, "status": "no_observation",
+            "reconciled_count": 0,
+        }
+
+    ynab_current = int((acct_row or {"balance_cents": 0})["balance_cents"] or 0)
+    post_asof_activity = int(sum_row["s"] or 0)
+    expected = ynab_current - post_asof_activity
+    observed = int(observed_row["balance_cents"])
+
+    is_credit_card = (acct_row and acct_row["type"] == "credit_card")
+    if is_credit_card:
+        delta = abs(observed) - abs(expected)
+    else:
+        delta = observed - expected
+
+    if abs(delta) <= tolerance_cents:
+        status = "ok"
+        with storage.connect(db_path) as con:
+            would = con.execute(
+                """SELECT COUNT(*) AS n FROM ledger_txn
+                   WHERE account_id = ? AND posted_date <= ?
+                     AND cleared != 'reconciled'""",
+                (account_id, as_of_date),
+            ).fetchone()
+        reconciled_count = int(would["n"] or 0)
+    else:
+        status = "mismatch"
+        reconciled_count = 0
 
     return {
         "account_id": account_id, "as_of_date": as_of_date,

@@ -139,6 +139,15 @@ def poll_once(settings: Settings) -> int:
         # otherwise fall back to the legacy OAuth path.
         imap_pw = _account_imap_password(account)
         use_imap = bool(imap_pw)
+        # An account configured ONLY for Telegram routing (no IMAP password
+        # and no OAuth token) has no Gmail integration — skip the email
+        # poll so we don't log an OAuth error every 60 seconds. This is
+        # the Allison case: she /starts the bot for DMs but the bot has
+        # no Gmail credentials for her.
+        if not use_imap and not (account.token_path or "").strip():
+            log.debug("skipping gmail poll for %s (no IMAP/OAuth configured)",
+                      account.email)
+            continue
         if use_imap:
             from bot.gmail_imap import (
                 GmailIMAP, extract_body as imap_extract_body,
@@ -220,6 +229,7 @@ def poll_once(settings: Settings) -> int:
                 if source.parser in {
                     "coastal_balance_summary",
                     "chase_balance_summary",
+                    "citi_balance_summary",
                 }:
                     from bot import ingest
                     try:

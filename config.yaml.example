@@ -50,6 +50,10 @@ email_sources:
   - name: paypal_payment
     query: 'from:paypal.com (subject:"payment to" OR subject:"refund from" OR subject:"USD") -subject:(statement OR "legal agreements" OR rewards OR offer OR crypto) newer_than:3d'
     parser: paypal_payment
+  # Citi CC daily balance alert
+  - name: citi_balance_summary
+    query: 'from:info6.citi.com subject:"daily account balance alert" newer_than:3d'
+    parser: citi_balance_summary
   # Coastal FCU per-transaction alerts (checking/savings deposits + withdrawals)
   - name: coastal_transaction_alert
     query: 'from:coastal24.com subject:"Transaction Alert" newer_than:3d'

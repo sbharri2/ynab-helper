@@ -1,0 +1,28 @@
+# ============================================================================
+# Allison's account block — append to config.yaml `gmail_accounts:` list
+# ============================================================================
+#
+# Steps after she /starts the bot from her phone:
+#
+#   1. Bot DMs her with her chat_id (e.g. "Welcome Allison! chat_id=<NNNN>").
+#   2. Copy that number.
+#   3. Replace `REPLACE_WITH_ALLISON_CHAT_ID` below with the number.
+#   4. Append the whole block to the `gmail_accounts:` list in config.yaml.
+#      (Same indent level as the existing `- email: sbharri2@gmail.com` block.)
+#   5. Run: .venv\Scripts\python.exe -m scripts._wire_allison
+#   6. Restart the bot: Stop-ScheduledTask + Start-ScheduledTask YNAB-Helper-Bot
+#
+# Why no token_path / imap_password_env: her Gmail is accessed via Claude's
+# Gmail MCP (per memory project_allison_gmail_mcp_access), not the bot's
+# IMAP path. gmail_watcher.poll_once now skips accounts with neither auth
+# method configured, so this is fine.
+#
+# Auto-routing: items inserted with user_id=allison (e.g. from her Gmail
+# scraped through MCP) will land in her queue automatically — no "For
+# Allison" tap required.
+#
+# ============================================================================
+
+- email: allison.laney.harris@gmail.com
+  user_id: allison
+  chat_id: REPLACE_WITH_ALLISON_CHAT_ID

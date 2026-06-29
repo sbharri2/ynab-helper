@@ -48,6 +48,22 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_flex_budget",
+            "description": (
+                "Return a single-block snapshot of Steven's regular discretionary "
+                "(flex) categories — dining, gifts, household, vacation, home "
+                "improvement, personal savings. Use this when the user asks for "
+                "'my budget', 'how am I doing', 'flex categories', 'where am I "
+                "this month', or similar holistic check-ins. No arguments — "
+                "always returns the standard fixed set; use get_category_available "
+                "for one-off lookups of any other category."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "get_account_balance",
             "description": "Get the current balance of an account. Use when the user asks 'how much in checking?', 'amex balance?', 'what's in my savings?'.",
             "parameters": {
@@ -212,6 +228,31 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "list_pending",
+            "description": "Show the current pending queue WITHOUT consuming it. Returns a numbered list of every pending transaction with payee, amount, date, and the suggested category. Use whenever the user asks meta questions about the queue — 'what's pending?', 'any uncategorized?', 'how many in queue?', 'pull YNAB transactions that have not been categorized', 'show me what's left'. DO NOT answer queue questions from your head — always call this tool first.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "categorize_batch_numbered",
+            "description": "Apply a numbered batch reply like '2. Vacation 5. Groceries 7. Steven Personal'. Each '<n>. <category>' pair categorizes the matching item from the most recent list_pending or batch list. Use when the user replies with multiple numbered assignments at once. Pass the user's verbatim text as `mapping_text`.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "mapping_text": {
+                        "type": "string",
+                        "description": "The user's verbatim numbered reply, e.g. '2. Vacation 10. Groceries'. The tool parses the '<n>. <name>' pattern itself."
+                    },
+                },
+                "required": ["mapping_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "create_category",
             "description": "Create a new YNAB category (and mirror it locally). Use when the user says 'create a new category for X', 'add a category called Y', 'I need a category for my password manager'. Pass the human name. Optionally pass a group_name and a monthly_target_dollars so the category has a recurring need goal from day one (e.g. 'create Password Manager for $5/mo under Annual or Seasonal Costs' → category_name='Password Manager', group_name='Annual or Seasonal Costs', monthly_target_dollars=5).",
             "parameters": {
@@ -319,6 +360,7 @@ TOOLS: list[dict[str, Any]] = [
 
 TOOL_NAME_TO_FUNCTION = {
     "get_category_available": agent_tools.get_category_available,
+    "get_flex_budget": agent_tools.get_flex_budget,
     "get_account_balance": agent_tools.get_account_balance,
     "list_categories_overview": agent_tools.list_categories_overview,
     "show_drill_down": agent_tools.show_drill_down,
@@ -329,6 +371,8 @@ TOOL_NAME_TO_FUNCTION = {
     "categorize_pending": agent_tools.categorize_pending_tool,
     "skip_pending": agent_tools.skip_pending_tool,
     "next_pending": agent_tools.next_pending_tool,
+    "list_pending": agent_tools.list_pending_tool,
+    "categorize_batch_numbered": agent_tools.categorize_batch_numbered_tool,
     "unskip_pending": agent_tools.unskip_pending_tool,
     "run_catchup": agent_tools.run_catchup_tool,
     "create_category": agent_tools.create_category_tool,
@@ -353,11 +397,14 @@ GUIDELINES:
 - Never invent category or account names. If the user's name doesn't resolve, surface the tool's refusal message.
 
 QUEUE NAVIGATION — never tell the user the queue is empty without checking:
+- "what's pending?" / "any uncategorized?" / "how many in queue?" / "pull YNAB transactions that have not been categorized" / "show me what's left" → INVOKE `list_pending` (read-only summary; doesn't advance the queue).
+- A numbered reply like "2. Vacation 5. Groceries" (with at least one `<number>. <category>` pair) → INVOKE `categorize_batch_numbered` with the user's verbatim text. The tool resolves numbers against the most recent batch/list_pending output.
 - "next" / "what's next?" / "next one" / "move on" / "show me the next" → INVOKE `next_pending` (do not guess; the tool tells you if it's empty).
 - "categorize" (no specific category named) / "let me categorize" / "let's go" / "start triaging" → INVOKE `next_pending`.
-- "pull new" / "check email" / "catch up" / "any new ones?" / "pull YNAB transactions" / "fetch new charges" → INVOKE `run_catchup` (pulls fresh YNAB + Gmail, reports counts). Don't say "I don't see anything" — call the tool first.
+- "pull new" / "check email" / "catch up" / "any new ones?" / "fetch new charges" → INVOKE `run_catchup` (pulls fresh YNAB + Gmail, reports counts). Don't say "I don't see anything" — call the tool first.
 - "revisit skipped" / "unskip" / "let me see what I skipped" → INVOKE `unskip_pending`.
 - Only refuse with "queue is empty" if a tool you actually called returned that.
+- NEVER answer queue-state questions from your own memory of past turns. The queue changes between turns; always call a tool.
 """
 
 
@@ -409,6 +456,10 @@ def _call_ollama(
         "messages": messages,
         "stream": False,
         "options": {"temperature": temperature},
+        # Keep the model loaded between turns. Default 5m means every
+        # reply after a short idle is a cold start (30-60s on consumer
+        # GPUs). 24h keeps it warm all day.
+        "keep_alive": "24h",
     }
     if tools:
         payload["tools"] = tools
@@ -480,7 +531,8 @@ def run_agent_turn(
                 # Inject context the model doesn't see (chat_id, db_path)
                 injected = {**args}
                 if name in {"categorize_pending", "skip_pending",
-                            "next_pending", "set_quiet"}:
+                            "next_pending", "set_quiet",
+                            "list_pending", "categorize_batch_numbered"}:
                     injected["chat_id"] = chat_id
                 if name in {"create_category", "move_category_to_group",
                             "rename_category", "run_catchup"}:
@@ -518,5 +570,10 @@ def run_agent_turn(
             log.warning("follow-up summarization failed; concatenating tool outputs: %s", e)
             reply = "\n\n".join(user_visible)
 
-    _save_turn(db_path, chat_id, user_id, user_text, reply)
+    # Avoid leaking control sentinels into chat history — the AI sees them
+    # next turn and copies the pattern. Replace before persisting.
+    history_reply = reply
+    if reply == agent_tools.ADVANCE_QUEUE_SENTINEL:
+        history_reply = "(showed next pending item via keyboard)"
+    _save_turn(db_path, chat_id, user_id, user_text, history_reply)
     return reply

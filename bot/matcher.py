@@ -26,6 +26,11 @@ from typing import Any, Optional
 _PAYEE_PATTERNS = {
     "amazon": re.compile(r"AMZN|AMAZON", re.IGNORECASE),
     "venmo":  re.compile(r"VENMO",        re.IGNORECASE),
+    # Apple charges land on the CC as "APPLE.COM/BILL CUPERTINO USA" or
+    # variants like "APL*ITUNES" / "APPLE COM BILL". The receipt scraped via
+    # apple_receipt parser has the real items; matching by payee + amount +
+    # date links them so Steven sees what was bought, not just "APPLE.COM".
+    "apple":  re.compile(r"APPLE\.?\s*COM|APL\s*\*", re.IGNORECASE),
 }
 
 # Weights — keep in sync with the docstring above.
@@ -112,6 +117,63 @@ def match_score(
         + payee_s * _W_PAYEE
         + memo_s  * _W_MEMO
     )
+
+
+def score_breakdown(
+    order: dict[str, Any],
+    txn: dict[str, Any],
+    source: str = "amazon",
+) -> dict[str, Any]:
+    """Like :func:`match_score` but returns every component, for the UI.
+
+    The reconciler-inspector tab renders these so the operator can see
+    *why* a candidate scored where it did (e.g. "amount was perfect but
+    the date drift cost 0.15"). The ``total`` here is identical to what
+    :func:`match_score` returns, including the date short-circuit to 0.
+    """
+    date_s = _date_score(order["order_date"], txn["txn_date"])
+    amount_s = _amount_score(order["total_cents"], txn["amount_cents"])
+    payee_s = _payee_score(txn.get("payee", ""), source)
+    memo_s = _memo_bonus(txn.get("memo", ""), order.get("external_id"))
+
+    # Mirror match_score's hard kill: a stale/pre-order date zeroes it out
+    # no matter how well everything else lines up.
+    if date_s == 0.0:
+        total = 0.0
+    else:
+        total = (
+            amount_s * _W_AMOUNT
+            + date_s * _W_DATE
+            + payee_s * _W_PAYEE
+            + memo_s * _W_MEMO
+        )
+
+    return {
+        "total": round(total, 4),
+        "date_killed": date_s == 0.0,
+        "components": {
+            "amount": {
+                "raw": round(amount_s, 4),
+                "weight": _W_AMOUNT,
+                "weighted": round(amount_s * _W_AMOUNT, 4),
+            },
+            "date": {
+                "raw": round(date_s, 4),
+                "weight": _W_DATE,
+                "weighted": round(date_s * _W_DATE, 4),
+            },
+            "payee": {
+                "raw": round(payee_s, 4),
+                "weight": _W_PAYEE,
+                "weighted": round(payee_s * _W_PAYEE, 4),
+            },
+            "memo": {
+                "raw": round(memo_s, 4),
+                "weight": _W_MEMO,
+                "weighted": round(memo_s * _W_MEMO, 4),
+            },
+        },
+    }
 
 
 def find_best_match(

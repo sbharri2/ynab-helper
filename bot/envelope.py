@@ -53,11 +53,20 @@ def _all_categories(con) -> list[str]:
 
 
 def _activity_for_month(con, month: str, category_id: str) -> int:
+    # Only on-budget accounts contribute to envelope activity. Money moving
+    # through a TRACKING account (e.g. the off-budget Marcus emergency fund —
+    # deposits, T-bill buys, crypto DCA) is not budget spending, exactly as
+    # YNAB treats it. Without this, an off-budget account's categorized
+    # transactions would pollute the envelopes. is_split = 0 keeps split
+    # parents out (their children carry the category + amount).
     row = con.execute(
-        """SELECT COALESCE(SUM(amount_cents), 0) AS sum_cents
-           FROM ledger_txn
-           WHERE category_id = ?
-             AND strftime('%Y-%m', posted_date) = ?""",
+        """SELECT COALESCE(SUM(lt.amount_cents), 0) AS sum_cents
+           FROM ledger_txn lt
+           JOIN account a ON a.id = lt.account_id
+           WHERE lt.category_id = ?
+             AND strftime('%Y-%m', lt.posted_date) = ?
+             AND a.on_budget = 1
+             AND lt.is_split = 0""",
         (category_id, month),
     ).fetchone()
     return int(row["sum_cents"] or 0)
@@ -133,6 +142,24 @@ def recompute_month(
             )
             results[category_id] = available
     return results
+
+
+def available_for_category(
+    db_path: Path | str,
+    *,
+    category_id: str,
+    month: str | None = None,
+) -> int:
+    """Recompute and return available_cents for one category this month.
+
+    Used by the bot's "Categorized as X — $Y left in pot" confirmation so
+    Steven sees the envelope balance immediately after he categorizes.
+    Cheaper than full recompute_month because it only touches one row.
+    """
+    if month is None:
+        month = date.today().strftime("%Y-%m")
+    results = recompute_month(db_path, month, category_ids=[category_id])
+    return results.get(category_id, 0)
 
 
 def roll_forward(

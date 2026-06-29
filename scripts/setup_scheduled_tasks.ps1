@@ -15,9 +15,12 @@ function New-YnabTask {
     Write-Host "Registered: $Name (every $IntervalMinutes min)"
 }
 
-New-YnabTask -Name "YNAB-Helper-GmailWatcher"    -Script "gmail_watcher"    -IntervalMinutes 5
-New-YnabTask -Name "YNAB-Helper-YnabWatcher"     -Script "ynab_watcher"     -IntervalMinutes 30
-New-YnabTask -Name "YNAB-Helper-SampleCollector" -Script "sample_collector" -IntervalMinutes 60
+# Phase 7+ (2026-06-26): YnabWatcher removed (bot/ynab_watcher.py deleted)
+# and SampleCollector disabled (parsers are built; samples no longer
+# needed). GmailWatcher external task superseded by the bot's in-process
+# 60s gmail poll loop. Kept commented for re-provisioning reference:
+# New-YnabTask -Name "YNAB-Helper-GmailWatcher"    -Script "gmail_watcher"    -IntervalMinutes 5
+# New-YnabTask -Name "YNAB-Helper-SampleCollector" -Script "sample_collector" -IntervalMinutes 60
 
 # Daily catch-up: refreshes LLM suggestions on pending_txn rows so the bot has
 # things to DM. Runs at 7:30am, just before quiet hours end at 7:00am... actually

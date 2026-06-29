@@ -1,0 +1,639 @@
+"""Localhost HTTP API for the Tauri UI's write actions.
+
+Phase 3 (2026-06-26 → onward): the bot stays the single writer for the
+ledger. The Tauri UI is read-only against SQLite for everything else;
+when it needs to mutate (recategorize a transaction, move money between
+envelopes, set a budgeted amount), it POSTs to this API. The bot reuses
+its existing envelope + categorize logic so envelope math, audit log,
+and the daily ynab_writer all keep working as one coherent system.
+
+Binding:
+  * Loopback only — 127.0.0.1:8765 by default.
+  * Token auth via ``X-API-Token`` header. Token comes from the
+    ``YNABHELPER_API_TOKEN`` env var. If unset on first start, we
+    generate one and persist it to ``ui_api_token.txt`` next to the
+    config so the Tauri side can read it without extra plumbing.
+
+Endpoints:
+  * ``GET  /healthz``         — liveness probe
+  * ``POST /categorize``      — set chosen_category on a pending_txn OR
+                                 set category_id on a ledger_txn
+  * ``POST /envelope/move``   — move budgeted_cents between two
+                                 category-months
+  * ``POST /budget/set``      — set absolute budgeted_cents for one
+                                 category-month
+  * ``GET  /categories``      — return all spending + non-spending
+                                 categories (for the picker)
+"""
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from fastapi import Depends, FastAPI, Header, HTTPException
+from pydantic import BaseModel
+
+from bot import envelope, storage
+from bot.config import Settings
+
+log = logging.getLogger(__name__)
+
+# Where the token gets cached when YNABHELPER_API_TOKEN env var isn't set.
+_TOKEN_FILE = Path(__file__).resolve().parent.parent / "ui_api_token.txt"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _load_or_generate_token() -> str:
+    env = os.environ.get("YNABHELPER_API_TOKEN", "").strip()
+    if env:
+        return env
+    if _TOKEN_FILE.exists():
+        cached = _TOKEN_FILE.read_text().strip()
+        if cached:
+            os.environ["YNABHELPER_API_TOKEN"] = cached
+            return cached
+    import secrets as _secrets
+    token = _secrets.token_hex(24)
+    _TOKEN_FILE.write_text(token)
+    os.environ["YNABHELPER_API_TOKEN"] = token
+    log.info("ui_api: generated new token; wrote to %s", _TOKEN_FILE)
+    return token
+
+
+def _require_token(x_api_token: str = Header(...)) -> None:
+    expected = _load_or_generate_token()
+    if x_api_token != expected:
+        raise HTTPException(status_code=401, detail="bad token")
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Request models — MUST live at module scope. When these were nested inside
+# build_app() FastAPI's body-vs-query detection misclassified them as query
+# params (it relies on `typing.get_type_hints` which can't resolve closure-
+# scoped names), and every POST returned 422 "Field required" before the
+# handler even ran.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+class CategorizeBody(BaseModel):
+    pt_id: int | None = None
+    ledger_txn_id: int | None = None
+    category_id: str
+
+
+class MoveBody(BaseModel):
+    month: str           # "YYYY-MM"
+    from_category_id: str
+    to_category_id: str
+    cents: int           # positive — amount to shift
+
+
+class SetBudgetBody(BaseModel):
+    month: str
+    category_id: str
+    cents: int           # absolute target budgeted_cents
+
+
+class RollForwardBody(BaseModel):
+    month: str           # target month "YYYY-MM" to copy budgets INTO
+
+
+class NewIncomeSource(BaseModel):
+    display_name: str
+    expected_amount_cents: int
+    cadence: str         # "biweekly" | "semi-monthly" | "monthly"
+    first_expected_date: str  # "YYYY-MM-DD"
+
+
+class JobChangeBody(BaseModel):
+    retire_payee_key: str | None = None
+    new_source: NewIncomeSource | None = None
+
+
+class YnabPushBody(BaseModel):
+    ledger_txn_id: int
+
+
+def build_app(settings: Settings) -> FastAPI:
+    app = FastAPI(
+        title="ynabhelper UI API",
+        description="Localhost write API for the Tauri desktop UI.",
+        version="0.1.0",
+    )
+    db_path = settings.paths.database
+    _load_or_generate_token()  # warm cache on startup
+
+    # ── Routes ────────────────────────────────────────────────────────────
+
+    @app.get("/healthz")
+    def healthz() -> dict[str, Any]:
+        return {"ok": True, "db": str(db_path)}
+
+    @app.get("/categories", dependencies=[Depends(_require_token)])
+    def list_categories() -> list[dict[str, Any]]:
+        """Every visible category — for the UI's category picker.
+
+        Excludes the 'Internal Master Category' group (YNAB plumbing
+        like 'Inflow: Ready to Assign' / 'Uncategorized'). The user
+        never wants to recategorize a transaction INTO those.
+        """
+        with storage.connect(db_path) as con:
+            rows = con.execute(
+                "SELECT c.id, c.name, c.is_spending, g.name AS group_name "
+                "FROM category c JOIN category_group g ON g.id = c.group_id "
+                "WHERE c.hidden = 0 AND g.hidden = 0 "
+                "  AND g.name != 'Internal Master Category' "
+                "ORDER BY g.sort_order, c.name"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    @app.post("/categorize", dependencies=[Depends(_require_token)])
+    def categorize(body: CategorizeBody) -> dict[str, Any]:
+        """Set the category on either a pending_txn OR a ledger_txn.
+
+        ``pt_id`` path mirrors `_apply_choice` in the Telegram bot:
+          1. Stamp pending_txn.chosen_category + status='categorized'
+          2. Mirror onto the linked ledger_txn so envelope math reflects
+             the choice instantly.
+          3. ynab_writer's next run pushes to YNAB.
+
+        ``ledger_txn_id`` path is for transactions that arrived purely
+        via ``ynab_full_sync`` and never had a pending_txn (typically
+        rows older than the bot's email coverage). We just set the
+        ledger_txn.category_id directly; the writer will pick it up if
+        the row has a ynab_txn_id.
+        """
+        if not body.category_id:
+            raise HTTPException(400, "category_id required")
+        if body.pt_id is None and body.ledger_txn_id is None:
+            raise HTTPException(400, "pt_id or ledger_txn_id required")
+
+        with storage.connect(db_path) as con:
+            cat = con.execute(
+                "SELECT name FROM category WHERE id = ? AND hidden = 0",
+                (body.category_id,),
+            ).fetchone()
+            if not cat:
+                raise HTTPException(404, "unknown category")
+
+            if body.pt_id is not None:
+                pt = con.execute(
+                    "SELECT id, ynab_txn_id FROM pending_txn WHERE id = ?",
+                    (body.pt_id,),
+                ).fetchone()
+                if not pt:
+                    raise HTTPException(404, "unknown pending_txn")
+                con.execute(
+                    "UPDATE pending_txn SET chosen_category = ?, "
+                    "chosen_at = ?, status = 'categorized' WHERE id = ?",
+                    (body.category_id, _utcnow(), body.pt_id),
+                )
+                yid = pt["ynab_txn_id"] or ""
+                if yid.startswith("ledger:"):
+                    try:
+                        lid = int(yid.split(":", 1)[1])
+                        con.execute(
+                            "UPDATE ledger_txn SET category_id = ?, "
+                            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (body.category_id, lid),
+                        )
+                    except (ValueError, IndexError):
+                        pass
+                elif yid:
+                    con.execute(
+                        "UPDATE ledger_txn SET category_id = ?, "
+                        "updated_at = CURRENT_TIMESTAMP "
+                        "WHERE ynab_txn_id = ?",
+                        (body.category_id, yid),
+                    )
+                target = {"pt_id": body.pt_id}
+            else:
+                lt = con.execute(
+                    "SELECT id, posted_date, amount_cents, payee, memo, "
+                    "ynab_txn_id "
+                    "FROM ledger_txn WHERE id = ?",
+                    (body.ledger_txn_id,),
+                ).fetchone()
+                if not lt:
+                    raise HTTPException(404, "unknown ledger_txn")
+                con.execute(
+                    "UPDATE ledger_txn SET category_id = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (body.category_id, body.ledger_txn_id),
+                )
+                # The ynab_writer scans pending_txn, not ledger_txn. Without
+                # a matching pending_txn row, this categorization stays
+                # local-only and never propagates to YNAB. Create/refresh
+                # a pending_txn entry tied to the ledger row so tomorrow
+                # morning's writer DM picks it up.
+                #
+                # Skip when the ledger row has no ynab_txn_id at all:
+                # writer's _find_ynab_txn_for_ledger needs SOMETHING to
+                # match against. (Rare path: bot-only ledger_txn that
+                # never reached YNAB.)
+                yid = lt["ynab_txn_id"]
+                if yid:
+                    existing_pt = con.execute(
+                        "SELECT id FROM pending_txn WHERE ynab_txn_id = ?",
+                        (yid,),
+                    ).fetchone()
+                    if existing_pt:
+                        # Already a pending_txn for this YNAB id — flip it
+                        # to categorized + park the chosen category. Don't
+                        # touch synced_to_ynab_at: if it's NULL, writer
+                        # will see it as work to do; if non-NULL we want
+                        # the writer to detect a category change.
+                        con.execute(
+                            "UPDATE pending_txn SET "
+                            "  chosen_category = ?, chosen_at = ?, "
+                            "  status = 'categorized', "
+                            "  synced_to_ynab_at = NULL "
+                            "WHERE id = ?",
+                            (body.category_id, _utcnow(), existing_pt["id"]),
+                        )
+                    else:
+                        # Backfill a pending_txn row from the ledger data
+                        # so writer's SELECT pt.id ... finds it tomorrow.
+                        con.execute(
+                            "INSERT INTO pending_txn "
+                            "  (user_id, ynab_txn_id, payee, amount_cents, "
+                            "   txn_date, memo, suggested_category, "
+                            "   chosen_category, chosen_at, status, "
+                            "   queue_lane) "
+                            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                            "        'categorized', 'cold')",
+                            ("steven", yid,
+                             (lt["payee"] or "")[:200],
+                             int(lt["amount_cents"]),
+                             str(lt["posted_date"])[:10],
+                             (lt["memo"] or "")[:500],
+                             body.category_id,        # suggested_category
+                             body.category_id,        # chosen_category
+                             _utcnow()),
+                        )
+                target = {"ledger_txn_id": body.ledger_txn_id}
+
+        storage.audit(db_path, "ui_categorize", {
+            **target,
+            "category_id": body.category_id,
+            "category_name": cat["name"],
+        })
+        # Re-derive envelope state for both old + new month_category in
+        # case the categorize crossed months. Cheap: one category at a
+        # time. Caller can pick the month from posted_date but it's
+        # easier to recompute the current month broadly.
+        try:
+            month_str = datetime.now().strftime("%Y-%m")
+            envelope.recompute_month(db_path, month_str,
+                                       category_ids=[body.category_id])
+        except Exception as e:  # noqa: BLE001
+            log.warning("recompute after categorize failed: %s", e)
+        return {"ok": True}
+
+    @app.post("/envelope/move", dependencies=[Depends(_require_token)])
+    def envelope_move(body: MoveBody) -> dict[str, Any]:
+        if body.cents <= 0:
+            raise HTTPException(400, "cents must be positive")
+        if body.from_category_id == body.to_category_id:
+            raise HTTPException(400, "from == to")
+        result = envelope.move_money(
+            db_path,
+            month=body.month,
+            from_category_id=body.from_category_id,
+            to_category_id=body.to_category_id,
+            cents=body.cents,
+        )
+        storage.audit(db_path, "ui_envelope_move", {
+            "month": body.month, "from": body.from_category_id,
+            "to": body.to_category_id, "cents": body.cents,
+        })
+        return {"ok": True, "result": result}
+
+    # ── Investments ───────────────────────────────────────────────────────
+
+    @app.get("/investments/files", dependencies=[Depends(_require_token)])
+    def investments_files() -> dict[str, Any]:
+        """List available snapshot xlsx files (newest first)."""
+        from bot import investments as inv
+        return {"folder": str(inv.SNAPSHOTS_DIR), "files": inv.list_snapshots()}
+
+    @app.get("/investments/snapshot", dependencies=[Depends(_require_token)])
+    def investments_snapshot() -> dict[str, Any]:
+        """Parsed snapshot from the most recent xlsx in the folder."""
+        from bot import investments as inv
+        latest = inv.find_latest_snapshot()
+        if not latest:
+            raise HTTPException(
+                404,
+                f"No xlsx files in {inv.SNAPSHOTS_DIR}. "
+                "Drop your exported sheet there.",
+            )
+        try:
+            return inv.parse_snapshot(latest)
+        except Exception as e:  # noqa: BLE001
+            log.exception("snapshot parse failed: %s", e)
+            raise HTTPException(500, f"parse failed: {e}")
+
+    # ── Reconciler inspector (read-only diagnostics) ──────────────────────
+
+    @app.get("/reconciler/ledger-vs-ynab", dependencies=[Depends(_require_token)])
+    def reconciler_ledger_vs_ynab(days: int = 90) -> dict[str, Any]:
+        """Three-column diff: our ledger vs the live YNAB ledger."""
+        from bot import recon_inspect
+        days = max(1, min(int(days), 730))
+        try:
+            return recon_inspect.ledger_vs_ynab_report(
+                db_path, settings, days=days,
+            )
+        except RuntimeError as e:
+            raise HTTPException(503, str(e))
+        except Exception as e:  # noqa: BLE001
+            log.exception("ledger-vs-ynab failed: %s", e)
+            raise HTTPException(502, f"YNAB fetch failed: {e}")
+
+    @app.get("/reconciler/matching", dependencies=[Depends(_require_token)])
+    def reconciler_matching() -> dict[str, Any]:
+        """Order ↔ YNAB-charge matching state + score breakdowns."""
+        from bot import recon_inspect
+        return recon_inspect.matching_report(db_path)
+
+    @app.get("/reconciler/dedupe", dependencies=[Depends(_require_token)])
+    def reconciler_dedupe() -> dict[str, Any]:
+        """Email-alert ↔ ynab_sync dedupe state (merged / orphan / dupes)."""
+        from bot import recon_inspect
+        return recon_inspect.dedupe_report(db_path)
+
+    @app.get("/reconciler/balance", dependencies=[Depends(_require_token)])
+    def reconciler_balance() -> dict[str, Any]:
+        """Per-account ledger-vs-bank balance reconciliation (no writes)."""
+        from bot import recon_inspect
+        return recon_inspect.balance_report(db_path)
+
+    @app.post("/income/job-change", dependencies=[Depends(_require_token)])
+    def income_job_change(body: JobChangeBody) -> dict[str, Any]:
+        """Handle a job-change transition: retire one source, add another.
+
+        Either or both fields can be present. ``retire_payee_key`` marks
+        an auto-detected source so it's excluded from RTA expectations.
+        ``new_source`` adds a manual source that gets counted until
+        auto-detection picks up the real payee. Idempotent on payee_key.
+        """
+        if not body.retire_payee_key and not body.new_source:
+            raise HTTPException(400, "must specify retire_payee_key or new_source")
+
+        retired_key = None
+        added_key = None
+
+        with storage.connect(db_path) as con:
+            # Retire path
+            if body.retire_payee_key:
+                key = body.retire_payee_key.strip().upper()
+                con.execute(
+                    "INSERT INTO income_source_override "
+                    "  (payee_key, status, retired_at) "
+                    "VALUES (?, 'retired', ?) "
+                    "ON CONFLICT(payee_key) DO UPDATE SET "
+                    "  status = 'retired', retired_at = excluded.retired_at",
+                    (key, _utcnow()),
+                )
+                retired_key = key
+
+            # Add path
+            if body.new_source:
+                src = body.new_source
+                # Compute median_delta_days from cadence
+                delta = (
+                    14 if src.cadence == "biweekly"
+                    else 15 if src.cadence == "semi-monthly"
+                    else 30  # monthly
+                )
+                new_key = src.display_name.strip().upper()
+                con.execute(
+                    "INSERT INTO income_source_override "
+                    "  (payee_key, status, display_name, expected_amount_cents, "
+                    "   cadence, first_expected_date, median_delta_days) "
+                    "VALUES (?, 'active', ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(payee_key) DO UPDATE SET "
+                    "  status = 'active', "
+                    "  display_name = excluded.display_name, "
+                    "  expected_amount_cents = excluded.expected_amount_cents, "
+                    "  cadence = excluded.cadence, "
+                    "  first_expected_date = excluded.first_expected_date, "
+                    "  median_delta_days = excluded.median_delta_days, "
+                    "  retired_at = NULL",
+                    (new_key, src.display_name, src.expected_amount_cents,
+                     src.cadence, src.first_expected_date, delta),
+                )
+                added_key = new_key
+
+        storage.audit(db_path, "ui_income_job_change", {
+            "retired": retired_key, "added": added_key,
+        })
+        return {"ok": True, "retired": retired_key, "added": added_key}
+
+    @app.post("/budget/roll-forward", dependencies=[Depends(_require_token)])
+    def budget_roll_forward(body: RollForwardBody) -> dict[str, Any]:
+        """Copy last month's per-category budgeted_cents into ``body.month``.
+
+        Idempotent + safe:
+          * Only fires if every existing month_category row for the
+            target month has budgeted_cents = 0 (or there are no rows).
+            That tells us the user hasn't hand-set anything yet for this
+            month — safe to copy from history.
+          * If ANY row in the target month is already non-zero, we treat
+            the month as "user-touched" and skip entirely (returns
+            ``copied=0, reason='already-set'``).
+          * Recomputes envelope math after the copy so available_cents
+            reflects the rolled-forward budgets immediately.
+
+        Returns ``{ok: bool, copied: int, source_month: str}``.
+        """
+        target = body.month
+        # Previous month string
+        from datetime import date as _date
+        y, m = (int(x) for x in target.split("-"))
+        py, pm = (y - 1, 12) if m == 1 else (y, m - 1)
+        source = f"{py}-{pm:02d}"
+
+        with storage.connect(db_path) as con:
+            # Has the user already started budgeting this month?
+            r = con.execute(
+                "SELECT COALESCE(SUM(budgeted_cents), 0) AS s "
+                "FROM month_category WHERE month = ?",
+                (target,),
+            ).fetchone()
+            if r and (r["s"] or 0) > 0:
+                return {
+                    "ok": True, "copied": 0, "source_month": source,
+                    "reason": "already-set",
+                }
+
+            # Pull source month's per-category budgets.
+            src_rows = con.execute(
+                "SELECT category_id, budgeted_cents "
+                "FROM month_category WHERE month = ? AND budgeted_cents > 0",
+                (source,),
+            ).fetchall()
+            if not src_rows:
+                return {
+                    "ok": True, "copied": 0, "source_month": source,
+                    "reason": "no-source",
+                }
+
+            copied = 0
+            for sr in src_rows:
+                con.execute(
+                    """INSERT INTO month_category
+                         (month, category_id, budgeted_cents, activity_cents,
+                          available_cents)
+                       VALUES (?, ?, ?, 0, 0)
+                       ON CONFLICT(month, category_id) DO UPDATE SET
+                         budgeted_cents = excluded.budgeted_cents""",
+                    (target, sr["category_id"], sr["budgeted_cents"]),
+                )
+                copied += 1
+
+        # Re-derive activity/available for the target month so the UI's
+        # next fetch reflects the copied budgets correctly. Cheap.
+        try:
+            envelope.recompute_month(db_path, target)
+        except Exception as e:  # noqa: BLE001
+            log.warning("recompute after roll-forward failed: %s", e)
+
+        storage.audit(db_path, "ui_budget_roll_forward", {
+            "source_month": source, "target_month": target, "copied": copied,
+        })
+        return {
+            "ok": True, "copied": copied, "source_month": source,
+            "reason": "rolled-forward",
+        }
+
+    @app.post("/budget/set", dependencies=[Depends(_require_token)])
+    def budget_set(body: SetBudgetBody) -> dict[str, Any]:
+        """Set absolute budgeted_cents for one category-month.
+
+        Computed as a delta on top of the current value because the
+        envelope module only exposes the additive ``assign_to_category``.
+        Net result: month_category.budgeted_cents = body.cents.
+        """
+        with storage.connect(db_path) as con:
+            existing = con.execute(
+                "SELECT budgeted_cents FROM month_category "
+                "WHERE month = ? AND category_id = ?",
+                (body.month, body.category_id),
+            ).fetchone()
+        current = int(existing["budgeted_cents"]) if existing else 0
+        delta = body.cents - current
+        result = envelope.assign_to_category(
+            db_path, body.month, body.category_id, delta,
+        )
+        storage.audit(db_path, "ui_budget_set", {
+            "month": body.month, "category_id": body.category_id,
+            "from_cents": current, "to_cents": body.cents,
+        })
+        return {"ok": True, "result": result}
+
+    @app.post("/ynab/push", dependencies=[Depends(_require_token)])
+    def ynab_push(body: YnabPushBody) -> dict[str, Any]:
+        """Push one local ledger_txn to YNAB. Stamps ynab_txn_id locally
+        on success so the row drops off the unsynced list.
+
+        Used during the parallel-process period when YNAB lacks live bank
+        sync. The UI's Sync to YNAB panel calls this per-row.
+
+        Idempotent via YNAB's import_id (= ledger:<id>) — pushing twice
+        is a no-op on the YNAB side.
+        """
+        with storage.connect(db_path) as con:
+            row = con.execute(
+                """SELECT t.id, t.posted_date, t.amount_cents, t.payee,
+                          t.memo, t.cleared, t.category_id, t.ynab_txn_id,
+                          a.ynab_account_id, a.name AS account_name
+                   FROM ledger_txn t
+                   JOIN account a ON a.id = t.account_id
+                   WHERE t.id = ?""",
+                (body.ledger_txn_id,),
+            ).fetchone()
+        if not row:
+            return {"ok": False, "error": "ledger_txn not found"}
+        if row["ynab_txn_id"]:
+            return {"ok": False, "error": "already synced",
+                    "ynab_txn_id": row["ynab_txn_id"]}
+        if not row["ynab_account_id"]:
+            return {"ok": False, "error": "account has no ynab_account_id"}
+
+        from bot.ynab_client import YnabClient
+        from datetime import date as _date
+        client = YnabClient(settings.ynab_token, settings.ynab.budget_id)
+        try:
+            # Resolve YNAB category_id from local category_id if available.
+            ynab_cat_id = None
+            if row["category_id"]:
+                with storage.connect(db_path) as con:
+                    c = con.execute(
+                        "SELECT ynab_category_id FROM category WHERE id = ?",
+                        (row["category_id"],),
+                    ).fetchone()
+                    ynab_cat_id = c["ynab_category_id"] if c else None
+
+            posted = _date.fromisoformat(str(row["posted_date"]))
+            created = client.create_transaction(
+                account_id=row["ynab_account_id"],
+                posted_date=posted,
+                amount_cents=int(row["amount_cents"]),
+                payee_name=row["payee"] or "(unknown)",
+                memo=row["memo"],
+                category_id=ynab_cat_id,
+                cleared=row["cleared"] or "cleared",
+                approved=False,    # leave unapproved so user can review in YNAB app
+                import_id=f"ledger:{row['id']}",
+            )
+        except Exception as e:  # noqa: BLE001
+            storage.audit(db_path, "ui_ynab_push_failed", {
+                "ledger_txn_id": row["id"], "error": str(e)[:300],
+            })
+            return {"ok": False, "error": str(e)}
+
+        # Stamp ynab_txn_id locally so subsequent queries skip this row.
+        with storage.connect(db_path) as con:
+            con.execute(
+                "UPDATE ledger_txn SET ynab_txn_id = ?, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (created["id"], row["id"]),
+            )
+        storage.audit(db_path, "ui_ynab_push_ok", {
+            "ledger_txn_id": row["id"], "ynab_txn_id": created["id"],
+        })
+        return {"ok": True, "ynab_txn_id": created["id"]}
+
+    return app
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Background-task launcher used from telegram_bot._post_init.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+async def serve(settings: Settings, *, host: str = "127.0.0.1",
+                 port: int = 8765) -> None:
+    """Run uvicorn in the same event loop as the Telegram bot.
+
+    Crashes are logged but never escape — same convention as the other
+    background tasks in telegram_bot.
+    """
+    import uvicorn  # imported here so a missing dep doesn't break the bot
+
+    app = build_app(settings)
+    config = uvicorn.Config(
+        app, host=host, port=port,
+        log_level="warning", access_log=False,
+    )
+    server = uvicorn.Server(config)
+    log.info("ui_api: serving on http://%s:%s", host, port)
+    await server.serve()
