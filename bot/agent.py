@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 import httpx
@@ -21,6 +22,63 @@ from bot import agent_tools, storage
 from bot.config import Settings
 
 log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Deterministic queue-state intercept
+# ---------------------------------------------------------------------------
+# qwen3:32b does NOT reliably obey the "always call list_pending" instruction
+# in SYSTEM_PROMPT. In practice it free-forms the pending list out of the
+# conversation history — fabricating counts (7→8→5 across identical questions),
+# breaking the numbering, and even inventing Amazon rows that list_pending
+# filters out. For the narrow, unambiguous set of "what's pending" phrasings we
+# bypass the model entirely and return the tool's verbatim, deterministic
+# output.
+# NB: the apostrophe class ['’]? matches a straight quote, a curly quote
+# (iOS/Telegram autocorrect sends U+2019 for "what's"), or none at all.
+_QUEUE_STATE_RE = re.compile(
+    r"(what['’]?s|what\s+is)\s+pending"
+    r"|any\s+uncategori[sz]ed"
+    r"|uncategori[sz]ed\s*\??\s*$"
+    r"|how\s+many\s+(are\s+)?(pending|left|in\s+(the\s+)?queue)"
+    r"|(what['’]?s|what\s+is)\s+left"
+    r"|show\s+me\s+(what['’]?s\s+left|the\s+queue|pending)"
+    r"|not\s+been\s+categori[sz]ed"
+    r"|in\s+(the\s+)?queue",
+    re.IGNORECASE,
+)
+
+# A numbered categorize reply ("2. Vacation 5. Groceries") must never be
+# intercepted as a queue-state question — it routes to categorize_batch_numbered.
+_NUMBERED_REPLY_RE = re.compile(r"\d+\.\s*\S")
+
+
+def _is_queue_state_question(text: str) -> bool:
+    """True for meta questions about the queue that should hit list_pending."""
+    if not text or _NUMBERED_REPLY_RE.search(text):
+        return False
+    return bool(_QUEUE_STATE_RE.search(text))
+
+
+def _scrub_for_history(text: str) -> str:
+    """Collapse queue listings before persisting to conversation history.
+
+    The model copies whatever it sees in prior turns. When a full numbered
+    pending list lands in history, qwen3:32b regurgitates a mutated copy on
+    the next turn (wrong counts, invented rows). Replace listings with a short,
+    non-copyable marker — the model still knows a list was shown but has nothing
+    to plagiarize, and the next queue question re-hits the deterministic tool.
+    """
+    if not text:
+        return text
+    is_listing = (
+        "to categorize multiple at once" in text
+        or re.match(r"^\s*\d+\s+pending transaction", text) is not None
+        or text.startswith("Queue is empty")
+    )
+    if is_listing:
+        return "(showed the current pending queue via list_pending)"
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -431,6 +489,7 @@ def _save_turn(
     user_text: str, assistant_text: str,
 ) -> None:
     """Append (user, assistant) to last_turns_json. Caps at last 5 pairs."""
+    assistant_text = _scrub_for_history(assistant_text)
     history = _load_last_turns(db_path, chat_id, n=4)
     history.append({"role": "user", "content": user_text})
     history.append({"role": "assistant", "content": assistant_text})
@@ -488,6 +547,20 @@ def run_agent_turn(
          produce a final natural-language reply.
       4. Persist the turn pair for next time.
     """
+    # Deterministic intercept: unambiguous queue-state questions bypass the
+    # model, which has repeatedly fabricated the pending list from stale
+    # history instead of calling list_pending. Return the tool output verbatim.
+    if _is_queue_state_question(user_text):
+        try:
+            reply = agent_tools.list_pending_tool(db_path, chat_id=chat_id)
+        except Exception as e:  # noqa: BLE001
+            log.exception("list_pending intercept failed: %s", e)
+            reply = ""
+        if reply:
+            _save_turn(db_path, chat_id, user_id, user_text, reply)
+            return reply
+        # Empty/failed intercept: fall through to the normal model path.
+
     history = _load_last_turns(db_path, chat_id, n=4)
     messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history,
                 {"role": "user", "content": user_text}]

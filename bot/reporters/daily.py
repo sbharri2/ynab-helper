@@ -151,8 +151,15 @@ def _build_steven_summary(db_path: str, *, as_of: date | None = None) -> str:
     amazon_ready = count_amazon_ready(db_path, user_id="steven")
     amazon_held = count_amazon_held(db_path, user_id="steven")
     with storage.connect(db_path) as con:
+        # Steven's non-Amazon order rows only. The old query was household-wide
+        # and unfiltered, so it counted Allison's rows plus all 30+ Amazon
+        # orders — already surfaced on the 📦 Amazon line above — and reported a
+        # "39 pending" that contradicted list_pending's "1 + 7" when Steven
+        # asked in chat. Match list_pending's filter so the surfaces agree.
         outstanding_orders = con.execute(
-            "SELECT COUNT(*) FROM pending_order WHERE status = 'pending'"
+            "SELECT COUNT(*) FROM pending_order "
+            "WHERE status = 'pending' AND assigned_to_user_id = 'steven' "
+            "AND source <> 'amazon'"
         ).fetchone()[0]
 
     lines: list[str] = []
