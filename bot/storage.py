@@ -5,6 +5,7 @@ All schema and CRUD lives here. No other module reads/writes the DB directly.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -257,6 +258,26 @@ CREATE TABLE IF NOT EXISTS payee_intel (
   confidence REAL DEFAULT 0,           -- 0-1 self-reported by LLM
   fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
+
+-- Redesign-v2 Phase 1 (docs/redesign-v2.md): every Telegram message, both
+-- directions, across all bots. The conversation is data; Telegram is just a
+-- client. Feeds the desktop Chat portal timeline and, later, the per-job
+-- eval sets for the narrow-job qwen pipeline. Rows are append-only.
+CREATE TABLE IF NOT EXISTS chat_message (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  tg_chat_id INTEGER NOT NULL,
+  tg_message_id INTEGER,               -- Telegram's id; NULL if send failed pre-id
+  reply_to_tg_message_id INTEGER,      -- set when the message quoted another
+  sender TEXT NOT NULL,                -- 'steven' | 'allison' | 'bot' | raw tg id
+  direction TEXT NOT NULL CHECK (direction IN ('in','out')),
+  text TEXT,
+  item_kind TEXT,                      -- optional link: 'txn' | 'order'
+  item_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_chat_message_ts ON chat_message(ts);
+CREATE INDEX IF NOT EXISTS idx_chat_message_tg
+  ON chat_message(tg_chat_id, tg_message_id);
 """
 
 
@@ -290,6 +311,12 @@ def _migrate(con) -> None:
     when needed. Order matters when a new column references another new
     column, but for now all migrations are independent.
     """
+    audit_cols = {r[1] for r in con.execute("PRAGMA table_info(audit_log)")}
+    if "chat_message_id" not in audit_cols:
+        # Redesign-v2 Phase 1: link engine events to the chat message they
+        # produced/concern so the desktop portal can interleave them.
+        con.execute("ALTER TABLE audit_log ADD COLUMN chat_message_id INTEGER")
+
     bot_conv_cols = {
         r[1] for r in con.execute("PRAGMA table_info(bot_conversation)")
     }
@@ -597,11 +624,49 @@ def record_match(
         )
 
 
-def audit(db_path: Path | str, event: str, details: dict[str, Any] | str = "") -> None:
+def audit(db_path: Path | str, event: str, details: dict[str, Any] | str = "",
+          *, chat_message_id: int | None = None) -> None:
     payload = json.dumps(details) if isinstance(details, dict) else str(details)
     with connect(db_path) as con:
-        con.execute("INSERT INTO audit_log (event, details) VALUES (?, ?)",
-                    (event, payload))
+        con.execute(
+            "INSERT INTO audit_log (event, details, chat_message_id) "
+            "VALUES (?, ?, ?)",
+            (event, payload, chat_message_id),
+        )
+
+
+def log_chat_message(
+    db_path: Path | str,
+    *,
+    tg_chat_id: int,
+    direction: str,
+    sender: str,
+    text: str | None,
+    tg_message_id: int | None = None,
+    reply_to_tg_message_id: int | None = None,
+    item_kind: str | None = None,
+    item_id: int | None = None,
+) -> int | None:
+    """Append one row to chat_message. Returns the new row id.
+
+    MUST never raise into a send/receive path — a logging failure must not
+    break the bot's ability to talk. Callers rely on that; errors are
+    swallowed here (logged at WARNING) rather than at every call site.
+    """
+    try:
+        with connect(db_path) as con:
+            cur = con.execute(
+                """INSERT INTO chat_message
+                   (tg_chat_id, tg_message_id, reply_to_tg_message_id,
+                    sender, direction, text, item_kind, item_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (tg_chat_id, tg_message_id, reply_to_tg_message_id,
+                 sender, direction, text, item_kind, item_id),
+            )
+            return cur.lastrowid
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger(__name__).warning("chat_message log failed: %s", e)
+        return None
 
 
 # ---------------------------------------------------------------------------

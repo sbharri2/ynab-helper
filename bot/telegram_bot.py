@@ -41,6 +41,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    TypeHandler,
     filters,
 )
 
@@ -2398,6 +2399,12 @@ def _register_handlers(app: Application) -> None:
     themselves are bot-agnostic — they look up the right outbound bot via
     ``_bot_for_chat`` and operate on the shared DB.
     """
+    # Redesign-v2 Phase 1: log EVERY inbound update before real handlers run.
+    # Group -100 fires first; the callback never raises ApplicationHandlerStop,
+    # so it can't block anything. Outbound is logged by ChatLogRateLimiter.
+    from bot.chat_log import log_inbound_update
+    app.add_handler(TypeHandler(Update, log_inbound_update), group=-100)
+
     app.add_handler(CommandHandler("start", _start_cmd))
     app.add_handler(CommandHandler("skip", _skip_cmd))
     app.add_handler(CommandHandler("quiet", _quiet_cmd))
@@ -2515,7 +2522,15 @@ def run(settings: Settings | None = None) -> None:
     apps_by_token: dict[str, Application] = {}
     for tok, accounts in token_to_accounts.items():
         is_primary = (tok == primary_token)
-        builder = ApplicationBuilder().token(tok)
+        # ChatLogRateLimiter observes every outbound API call (sendMessage)
+        # and logs it to chat_message — one choke point instead of wrapping
+        # ~40 send call sites. It does no actual rate limiting.
+        from bot.chat_log import ChatLogRateLimiter
+        builder = (
+            ApplicationBuilder()
+            .token(tok)
+            .rate_limiter(ChatLogRateLimiter(str(settings.paths.database)))
+        )
         if is_primary:
             builder = builder.post_init(_post_init)
         app = builder.build()
