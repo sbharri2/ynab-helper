@@ -202,23 +202,24 @@ async def send_progress_report(app) -> None:
     settings = app.bot_data["settings"]
     db_path = settings.paths.database
     body = build_progress_report(db_path)
-    recipients = storage.list_recipients_for_period(db_path, "weekly")
+    # Steven-only — this is a "how's the bot doing" ops trend report,
+    # not household-relevant content. Same rationale as send_writer_report
+    # + send_aged_out_alert_if_new (fixed 2026-06-30 after Allison got
+    # spammed with the daily writer report).
     user_to_chat = {a.user_id: a.chat_id for a in settings.gmail_accounts}
+    chat_id = user_to_chat.get("steven")
     sent = skipped = 0
-    for r in recipients:
-        chat_id = user_to_chat.get(r["user_id"])
-        if not chat_id:
-            skipped += 1
-            continue
+    if chat_id is not None:
         try:
             from bot.telegram_bot import _bot_for_chat
             await _bot_for_chat(app, chat_id).send_message(
                 chat_id=chat_id, text=body,
             )
-            sent += 1
+            sent = 1
         except Exception as e:  # noqa: BLE001
-            log.warning("ynab_progress send to %s failed: %s",
-                         r["user_id"], e)
-            skipped += 1
+            log.warning("ynab_progress send to steven failed: %s", e)
+            skipped = 1
+    else:
+        skipped = 1
     storage.audit(db_path, "ynab_progress_sent",
                   {"sent": sent, "skipped": skipped})

@@ -167,25 +167,21 @@ async def send_aged_out_alert_if_new(app) -> None:
     body = (f"⚠ {len(snapshot['aged_out'])} Amazon items unreconciled "
             f"after 14 days.\n\n" + body)
 
-    recipients = storage.list_recipients_for_period(db_path, "daily")
+    # Steven-only ops alert. Amazon aged-out items are for the operator to
+    # investigate (unmatched CC charges, broken parsers) — Allison shouldn't
+    # get pinged about ledger drift she can't act on.
     user_to_chat = {a.user_id: a.chat_id for a in settings.gmail_accounts}
-    now = _dt.now()
+    chat_id = user_to_chat.get("steven")
     sent = 0
-    for r in recipients:
-        chat_id = user_to_chat.get(r["user_id"])
-        if not chat_id:
-            continue
-        if _in_quiet_hours(now, r["quiet_hours"]):
-            continue
+    if chat_id:
         try:
             from bot.telegram_bot import _bot_for_chat
             await _bot_for_chat(app, chat_id).send_message(
                 chat_id=chat_id, text=body,
             )
-            sent += 1
+            sent = 1
         except Exception as e:  # noqa: BLE001
-            log.warning("amazon aged-out send to %s failed: %s",
-                         r["user_id"], e)
+            log.warning("amazon aged-out send to steven failed: %s", e)
     storage.audit(db_path, "amazon_aged_out_alerted", {
         "source_audit_id": recent_aged["id"], "sent": sent,
     })

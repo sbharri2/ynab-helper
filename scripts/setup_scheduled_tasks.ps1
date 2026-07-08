@@ -31,6 +31,15 @@ $catchupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTi
 Register-ScheduledTask -TaskName "YNAB-Helper-DailyCatchup" -Action $catchupAction -Trigger $catchupTrigger -Settings $catchupSettings -RunLevel Highest -Force | Out-Null
 Write-Host "Registered: YNAB-Helper-DailyCatchup (daily 7:30am)"
 
+# DB backup: consistent SQLite snapshot pushed to Google Drive every 6h.
+# The live DB stays on LOCAL disk (Drive corrupts live SQLite); this task
+# is how Drive gets its copies. Runs as Limited so it needs no elevation.
+$backupAction = New-ScheduledTaskAction -Execute $python -Argument "-m scripts.backup_db --keep 28" -WorkingDirectory $RepoRoot
+$backupTrigger = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(2)) -RepetitionInterval (New-TimeSpan -Hours 6)
+$backupSettings = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
+Register-ScheduledTask -TaskName "YNAB-Helper-Backup" -Action $backupAction -Trigger $backupTrigger -Settings $backupSettings -Force | Out-Null
+Write-Host "Registered: YNAB-Helper-Backup (every 6h, keep 28 snapshots)"
+
 # Long-running bot -separate task, runs at logon, restarts on failure
 $action = New-ScheduledTaskAction -Execute $python -Argument "-m bot.telegram_bot" -WorkingDirectory $RepoRoot
 $trigger = New-ScheduledTaskTrigger -AtLogOn

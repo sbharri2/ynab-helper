@@ -181,6 +181,7 @@ def ingest_signal(
             }
 
     category_id: str | None = None
+    is_amazon = _is_amazon_payee(payee)
     if existing:
         ledger_txn_id = existing["id"]
         # Enrich existing row if the new signal carries better payee/memo/amount
@@ -209,7 +210,25 @@ def ingest_signal(
                     "had_chosen_category": bool(matched_order.get("chosen_category")),
                 })
 
-        if settings is not None:
+        # Amazon auto-bucket (Steven's design): every Amazon charge files
+        # straight into a per-person spending bucket — 'Amazon - Steven' /
+        # 'Amazon - Allison' from whoever the matched order was addressed to,
+        # else 'Amazon - Unassigned'. No LLM guess, no confirm prompt, no
+        # hold lane. The item-level detail still rides along in the memo via
+        # _enrich_from_pending_order above. Unlike other charges this DOES
+        # write category_id onto the ledger row now (there's no user-confirm
+        # step to promote it later).
+        ledger_category_id: str | None = None
+        if is_amazon:
+            person = (matched_order or {}).get("assigned_to_user_id")
+            category_id = _amazon_bucket_category(db_path, person)
+            ledger_category_id = category_id
+            storage.audit(db_path, "amazon_auto_bucket", {
+                "payee": payee, "person": person or "unassigned",
+                "category_id": category_id,
+                "matched_order": bool(matched_order),
+            })
+        elif settings is not None:
             if matched_order and matched_order.get("chosen_category"):
                 # Trust the user's prior choice on the matching order
                 category_id = matched_order["chosen_category"]
@@ -227,7 +246,7 @@ def ingest_signal(
                     payee=payee,
                 )
         with storage.connect(db_path) as con:
-            # NOTE: ledger_txn.category_id is intentionally left NULL here
+            # NOTE: for NON-Amazon charges ledger_txn.category_id is left NULL
             # even when the categorizer produced a high-confidence suggestion.
             # The suggestion stays on pending_txn.suggested_category and is
             # only promoted to ledger_txn.category_id when the user confirms
@@ -238,14 +257,18 @@ def ingest_signal(
             # would otherwise show the same $Y across every confirmation in
             # the same category — because the LLM suggestion had already
             # counted each charge into activity before the user tapped.
+            #
+            # Amazon is the exception: it auto-buckets with no confirm step, so
+            # ledger_category_id is set and written straight away.
             cur = con.execute(
                 """INSERT INTO ledger_txn
                      (account_id, posted_date, amount_cents, payee, memo,
                       category_id, cleared, source_signal, source_email_id,
                       dedupe_key)
-                   VALUES (?, ?, ?, ?, ?, NULL, 'uncleared', ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, 'uncleared', ?, ?, ?)""",
                 (account_id, posted_date, amount_cents, payee,
                  parsed.get("memo") or parsed.get("summary") or "",
+                 ledger_category_id,
                  signal_kind, email_id,
                  _dedupe_key(account_id, posted_date, amount_cents)),
             )
@@ -279,8 +302,12 @@ def ingest_signal(
     # surfaces it for confirm. ynab_txn_id is synthesized as "ledger:<id>"
     # so the row is uniquely keyed. _apply_choice detects that prefix and
     # skips the YNAB write (no YNAB id yet).
+    # Amazon charges auto-bucket (above) with no confirm step, so they never
+    # enter the prompt queue. The categorized ledger row still surfaces in the
+    # Sync-to-YNAB panel for a batch push whenever Steven wants.
     pending_txn_id: int | None = None
-    if action == "new" and signal_kind in _PROMPT_USER_KINDS and user_id:
+    if (action == "new" and signal_kind in _PROMPT_USER_KINDS
+            and user_id and not is_amazon):
         try:
             pending_txn_id = storage.insert_pending_txn(
                 db_path,
@@ -300,29 +327,9 @@ def ingest_signal(
                         (category_id, parsed.get("summary") or "",
                          pending_txn_id),
                     )
-            # Phase 7 queue routing: per Steven's design, an Amazon-
-            # marketplace CC alert that did NOT find a matching order
-            # email goes to HOLD so the bot doesn't DM him with a bare
-            # "Chase $X.XX at AMAZON MKTPLACE PMTS" prompt. The hold
-            # sweep retries enrichment every 30 min and promotes to HOT
-            # once the matching order arrives — or to COLD after 24h.
-            # Everything else (Citi/Coastal/Chase non-Amazon, Apple,
-            # Venmo with rich memo, etc.) goes straight to HOT.
-            if pending_txn_id and _is_generic_payee(payee):
-                payee_upper = (payee or "").upper()
-                is_amazon = ("AMAZON" in payee_upper or "AMZN" in payee_upper)
-                if is_amazon and not matched_order:
-                    with storage.connect(db_path) as con:
-                        con.execute(
-                            "UPDATE pending_txn SET queue_lane = 'hold', "
-                            "lane_changed_at = CURRENT_TIMESTAMP WHERE id = ?",
-                            (pending_txn_id,),
-                        )
-                    storage.audit(db_path, "queue_lane_change", {
-                        "pt_id": pending_txn_id,
-                        "from": "hot", "to": "hold",
-                        "reason": "amazon_awaiting_order_enrichment",
-                    })
+            # (Amazon no longer uses the HOLD lane — it auto-buckets above.
+            # Non-Amazon generic payees like Venmo/PayPal go straight to HOT
+            # since their enrichment already rode in on the parsed summary.)
         except sqlite3.IntegrityError:
             # Already enqueued for this ledger_txn — fine
             pass
@@ -823,6 +830,38 @@ _GENERIC_PAYEE_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+
+
+_AMAZON_BUCKET_NAMES = {
+    "steven": "Amazon - Steven",
+    "allison": "Amazon - Allison",
+}
+
+
+def _amazon_bucket_category(db_path: Path | str, person: str | None) -> str | None:
+    """Resolve the per-person Amazon spending bucket category id.
+
+    Amazon charges auto-file into 'Amazon - Steven' / 'Amazon - Allison'
+    (whoever the matched order was addressed to) or 'Amazon - Unassigned'
+    when no receipt matched. Looked up by name so a re-created category
+    still resolves. Returns None only if the buckets don't exist yet.
+    """
+    name = _AMAZON_BUCKET_NAMES.get((person or "").lower(), "Amazon - Unassigned")
+    with storage.connect(db_path) as con:
+        row = con.execute(
+            "SELECT id FROM category WHERE name = ?", (name,)
+        ).fetchone()
+        if row:
+            return row["id"]
+        row = con.execute(
+            "SELECT id FROM category WHERE name = 'Amazon - Unassigned'"
+        ).fetchone()
+    return row["id"] if row else None
+
+
+def _is_amazon_payee(p: str) -> bool:
+    up = (p or "").upper()
+    return _is_generic_payee(p) and ("AMAZON" in up or "AMZN" in up)
 
 
 def _is_generic_payee(p: str) -> bool:

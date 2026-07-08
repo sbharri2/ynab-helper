@@ -314,39 +314,35 @@ def run_once(settings: Settings) -> dict:
     return report
 
 
-def format_report(report: dict) -> str:
-    """DM-friendly summary of a writer run."""
+def format_report(report: dict) -> str | None:
+    """DM-friendly summary of a writer run, or None when the run had
+    nothing worth reporting.
+
+    "Worth reporting" = something was actually pushed, rewired, conflicted,
+    or failed. The prior version also surfaced the "Waiting for YNAB to
+    surface" list — but those are ledger:N rows sitting in Steven's
+    manual Sync-to-YNAB backlog (his bank has no YNAB Direct Import).
+    They're visible on demand in the Tauri panel; DMing them daily
+    reframes finished categorization work as "pending" user action and
+    was confusing enough that pt#933 from three weeks earlier looked
+    hung when it was just waiting in the manual push queue.
+
+    ``already_synced`` alone also isn't news — it means the writer walked
+    the queue and confirmed nothing drifted. Log-worthy, not DM-worthy.
+    """
     pushed = report.get("pushed", 0)
-    already = report.get("already_synced", 0)
     rewired = report.get("rewired", 0)
-    no_match = report.get("no_ynab_match", []) or []
     conflicts = report.get("conflicts", []) or []
     failed = report.get("failed", []) or []
 
-    lines = [f"🔄 YNAB writer"]
-    total_handled = pushed + already + rewired + len(no_match) + len(failed)
-    if total_handled == 0:
-        lines.append("Nothing to sync — bot ledger is already in line with YNAB.")
-        return "\n".join(lines)
+    if not (pushed or rewired or conflicts or failed):
+        return None
 
+    lines = ["🔄 YNAB writer"]
     if pushed:
         lines.append(f"✅ Pushed {pushed} categorization(s) to YNAB.")
     if rewired:
         lines.append(f"🔗 Rewired {rewired} synthetic id(s) to real YNAB UUIDs.")
-    if already:
-        lines.append(f"= {already} already in sync (no-op).")
-
-    if no_match:
-        lines.append("")
-        lines.append(f"⏳ Waiting for YNAB to surface ({len(no_match)}):")
-        for r in no_match[:8]:
-            amt = (r["amount_cents"] or 0) / 100
-            lines.append(
-                f"   pt#{r['pt_id']}  {r['date']}  ${amt:>+9.2f}  "
-                f"{(r['payee'] or '')[:34]}"
-            )
-        if len(no_match) > 8:
-            lines.append(f"   … and {len(no_match) - 8} more")
 
     if conflicts:
         lines.append("")
@@ -373,26 +369,34 @@ def format_report(report: dict) -> str:
 
 
 async def send_writer_report(app) -> dict:
-    """Run the writer and DM the result to opted-in users."""
+    """Run the writer and DM the result to Steven only.
+
+    This is an ops-level report (what got pushed to YNAB, what conflicted,
+    what's still waiting to surface). Household members other than the
+    operator don't care and shouldn't be woken by it — Allison DM'd about
+    this leaking into her 08:00 daily on 2026-06-30.
+    """
     settings = app.bot_data["settings"]
     db_path = settings.paths.database
     report = await __import__("asyncio").to_thread(run_once, settings)
     body = format_report(report)
 
-    recipients = storage.list_recipients_for_period(db_path, "daily")
+    # format_report returns None on quiet runs (nothing pushed / rewired /
+    # conflicted / failed). Skip the DM entirely — the writer's counters
+    # still land in audit_log for later inspection.
+    if body is None:
+        return report
+
     user_to_chat = {a.user_id: a.chat_id for a in settings.gmail_accounts}
-    for r in recipients:
-        chat_id = user_to_chat.get(r["user_id"])
-        if not chat_id:
-            continue
+    chat_id = user_to_chat.get("steven")
+    if chat_id:
         try:
             from bot.telegram_bot import _bot_for_chat
             await _bot_for_chat(app, chat_id).send_message(
                 chat_id=chat_id, text=body,
             )
         except Exception as e:  # noqa: BLE001
-            log.warning("ynab_writer report send to %s failed: %s",
-                         r["user_id"], e)
+            log.warning("ynab_writer report send to steven failed: %s", e)
     storage.audit(db_path, "ynab_writer_report_sent", {
         "pushed": report.get("pushed", 0),
         "conflicts": len(report.get("conflicts", [])),

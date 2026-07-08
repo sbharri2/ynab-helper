@@ -64,6 +64,24 @@ def _account_imap_password(account) -> str | None:
     return os.environ.get(env_name)
 
 
+def _person_from_recipient(headers: dict, default_user_id: str) -> str:
+    """Attribute an order to whoever it was addressed to.
+
+    Steven's inbox receives both his own Amazon confirmations AND Allison's
+    (she forwards hers, and the forward preserves the original To/Delivered-To).
+    Reading the recipient — not the polled mailbox — is what lets the per-person
+    Amazon buckets split Steven vs Allison correctly. Falls back to the polling
+    account's user_id when the recipient is unrecognized.
+    """
+    to = ((headers.get("To") or "") + " "
+          + (headers.get("Delivered-To") or "")).lower()
+    if "allison" in to:
+        return "allison"
+    if "sbharri2" in to or "steven" in to:
+        return "steven"
+    return default_user_id
+
+
 def _extract_body(msg: dict) -> str:
     """Walk the message payload, preferring text/plain when usable.
 
@@ -260,6 +278,8 @@ def poll_once(settings: Settings) -> int:
                         total_cents=parsed.get("total_cents") or parsed.get("amount_cents") or 0,
                         raw_summary=parsed.get("summary", ""),
                         raw_payload=parsed,
+                        assigned_to_user_id=_person_from_recipient(
+                            headers, account.user_id),
                     )
                     new_count += 1
                 except sqlite3.IntegrityError:
