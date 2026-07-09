@@ -1,6 +1,13 @@
 # Redesign v2 — Categorization, Chat, and the Desktop Portal
 
-*Drafted 2026-07-08 from the ground-up rethink conversation. Status: proposal for iteration, no code yet.*
+*Drafted 2026-07-08 from the ground-up rethink conversation.*
+
+**Status 2026-07-08 (evening): Phases 1–3 SHIPPED.** Phase 1a chat_message
+logging live in the bot; Phase 1b Chat portal + Phase 2 Inbox panel live in
+the desktop app; Phase 3 auto-file (override/prior/order → commit with
+`filed_by` provenance) + Amazon retro-bucket sweep live. Phase 4 (group-chat
+cutover + deletions) blocks on Steven creating the Telegram group; Phase 5
+(narrow-job pipeline replacing the v1 agent loop) follows it.
 
 ## Why
 
