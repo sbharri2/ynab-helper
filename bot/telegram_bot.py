@@ -897,6 +897,10 @@ def _apply_choice(
                 "WHERE id = ?",
                 (category_id, _utcnow(), user_id, item_id),
             )
+        # Cross-surface: a DM filing closes any open group question too.
+        from bot.group_chat import resolve_open_questions_for_item
+        resolve_open_questions_for_item(
+            settings.paths.database, "txn", item_id, user_id)
         ynab_id = item.get("ynab_txn_id") or ""
         if ynab_id.startswith("ledger:"):
             try:
@@ -1703,6 +1707,11 @@ async def _post_init(app: Application) -> None:
     log.info("queue-lane sweep loop started")
     app.bot_data["awareness_task"] = asyncio.create_task(_awareness_ping_loop(app))
     log.info("awareness ping loop started")
+    # Redesign-v2 Phase 4 — instant pings to the household group. Dormant
+    # (returns immediately) when telegram.group_chat_id is unset.
+    from bot.group_chat import group_ping_loop
+    app.bot_data["group_ping_task"] = asyncio.create_task(group_ping_loop(app))
+    log.info("group ping loop started")
     # Phase 3 (UI writes) — localhost HTTP API for the Tauri desktop app.
     # Stays loopback-only with a shared secret. The UI calls /categorize,
     # /envelope/move, /budget/set; the bot is still the single writer.
@@ -2406,6 +2415,20 @@ def _register_handlers(app: Application) -> None:
     from bot.chat_log import log_inbound_update
     app.add_handler(TypeHandler(Update, log_inbound_update), group=-100)
 
+    # Redesign-v2 Phase 4: household group traffic routes to its own handler
+    # and NEVER reaches the DM machinery below (within one handler group,
+    # PTB runs only the first match — this is registered ahead of the DM
+    # text handlers so group chatter can't trip "This chat isn't linked").
+    settings = app.bot_data.get("settings")
+    group_id = int(getattr(getattr(settings, "telegram", None),
+                           "group_chat_id", 0) or 0)
+    if group_id:
+        from bot.group_chat import handle_group_message
+        app.add_handler(MessageHandler(
+            filters.Chat(group_id) & filters.TEXT & ~filters.COMMAND,
+            handle_group_message,
+        ))
+
     app.add_handler(CommandHandler("start", _start_cmd))
     app.add_handler(CommandHandler("skip", _skip_cmd))
     app.add_handler(CommandHandler("quiet", _quiet_cmd))
@@ -2555,6 +2578,19 @@ def run(settings: Settings | None = None) -> None:
     for tok, accounts in token_to_accounts.items():
         for acct in accounts:
             chat_to_bot[int(acct.chat_id)] = apps_by_token[tok].bot
+    # Redesign-v2 Phase 4: the household group is served by group_bot_user's
+    # bot (the one Steven added to the group). Mapping it here means every
+    # existing _bot_for_chat / chat_to_bot call site can address the group
+    # like any other chat.
+    group_id = int(getattr(settings.telegram, "group_chat_id", 0) or 0)
+    if group_id:
+        group_tok = resolve_user_bot_token(
+            settings, getattr(settings.telegram, "group_bot_user", "steven"))
+        if group_tok and group_tok in apps_by_token:
+            chat_to_bot[group_id] = apps_by_token[group_tok].bot
+        else:
+            log.warning("group_chat_id set but no bot resolves for user %r",
+                        getattr(settings.telegram, "group_bot_user", None))
     for app in apps:
         app.bot_data["chat_to_bot"] = chat_to_bot
 

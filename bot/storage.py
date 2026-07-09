@@ -278,6 +278,32 @@ CREATE TABLE IF NOT EXISTS chat_message (
 CREATE INDEX IF NOT EXISTS idx_chat_message_ts ON chat_message(ts);
 CREATE INDEX IF NOT EXISTS idx_chat_message_tg
   ON chat_message(tg_chat_id, tg_message_id);
+
+-- Redesign-v2 Phase 4: one row per thing the bot is waiting to hear about.
+-- Every ping/question is a self-contained Telegram message; answers arrive
+-- as replies to it (reply_to_message_id → asked_message_id lookup). No
+-- shared mutable pointer, so nothing can stall: an ignored question just
+-- stays 'open' while the item remains visible in the desktop Inbox.
+CREATE TABLE IF NOT EXISTS question (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind TEXT NOT NULL CHECK (kind IN ('instant','attribution','batch_item')),
+  batch_id INTEGER,                    -- future review_batch linkage
+  n INTEGER,                           -- 1..N within a batch
+  item_kind TEXT NOT NULL CHECK (item_kind IN ('txn','order')),
+  item_id INTEGER NOT NULL,
+  tg_chat_id INTEGER NOT NULL,
+  asked_message_id INTEGER,
+  asked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  state TEXT NOT NULL DEFAULT 'open'
+    CHECK (state IN ('open','answered','resolved_elsewhere','expired')),
+  answered_by TEXT,
+  answer_text TEXT,
+  resolved_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_question_msg
+  ON question(tg_chat_id, asked_message_id);
+CREATE INDEX IF NOT EXISTS idx_question_item
+  ON question(item_kind, item_id, state);
 """
 
 

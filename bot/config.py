@@ -75,6 +75,11 @@ class OllamaConfig(BaseModel):
 class TelegramConfig(BaseModel):
     quiet_hours: str = "22:00-07:00"
     daily_digest_time: str = "09:00"
+    # Redesign-v2 Phase 4: the household group chat (Steven + Allison + one
+    # bot). 0 = not configured; group flows stay dormant. The bot that
+    # serves the group is group_bot_user's per-user bot.
+    group_chat_id: int = 0
+    group_bot_user: str = "steven"
     # Phase 5 — proactive summary scheduling. Each is "HH:MM" 24-hour local.
     # Both default to outside the default quiet hours so they fire reliably.
     daily_summary_time: str = "07:30"
