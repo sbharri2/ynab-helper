@@ -176,9 +176,58 @@ async def handle_group_message(
         await _handle_question_reply(context.application, settings,
                                       msg, user, reply_to.message_id)
         return
-    # Non-reply group chatter: with privacy mode on we only see @mentions
-    # and commands. Referee mode / free-text Q&A lands in a later phase —
-    # stay quiet rather than interject (restraint rule).
+
+    # ── Free-text group message (privacy mode off, 2026-07-08) ──────────
+    text = (msg.text or "").strip()
+    if not text:
+        return
+    db_path = settings.paths.database
+
+    # 1. Addressed to the bot → Q&A via the agent (money questions,
+    #    "what's pending", etc.). The deterministic queue intercept applies.
+    bot_username = (context.bot.username or "").lower()
+    if bot_username and f"@{bot_username}" in text.lower():
+        stripped = text
+        for form in (f"@{context.bot.username}", f"@{bot_username}"):
+            stripped = stripped.replace(form, "")
+        stripped = stripped.strip() or "help"
+        from bot.agent import run_agent_turn
+        try:
+            reply = await asyncio.to_thread(
+                run_agent_turn, db_path,
+                user_text=stripped, chat_id=msg.chat_id,
+                user_id=user, settings=settings,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("group agent turn failed: %s", e)
+            reply = "Something went wrong answering that — try again."
+        if reply:
+            await msg.reply_text(reply)
+        return
+
+    # 2. Category-shaped text with exactly ONE open question → treat it as
+    #    the answer (the design's most-recent-open fallback, held to its
+    #    safest case). With several open, ask for a direct reply instead of
+    #    guessing; with none open, it's humans talking — stay out of it.
+    from bot.agent_tools import _resolve_category
+    cat = _resolve_category(db_path, text)
+    if cat is not None or text.lower().rstrip(".!") in _SKIP_WORDS:
+        with storage.connect(db_path) as con:
+            open_qs = con.execute(
+                """SELECT * FROM question
+                   WHERE tg_chat_id = ? AND state = 'open'
+                   ORDER BY id DESC LIMIT 2""",
+                (msg.chat_id,),
+            ).fetchall()
+        if len(open_qs) == 1:
+            await _process_answer(db_path, msg, user, dict(open_qs[0]), text)
+        elif len(open_qs) > 1:
+            await msg.reply_text(
+                "A few items are open — reply directly to the one you mean.")
+        return
+
+    # Anything else is human conversation. Referee mode (unprompted
+    # evidence) comes later; the restraint rule says stay quiet until then.
     return
 
 
@@ -198,8 +247,13 @@ async def _handle_question_reply(
     if q["state"] != "open":
         await msg.reply_text("Already handled — nothing to do. ✓")
         return
+    await _process_answer(db_path, msg, user, dict(q),
+                          (msg.text or "").strip())
 
-    text = (msg.text or "").strip()
+
+async def _process_answer(db_path, msg, user: str, q: dict, text: str) -> None:
+    """Apply one human answer to one open question. Shared by the reply-to
+    path (deterministic anchor) and the single-open-question fallback."""
     low = text.lower().rstrip(".!")
 
     if low in _SKIP_WORDS:
