@@ -191,7 +191,9 @@ def build_app(settings: Settings) -> FastAPI:
                     raise HTTPException(404, "unknown pending_txn")
                 con.execute(
                     "UPDATE pending_txn SET chosen_category = ?, "
-                    "chosen_at = ?, status = 'categorized' WHERE id = ?",
+                    "chosen_at = ?, status = 'categorized', "
+                    # Desktop UI writes are Steven acting (his machine).
+                    "filed_by = 'steven' WHERE id = ?",
                     (body.category_id, _utcnow(), body.pt_id),
                 )
                 yid = pt["ynab_txn_id"] or ""

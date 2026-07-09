@@ -488,9 +488,11 @@ def categorize_pending_tool(
         if table == "pending_txn":
             con.execute(
                 """UPDATE pending_txn
-                   SET chosen_category = ?, status = 'categorized', chosen_at = ?
+                   SET chosen_category = ?, status = 'categorized', chosen_at = ?,
+                       filed_by = ?
                    WHERE id = ?""",
-                (cat["id"], datetime.now(), row["last_asked_id"]),
+                (cat["id"], datetime.now(), row["user_id"],
+                 row["last_asked_id"]),
             )
         else:
             con.execute(
@@ -772,9 +774,12 @@ def categorize_batch_numbered_tool(
                 continue
             con.execute(
                 """UPDATE pending_txn
-                   SET chosen_category = ?, status = 'categorized', chosen_at = ?
+                   SET chosen_category = ?, status = 'categorized', chosen_at = ?,
+                       filed_by = COALESCE(
+                           (SELECT user_id FROM bot_conversation WHERE chat_id = ?),
+                           filed_by)
                    WHERE id = ?""",
-                (cat["id"], datetime.now(), pt_id),
+                (cat["id"], datetime.now(), chat_id, pt_id),
             )
         storage.audit(
             db_path, "categorized",

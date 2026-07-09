@@ -181,6 +181,9 @@ def ingest_signal(
             }
 
     category_id: str | None = None
+    # Provenance of the category pick: 'override'/'prior'/'order' auto-commit
+    # (redesign-v2 Phase 3); 'llm' stays a suggestion awaiting a human.
+    categorize_method: str = "llm"
     is_amazon = _is_amazon_payee(payee)
     if existing:
         ledger_txn_id = existing["id"]
@@ -232,12 +235,13 @@ def ingest_signal(
             if matched_order and matched_order.get("chosen_category"):
                 # Trust the user's prior choice on the matching order
                 category_id = matched_order["chosen_category"]
+                categorize_method = "order"
                 storage.audit(db_path, "categorize_via_matched_order", {
                     "payee": payee, "category_id": category_id,
                     "matched_order_id": matched_order.get("id"),
                 })
             else:
-                category_id = _categorize(
+                category_id, categorize_method = _categorize(
                     db_path, settings,
                     summary=parsed.get("summary") or payee or "",
                     amount_cents=amount_cents,
@@ -320,13 +324,47 @@ def ingest_signal(
                 memo=parsed.get("summary") or parsed.get("memo") or "",
             )
             if pending_txn_id and category_id:
+                auto_commit = categorize_method in ("override", "prior", "order")
                 with storage.connect(db_path) as con:
-                    con.execute(
-                        "UPDATE pending_txn SET suggested_category = ?, "
-                        "raw_summary = ? WHERE id = ?",
-                        (category_id, parsed.get("summary") or "",
-                         pending_txn_id),
-                    )
+                    if auto_commit:
+                        # Redesign-v2 Phase 3: HIGH-CONFIDENCE picks commit
+                        # immediately with provenance instead of waiting in
+                        # the queue — an explicit payee rule, a ≥3×/≥70%
+                        # human-confirmed prior, or the user's own category
+                        # on the matched order. The Inbox's "recently filed"
+                        # section is the correcting safety net; the row never
+                        # enters the ask queue (status != 'pending').
+                        con.execute(
+                            "UPDATE pending_txn SET suggested_category = ?, "
+                            "chosen_category = ?, chosen_at = ?, "
+                            "status = 'categorized', filed_by = ?, "
+                            "raw_summary = ? WHERE id = ?",
+                            (category_id, category_id, storage._utcnow(),
+                             f"auto_{categorize_method}",
+                             parsed.get("summary") or "", pending_txn_id),
+                        )
+                        # Promote onto the ledger row now — same semantics
+                        # as the Amazon auto-bucket path: there is no later
+                        # confirm step to do it.
+                        con.execute(
+                            "UPDATE ledger_txn SET category_id = ?, "
+                            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (category_id, ledger_txn_id),
+                        )
+                    else:
+                        con.execute(
+                            "UPDATE pending_txn SET suggested_category = ?, "
+                            "raw_summary = ? WHERE id = ?",
+                            (category_id, parsed.get("summary") or "",
+                             pending_txn_id),
+                        )
+                if auto_commit:
+                    storage.audit(db_path, "auto_filed", {
+                        "pending_txn_id": pending_txn_id,
+                        "ledger_txn_id": ledger_txn_id,
+                        "payee": payee, "category_id": category_id,
+                        "method": categorize_method,
+                    })
             # (Amazon no longer uses the HOLD lane — it auto-buckets above.
             # Non-Amazon generic payees like Venmo/PayPal go straight to HOT
             # since their enrichment already rode in on the parsed summary.)
@@ -859,6 +897,61 @@ def _amazon_bucket_category(db_path: Path | str, person: str | None) -> str | No
     return row["id"] if row else None
 
 
+def retro_bucket_amazon_order(db_path: Path | str, *, order_id: int) -> bool:
+    """Re-bucket an already-ingested Amazon-Unassigned charge when its order
+    email arrives late (redesign-v2 Phase 3).
+
+    Fixes the ordering race seen 2026-07-06: a $139.41 charge auto-bucketed
+    to 'Amazon - Unassigned' at 07:03, then the order email carrying the
+    recipient parsed at 10:32 — and nothing ever revisited the charge.
+
+    Conservative on purpose: only acts when exactly ONE Unassigned charge
+    matches the order total within [-1, +10] days of the order date.
+    Ambiguity (0 or 2+ candidates) is left for a human in the Inbox.
+    Returns True if a charge was re-bucketed.
+    """
+    with storage.connect(db_path) as con:
+        o = con.execute(
+            "SELECT * FROM pending_order WHERE id = ?", (order_id,)
+        ).fetchone()
+    if not o or o["source"] != "amazon":
+        return False
+    person = o["assigned_to_user_id"]
+    total = o["total_cents"] or 0
+    if not person or not total:
+        return False
+    target_cat = _amazon_bucket_category(db_path, person)
+    unassigned_cat = _amazon_bucket_category(db_path, None)
+    if not target_cat or not unassigned_cat or target_cat == unassigned_cat:
+        return False
+
+    order_date = str(o["order_date"])
+    with storage.connect(db_path) as con:
+        candidates = con.execute(
+            """SELECT id, posted_date, amount_cents FROM ledger_txn
+               WHERE category_id = ?
+                 AND ABS(amount_cents) = ?
+                 AND posted_date BETWEEN date(?, '-1 day')
+                                     AND date(?, '+10 days')
+               LIMIT 2""",
+            (unassigned_cat, abs(total), order_date, order_date),
+        ).fetchall()
+        if len(candidates) != 1:
+            return False
+        charge = candidates[0]
+        con.execute(
+            "UPDATE ledger_txn SET category_id = ?, "
+            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (target_cat, charge["id"]),
+        )
+    storage.audit(db_path, "amazon_retro_bucket", {
+        "order_id": order_id, "ledger_txn_id": charge["id"],
+        "person": person, "total_cents": total,
+        "order_date": order_date, "posted_date": str(charge["posted_date"]),
+    })
+    return True
+
+
 def _is_amazon_payee(p: str) -> bool:
     up = (p or "").upper()
     return _is_generic_payee(p) and ("AMAZON" in up or "AMZN" in up)
@@ -881,21 +974,24 @@ def _is_generic_payee(p: str) -> bool:
 def _categorize(
     db_path: Path | str, settings: Settings, *,
     summary: str, amount_cents: int, date_str: str, source: str, payee: str,
-) -> str | None:
-    """Return a suggested category_id, or None.
+) -> tuple[str | None, str]:
+    """Return ``(category_id, method)``; category_id may be None.
+
+    ``method`` is the provenance of the pick and decides what happens next
+    (redesign-v2 Phase 3): 'override' and 'prior' are HIGH CONFIDENCE and
+    auto-commit; 'llm' is a suggestion that waits for a human in the Inbox.
 
     Resolution order (first hit wins):
-      1. Hard-coded payee override map (bot.payee_overrides) — catches
-         recurring bills like AT&T → "Cell Phone (4th)" that the LLM
-         can't pick because the named-bill envelopes are deliberately
+      1. 'override' — hard-coded payee override map (bot.payee_overrides);
+         catches recurring bills like AT&T → "Cell Phone (4th)" that the
+         LLM can't pick because named-bill envelopes are deliberately
          excluded from the spending-only candidate pool.
-      2. Strongest historical prior — if Steven has categorized this
+      2. 'prior' — strongest historical prior: Steven has categorized this
          payee to the same category ≥3 times AND that category accounts
-         for ≥70% of his history, just use that. Lets non-spending
-         priors (bills, savings) win without going through the LLM.
-      3. The hardened LLM categorizer, restricted to spending categories
-         and softly biased by priors (still spending-only for the LLM's
-         restricted candidate list).
+         for ≥70% of his history. Lets non-spending priors (bills,
+         savings) win without going through the LLM.
+      3. 'llm' — the hardened LLM categorizer, restricted to spending
+         categories and softly biased by priors.
     """
     # 1. Explicit override map
     from bot.payee_overrides import resolve_payee_override
@@ -906,7 +1002,7 @@ def _categorize(
             "category_name": override["category_name"],
             "rule": override.get("rule"),
         })
-        return override["category_id"]
+        return override["category_id"], "override"
 
     # 2. Strong historical prior (bypasses LLM + is_spending filter)
     # — skip for payment-processor brands (Amazon, Venmo, PayPal, etc.)
@@ -922,12 +1018,12 @@ def _categorize(
             "category_name": strong["category_name"],
             "pct": strong["pct"], "count": strong["count"],
         })
-        return strong["category_id"]
+        return strong["category_id"], "prior"
 
     # 3. Fall through to the LLM with spending-only candidates + priors hint
     spending = storage.list_categories_for_spending(db_path)
     if not spending:
-        return None
+        return None, "llm"
     cats = [{"id": c["id"], "name": c["name"], "group": c["group_name"]}
             for c in spending]
     priors = storage.get_category_priors_for_payee(db_path, payee, top_n=5)
@@ -939,4 +1035,4 @@ def _categorize(
         summary=summary, amount_cents=amount_cents, date_str=date_str,
         source=source, categories=cats, priors=priors,
     )
-    return result.get("category_id")
+    return result.get("category_id"), "llm"

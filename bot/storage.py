@@ -360,6 +360,12 @@ def _migrate(con) -> None:
     # rotates through ignored items instead of re-pushing the lowest-id
     # row over and over after the 60-min staleness guard fires.
     txn_cols = {r[1] for r in con.execute("PRAGMA table_info(pending_txn)")}
+    if "filed_by" not in txn_cols:
+        # Redesign-v2 Phase 3: provenance for every categorization —
+        # 'auto_override' | 'auto_prior' | 'auto_order' | 'steven' |
+        # 'allison' | NULL (legacy rows). Powers the Inbox "recently filed"
+        # safety net and "review what the bot did" queries.
+        con.execute("ALTER TABLE pending_txn ADD COLUMN filed_by TEXT")
     if "last_pushed_at" not in txn_cols:
         con.execute("ALTER TABLE pending_txn ADD COLUMN last_pushed_at TIMESTAMP")
     order_cols = {r[1] for r in con.execute("PRAGMA table_info(pending_order)")}

@@ -893,8 +893,9 @@ def _apply_choice(
         with storage.connect(settings.paths.database) as con:
             con.execute(
                 "UPDATE pending_txn SET chosen_category = ?, "
-                "chosen_at = ?, status = 'categorized' WHERE id = ?",
-                (category_id, _utcnow(), item_id),
+                "chosen_at = ?, status = 'categorized', filed_by = ? "
+                "WHERE id = ?",
+                (category_id, _utcnow(), user_id, item_id),
             )
         ynab_id = item.get("ynab_txn_id") or ""
         if ynab_id.startswith("ledger:"):

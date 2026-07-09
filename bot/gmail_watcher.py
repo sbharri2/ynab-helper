@@ -285,6 +285,19 @@ def poll_once(settings: Settings) -> int:
                 except sqlite3.IntegrityError:
                     continue
 
+                # Amazon order emails often arrive HOURS after their charge
+                # was already ingested and auto-bucketed to Unassigned. Sweep
+                # backward so the late-arriving recipient re-buckets the
+                # charge (redesign-v2 Phase 3; conservative single-match).
+                if parsed.get("source") == "amazon" and row_id:
+                    from bot import ingest
+                    try:
+                        ingest.retro_bucket_amazon_order(
+                            settings.paths.database, order_id=row_id,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("amazon retro-bucket failed: %s", e)
+
                 # Venmo INFLOWS ("Jane paid you $20", charged_by) should
                 # never run through the LLM — they're not spending. The
                 # LLM was guessing Dining/Groceries because every option
