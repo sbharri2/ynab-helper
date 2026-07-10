@@ -256,7 +256,8 @@ async def handle_group_message(
         and low_bare not in _AFFIRM_WORDS
     )
     if len(open_qs) == 1 and looks_like_answer:
-        await _process_answer(db_path, msg, user, dict(open_qs[0]), text)
+        await _process_answer(db_path, msg, user, dict(open_qs[0]), text,
+                              known_users=_known_users(settings))
         return
     if len(open_qs) > 1 and (
         _resolve_category(db_path, text) is not None
@@ -306,10 +307,43 @@ async def _handle_question_reply(
         await msg.reply_text("Already handled — nothing to do. ✓")
         return
     await _process_answer(db_path, msg, user, dict(q),
-                          (msg.text or "").strip())
+                          (msg.text or "").strip(),
+                          known_users=_known_users(settings))
 
 
-async def _process_answer(db_path, msg, user: str, q: dict, text: str) -> None:
+def _known_users(settings) -> frozenset:
+    return frozenset(a.user_id for a in settings.gmail_accounts)
+
+
+_ROUTE_PREFIXES = ("ask ", "for ", "give to ", "send to ", "route to ")
+
+
+def _routing_target(low: str, known_users: frozenset) -> str | None:
+    """'allison', 'ask allison', "allison's" → 'allison' when it names a
+    known household member. None when the text isn't a plain routing form."""
+    s = low.lstrip("@").strip()
+    for p in _ROUTE_PREFIXES:
+        if s.startswith(p):
+            s = s[len(p):].strip()
+            break
+    for suffix in ("'s", "’s"):
+        if s.endswith(suffix):
+            s = s[: -len(suffix)]
+    return s if s in known_users else None
+
+
+def _find_user_word(low: str, known_users: frozenset) -> str | None:
+    """A known member's name appearing as a word inside longer text
+    ('Allison needs to categorize this')."""
+    import re
+    for u in known_users:
+        if re.search(rf"\b{re.escape(u)}\b", low):
+            return u
+    return None
+
+
+async def _process_answer(db_path, msg, user: str, q: dict, text: str,
+                          known_users: frozenset = frozenset()) -> None:
     """Apply one human answer to one open question. Shared by the reply-to
     path (deterministic anchor) and the single-open-question fallback."""
     low = text.lower().strip(".!")
@@ -318,6 +352,13 @@ async def _process_answer(db_path, msg, user: str, q: dict, text: str) -> None:
         _close_question(db_path, q["id"], "answered", user, text)
         await msg.reply_text(
             "No problem — it stays in the Inbox for later.")
+        return
+
+    # Routing, not categorizing: "Allison" / "ask allison" means "this is
+    # hers to file" (Steven, 2026-07-09). Reassign + re-ask addressed to her.
+    target = _routing_target(low, known_users)
+    if target is not None:
+        await _reroute_item(db_path, msg, user, q, target, text)
         return
 
     from bot.agent_tools import _resolve_category
@@ -340,6 +381,13 @@ async def _process_answer(db_path, msg, user: str, q: dict, text: str) -> None:
     if cat is None:
         cat = _resolve_category(db_path, text)
     if cat is None:
+        # "I'm telling you Allison needs to categorize this" — a member's
+        # name inside text that isn't a category = route it to them.
+        # (Safe ordering: "Allison Personal Savings" already resolved above.)
+        target = _find_user_word(low, known_users)
+        if target is not None:
+            await _reroute_item(db_path, msg, user, q, target, text)
+            return
         hints = _close_category_names(db_path, text)
         hint_str = (f" Close matches: {', '.join(hints)}." if hints else "")
         await msg.reply_text(
@@ -363,6 +411,47 @@ async def _process_answer(db_path, msg, user: str, q: dict, text: str) -> None:
         f"✓ Filed {filed['payee']} ({_fmt_money(filed['amount_cents'])}) "
         f"→ {cat['name']}"
     )
+
+
+async def _reroute_item(db_path, msg, user: str, q: dict,
+                        target: str, text: str) -> None:
+    """Reassign the question's item to another household member and post a
+    fresh question addressed to them (new anchor, so their reply files it)."""
+    if q["item_kind"] != "txn":
+        await msg.reply_text("Can't route that kind of item yet.")
+        return
+    with storage.connect(db_path) as con:
+        pt = con.execute(
+            "SELECT id, payee, amount_cents, txn_date, status "
+            "FROM pending_txn WHERE id = ?", (q["item_id"],),
+        ).fetchone()
+        if pt is None or pt["status"] not in ("pending", "skipped"):
+            _close_question(db_path, q["id"], "resolved_elsewhere", user, text)
+            await msg.reply_text("That item's already handled — nothing to route.")
+            return
+        con.execute(
+            "UPDATE pending_txn SET assigned_to_user_id = ? WHERE id = ?",
+            (target, pt["id"]),
+        )
+    _close_question(db_path, q["id"], "answered", user, text)
+    name = target.capitalize()
+    sent = await msg.reply_text(
+        f"👉 Over to {name}: {pt['payee']} "
+        f"({_fmt_money(pt['amount_cents'])}, {pt['txn_date']}). "
+        f"{name} — reply to this message with a category, or “skip”."
+    )
+    if sent is not None and getattr(sent, "message_id", None):
+        with storage.connect(db_path) as con:
+            con.execute(
+                """INSERT INTO question
+                     (kind, item_kind, item_id, tg_chat_id, asked_message_id)
+                   VALUES ('instant', 'txn', ?, ?, ?)""",
+                (pt["id"], msg.chat_id, sent.message_id),
+            )
+    storage.audit(db_path, "group_rerouted", {
+        "question_id": q["id"], "pt_id": pt["id"],
+        "from": user, "to": target, "text": text[:80],
+    })
 
 
 def _close_category_names(db_path, text: str, n: int = 3) -> list[str]:
