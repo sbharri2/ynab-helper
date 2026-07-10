@@ -144,13 +144,20 @@ async def _sweep_once(app: Application, settings, group_id: int) -> None:
         return
 
     for r in rows:
-        hint = f" — suggest {r['suggested_name']}" if r["suggested_name"] else ""
-        text = (
-            f"🆕 {_fmt_money(r['amount_cents'])} {r['payee']} "
-            f"({r['txn_date']}){hint}\n"
-            f"Reply to this message with a category to file it — "
-            f"or ignore it, it's in the Inbox."
-        )
+        head = (f"🆕 {_fmt_money(r['amount_cents'])} {r['payee']} "
+                f"({r['txn_date']})")
+        if r["suggested_name"]:
+            text = (
+                f"{head} — suggest {r['suggested_name']}\n"
+                f"Reply “y” to accept, or another category — "
+                f"or ignore it, it's in the Inbox."
+            )
+        else:
+            text = (
+                f"{head}\n"
+                f"Reply to this message with a category to file it — "
+                f"or ignore it, it's in the Inbox."
+            )
         try:
             sent = await bot.send_message(chat_id=group_id, text=text)
         except Exception as e:  # noqa: BLE001
@@ -175,8 +182,26 @@ async def _sweep_once(app: Application, settings, group_id: int) -> None:
 
 _SKIP_WORDS = {"skip", "not sure", "idk", "dunno", "no idea", "later", "?"}
 # "yes" to a ping that carries a suggestion = accept the suggestion.
-_AFFIRM_WORDS = {"yes", "y", "yep", "yeah", "sure", "correct", "sounds right",
-                 "that's right", "thats right", "👍"}
+# Short/ambiguous forms — only honored with a reply anchor (a bare "ok"
+# in the group is chatter, but replying "ok" to a suggestion is consent).
+_AFFIRM_WORDS = {"yes", "y", "k", "ok", "okay", "1", "+", "yep", "yeah",
+                 "sure", "correct", "👍", "✓", "✔"}
+# Explicit multi-word acceptances — unambiguous even without an anchor.
+_AFFIRM_PHRASES = {"sounds right", "that's right", "thats right",
+                   "that works", "sounds good", "looks good",
+                   "good suggestion", "suggestion is good",
+                   "use the suggestion", "go with that",
+                   "go with the suggestion", "yes please"}
+_POSITIVE_WORDS = ("good", "great", "right", "fine", "works", "correct",
+                   "perfect", "yes", "approve", "accept")
+
+
+def _is_affirmative(low: str) -> bool:
+    if low in _AFFIRM_WORDS or low in _AFFIRM_PHRASES:
+        return True
+    # "the suggestion looks good to me" — mentions the suggestion + a
+    # positive word, in any arrangement.
+    return "suggestion" in low and any(p in low for p in _POSITIVE_WORDS)
 # Bare-text conversational filler that must never be mistaken for an
 # answer attempt when one question happens to be open.
 _CHATTER_WORDS = {"ok", "okay", "k", "no", "nope", "thanks", "thank you",
@@ -363,8 +388,8 @@ async def _process_answer(db_path, msg, user: str, q: dict, text: str,
 
     from bot.agent_tools import _resolve_category
     cat = None
-    if low in _AFFIRM_WORDS:
-        # "yes" = accept the suggestion the ping carried, if any.
+    if _is_affirmative(low):
+        # "y" / "ok" / "suggestion is good" = accept the ping's suggestion.
         with storage.connect(db_path) as con:
             row = con.execute(
                 """SELECT c.id, c.name FROM pending_txn pt
