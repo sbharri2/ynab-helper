@@ -986,12 +986,13 @@ def _categorize(
          catches recurring bills like AT&T → "Cell Phone (4th)" that the
          LLM can't pick because named-bill envelopes are deliberately
          excluded from the spending-only candidate pool.
-      2. 'prior' — strongest historical prior: Steven has categorized this
-         payee to the same category ≥3 times AND that category accounts
-         for ≥70% of his history. Lets non-spending priors (bills,
-         savings) win without going through the LLM.
-      3. 'llm' — the hardened LLM categorizer, restricted to spending
-         categories and softly biased by priors.
+      2. 'prior' — payee memory v2 STRONG tier (bot.suggest): recency-
+         weighted majority ≥80% share with ≥3 confirmations. Auto-commits.
+      3. 'memory' — memory v2 SUGGEST tier (≥60% share, or amount-band
+         override on split payees). A suggestion, not an auto-commit —
+         but measured better than the LLM where it speaks (78% vs 64%).
+      4. 'llm' — the hardened LLM categorizer, restricted to spending
+         categories and softly biased by priors. Novel payees only.
     """
     # 1. Explicit override map
     from bot.payee_overrides import resolve_payee_override
@@ -1004,21 +1005,38 @@ def _categorize(
         })
         return override["category_id"], "override"
 
-    # 2. Strong historical prior (bypasses LLM + is_spending filter)
+    # 2. Payee memory v2 (suggestions-v2, docs/suggestions-v2.md):
+    # recency-weighted majority vote over normalized payees, with
+    # amount-band overrides for split payees. Backtested 2026-07-10:
+    # strong tier 89% (auto-file grade), suggest tier 78% (vs 64% LLM).
     # — skip for payment-processor brands (Amazon, Venmo, PayPal, etc.)
     # because the canonical signal lives in the matching order/payment
-    # email; trusting a small-sample prior here misroutes the charge.
-    if _is_generic_payee(payee):
-        strong = None
-    else:
-        strong = storage.get_strongest_payee_category(db_path, payee)
-    if strong:
-        storage.audit(db_path, "categorize_via_prior", {
-            "payee": payee, "category_id": strong["category_id"],
-            "category_name": strong["category_name"],
-            "pct": strong["pct"], "count": strong["count"],
+    # email; trusting a payee prior here misroutes the charge.
+    memory_cat: str | None = None
+    if not _is_generic_payee(payee):
+        from bot import suggest as _suggest
+        try:
+            amt = int(amount_cents)
+        except (TypeError, ValueError):
+            amt = None
+        mem_cat, tier = _suggest.memory_suggestion(
+            db_path, payee, amount_cents=amt)
+        if mem_cat is not None and tier == "strong":
+            storage.audit(db_path, "categorize_via_prior", {
+                "payee": payee, "category_id": mem_cat,
+                "engine": "memory_v2", "tier": tier,
+            })
+            return mem_cat, "prior"
+        if mem_cat is not None and tier == "suggest":
+            # Not auto-file grade, but better than the LLM where it
+            # speaks (78% vs 64% measured) — return as the suggestion.
+            memory_cat = mem_cat
+
+    if memory_cat is not None:
+        storage.audit(db_path, "categorize_via_memory", {
+            "payee": payee, "category_id": memory_cat,
         })
-        return strong["category_id"], "prior"
+        return memory_cat, "memory"
 
     # 3. Fall through to the LLM with spending-only candidates + priors hint
     spending = storage.list_categories_for_spending(db_path)
