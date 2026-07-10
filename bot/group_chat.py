@@ -119,6 +119,7 @@ async def group_ping_loop(app: Application) -> None:
 
 async def _sweep_once(app: Application, settings, group_id: int) -> None:
     db_path = settings.paths.database
+    await _post_trip_confirms(app, settings, group_id)
     with storage.connect(db_path) as con:
         rows = con.execute(
             """SELECT pt.id, pt.payee, pt.amount_cents, pt.txn_date,
@@ -144,20 +145,7 @@ async def _sweep_once(app: Application, settings, group_id: int) -> None:
         return
 
     for r in rows:
-        head = (f"🆕 {_fmt_money(r['amount_cents'])} {r['payee']} "
-                f"({r['txn_date']})")
-        if r["suggested_name"]:
-            text = (
-                f"{head} — suggest {r['suggested_name']}\n"
-                f"Reply “y” to accept, or another category — "
-                f"or ignore it, it's in the Inbox."
-            )
-        else:
-            text = (
-                f"{head}\n"
-                f"Reply to this message with a category to file it — "
-                f"or ignore it, it's in the Inbox."
-            )
+        text = _ping_text(r)
         try:
             sent = await bot.send_message(chat_id=group_id, text=text)
         except Exception as e:  # noqa: BLE001
@@ -174,6 +162,124 @@ async def _sweep_once(app: Application, settings, group_id: int) -> None:
             "pt_id": r["id"], "message_id": sent.message_id,
             "payee": r["payee"], "amount_cents": r["amount_cents"],
         })
+
+
+async def _post_trip_confirms(app: Application, settings, group_id: int) -> None:
+    """Suggestions-v2 trip windows: candidate trips get ONE confirmation
+    question in the group. A 'y' reply arms the window."""
+    db_path = settings.paths.database
+    with storage.connect(db_path) as con:
+        cands = con.execute(
+            """SELECT * FROM trip
+               WHERE state = 'candidate' AND confirm_message_id IS NULL
+               ORDER BY id ASC LIMIT 3""",
+        ).fetchall()
+    if not cands:
+        return
+    bot = app.bot_data["chat_to_bot"].get(group_id)
+    if bot is None:
+        return
+    for t in cands:
+        text = (
+            f"✈️ Looks like a trip around {t['start_date']} – {t['end_date']} "
+            f"({t['detect_payee']}).\n"
+            f"File away-from-home dining/transport in that window as "
+            f"Vacation? Reply “y” to confirm or “no” to dismiss."
+        )
+        try:
+            sent = await bot.send_message(chat_id=group_id, text=text)
+        except Exception as e:  # noqa: BLE001
+            log.warning("trip confirm send failed for trip %s: %s", t["id"], e)
+            continue
+        with storage.connect(db_path) as con:
+            con.execute(
+                "UPDATE trip SET tg_chat_id = ?, confirm_message_id = ? "
+                "WHERE id = ?",
+                (group_id, sent.message_id, t["id"]),
+            )
+        storage.audit(db_path, "trip_confirm_asked", {
+            "trip_id": t["id"], "message_id": sent.message_id,
+        })
+
+
+def _ping_text(r) -> str:
+    """One instant-ping message. r needs payee/amount_cents/txn_date and
+    suggested_name (None when no suggestion)."""
+    head = (f"🆕 {_fmt_money(r['amount_cents'])} {r['payee']} "
+            f"({r['txn_date']})")
+    if r["suggested_name"]:
+        return (
+            f"{head} — suggest {r['suggested_name']}\n"
+            f"Reply “y” to accept, or another category — "
+            f"or ignore it, it's in the Inbox."
+        )
+    return (
+        f"{head}\n"
+        f"Reply to this message with a category to file it — "
+        f"or ignore it, it's in the Inbox."
+    )
+
+
+def post_instant_ping_sync(settings, pt_id: int) -> int:
+    """Synchronous instant ping for one pending_txn — the desktop 'Ask in
+    chat' button (runs inside the FastAPI route, so raw HTTP rather than
+    the PTB application). Returns the Telegram message id.
+
+    Raises RuntimeError when the group isn't configured or the item
+    already has an open question in the group.
+    """
+    import json
+    import urllib.parse
+    import urllib.request
+
+    db_path = settings.paths.database
+    group_id = int(getattr(settings.telegram, "group_chat_id", 0) or 0)
+    if not group_id:
+        raise RuntimeError("no household group configured")
+    with storage.connect(db_path) as con:
+        existing = con.execute(
+            """SELECT 1 FROM question WHERE item_kind = 'txn' AND item_id = ?
+               AND state = 'open'""", (pt_id,),
+        ).fetchone()
+        r = con.execute(
+            """SELECT pt.id, pt.payee, pt.amount_cents, pt.txn_date,
+                      c.name AS suggested_name
+               FROM pending_txn pt
+               LEFT JOIN category c ON c.id = pt.suggested_category
+               WHERE pt.id = ?""", (pt_id,),
+        ).fetchone()
+    if r is None:
+        raise RuntimeError("unknown pending_txn")
+    if existing:
+        raise RuntimeError("already asked in the group — answer that ping")
+
+    from bot.config import resolve_user_bot_token
+    token = resolve_user_bot_token(
+        settings, getattr(settings.telegram, "group_bot_user", "steven"))
+    text = _ping_text(r)
+    data = urllib.parse.urlencode(
+        {"chat_id": group_id, "text": text}).encode("utf-8")
+    resp = json.load(urllib.request.urlopen(urllib.request.Request(
+        f"https://api.telegram.org/bot{token}/sendMessage", data=data),
+        ))
+    if not resp.get("ok"):
+        raise RuntimeError(f"telegram send failed: {resp}")
+    message_id = resp["result"]["message_id"]
+    with storage.connect(db_path) as con:
+        con.execute(
+            """INSERT INTO question
+                 (kind, item_kind, item_id, tg_chat_id, asked_message_id)
+               VALUES ('instant', 'txn', ?, ?, ?)""",
+            (pt_id, group_id, message_id),
+        )
+    storage.log_chat_message(db_path, tg_chat_id=group_id, direction="out",
+                             sender="bot", text=text,
+                             tg_message_id=message_id)
+    storage.audit(db_path, "group_ping_sent", {
+        "pt_id": pt_id, "message_id": message_id, "payee": r["payee"],
+        "amount_cents": r["amount_cents"], "via": "desktop",
+    })
+    return message_id
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +362,26 @@ async def handle_group_message(
             await msg.reply_text(reply)
         return
 
+    # 1b. "we're traveling until the 26th" — explicit trip declaration
+    #     opens a confirmed window immediately (no round-trip).
+    from bot import trips as _trips
+    travel = _trips.parse_travel_message(text)
+    if travel is not None:
+        start, end = travel
+        trip_id = _trips.create_confirmed_manual(
+            db_path, start=start, end=end, by=user)
+        with storage.connect(db_path) as con:
+            trow = con.execute("SELECT * FROM trip WHERE id = ?",
+                               (trip_id,)).fetchone()
+        filed = _trips.apply_trip_to_pending(db_path, trow)
+        extra = (f" Filed {len(filed)} open charge"
+                 f"{'s' if len(filed) != 1 else ''} as Vacation already."
+                 if filed else "")
+        await msg.reply_text(
+            f"🏖 Got it — trip until {end}. Away-from-home charges will "
+            f"file as Vacation.{extra}")
+        return
+
     # 2. With exactly ONE open question, short bare text is almost always
     #    an answer attempt — process it even when it isn't an exact
     #    category name, so a near-miss ("Apple") gets a helpful nudge
@@ -319,6 +445,17 @@ async def _handle_question_reply(
     app: Application, settings, msg, user: str, replied_message_id: int,
 ) -> None:
     db_path = settings.paths.database
+    # Trip confirmations anchor to their own table, not `question`.
+    with storage.connect(db_path) as con:
+        trip = con.execute(
+            """SELECT * FROM trip
+               WHERE tg_chat_id = ? AND confirm_message_id = ?
+               ORDER BY id DESC LIMIT 1""",
+            (msg.chat_id, replied_message_id),
+        ).fetchone()
+    if trip is not None:
+        await _handle_trip_reply(db_path, msg, user, dict(trip))
+        return
     with storage.connect(db_path) as con:
         q = con.execute(
             """SELECT * FROM question
@@ -334,6 +471,33 @@ async def _handle_question_reply(
     await _process_answer(db_path, msg, user, dict(q),
                           (msg.text or "").strip(),
                           known_users=_known_users(settings))
+
+
+_NEGATIVE_WORDS = {"no", "n", "nope", "nah", "dismiss", "not a trip",
+                   "no trip"}
+
+
+async def _handle_trip_reply(db_path, msg, user: str, trip: dict) -> None:
+    from bot import trips
+    if trip["state"] != "candidate":
+        await msg.reply_text("That trip's already settled. ✓")
+        return
+    low = (msg.text or "").strip().lower().strip(".!")
+    if _is_affirmative(low):
+        trips.set_trip_state(db_path, trip["id"], "confirmed", by=user)
+        filed = trips.apply_trip_to_pending(db_path, trip)
+        extra = (f" Filed {len(filed)} charge"
+                 f"{'s' if len(filed) != 1 else ''} from the window as "
+                 f"Vacation already." if filed else "")
+        await msg.reply_text(
+            f"🏖 Trip armed {trip['start_date']} – {trip['end_date']}: "
+            f"away-from-home charges will file as Vacation.{extra}")
+        return
+    if low in _NEGATIVE_WORDS or low in _SKIP_WORDS:
+        trips.set_trip_state(db_path, trip["id"], "dismissed", by=user)
+        await msg.reply_text("Okay — not a trip. Nothing changes.")
+        return
+    await msg.reply_text("Reply “y” to arm Vacation filing, or “no”.")
 
 
 def _known_users(settings) -> frozenset:

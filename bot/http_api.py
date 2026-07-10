@@ -116,6 +116,10 @@ class JobChangeBody(BaseModel):
     new_source: NewIncomeSource | None = None
 
 
+class AskInChatBody(BaseModel):
+    pt_id: int
+
+
 class YnabPushBody(BaseModel):
     ledger_txn_id: int
 
@@ -139,19 +143,45 @@ def build_app(settings: Settings) -> FastAPI:
     def list_categories() -> list[dict[str, Any]]:
         """Every visible category — for the UI's category picker.
 
-        Excludes the 'Internal Master Category' group (YNAB plumbing
-        like 'Inflow: Ready to Assign' / 'Uncategorized'). The user
-        never wants to recategorize a transaction INTO those.
+        Excludes the 'Internal Master Category' group (YNAB plumbing like
+        'Uncategorized') EXCEPT 'Inflow: Ready to Assign' — that's where
+        income deposits belong (paychecks, refunds, Venmo income), shown
+        under a friendlier 'Income' group label (Steven, 2026-07-10).
         """
         with storage.connect(db_path) as con:
             rows = con.execute(
-                "SELECT c.id, c.name, c.is_spending, g.name AS group_name "
+                "SELECT c.id, c.name, c.is_spending, "
+                "  CASE WHEN g.name = 'Internal Master Category' "
+                "       THEN 'Income' ELSE g.name END AS group_name "
                 "FROM category c JOIN category_group g ON g.id = c.group_id "
                 "WHERE c.hidden = 0 AND g.hidden = 0 "
-                "  AND g.name != 'Internal Master Category' "
-                "ORDER BY g.sort_order, c.name"
+                "  AND (g.name != 'Internal Master Category' "
+                "       OR c.name = 'Inflow: Ready to Assign') "
+                "ORDER BY CASE WHEN c.name = 'Inflow: Ready to Assign' "
+                "         THEN 0 ELSE 1 END, g.sort_order, c.name"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    @app.post("/ask_in_chat", dependencies=[Depends(_require_token)])
+    def ask_in_chat(body: AskInChatBody) -> dict[str, Any]:
+        """Push one Inbox item to the household group as a ping (question
+        row + Telegram message), so it can be answered per chat. Desktop
+        'Ask in chat' button (Steven, 2026-07-10)."""
+        from bot.group_chat import post_instant_ping_sync
+        with storage.connect(db_path) as con:
+            pt = con.execute(
+                "SELECT id, status FROM pending_txn WHERE id = ?",
+                (body.pt_id,),
+            ).fetchone()
+        if not pt:
+            raise HTTPException(404, "unknown pending_txn")
+        if pt["status"] not in ("pending", "skipped"):
+            raise HTTPException(409, "item is already categorized")
+        try:
+            message_id = post_instant_ping_sync(settings, body.pt_id)
+        except RuntimeError as e:
+            raise HTTPException(409, str(e))
+        return {"ok": True, "message_id": message_id}
 
     @app.post("/categorize", dependencies=[Depends(_require_token)])
     def categorize(body: CategorizeBody) -> dict[str, Any]:

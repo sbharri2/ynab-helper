@@ -249,6 +249,27 @@ def ingest_signal(
                     source=signal_kind,
                     payee=payee,
                 )
+                # Suggestions-v2 layer 3: a confirmed trip window turns
+                # away-from-home dining/transport into Vacation. Only
+                # transforms memory/LLM picks — overrides and matched
+                # orders already carry stronger evidence.
+                if categorize_method in ("memory", "llm"):
+                    from bot import trips as _trips
+                    base_name = None
+                    if category_id:
+                        with storage.connect(db_path) as con:
+                            _r = con.execute(
+                                "SELECT name FROM category WHERE id = ?",
+                                (category_id,)).fetchone()
+                        base_name = _r["name"] if _r else None
+                    vac = _trips.trip_vacation_category(
+                        db_path, payee=payee or "", txn_date=posted_date,
+                        source=signal_kind, base_category_name=base_name)
+                    if vac is not None:
+                        category_id, categorize_method = vac, "trip"
+                        storage.audit(db_path, "categorize_via_trip", {
+                            "payee": payee, "category_id": vac,
+                        })
         with storage.connect(db_path) as con:
             # NOTE: for NON-Amazon charges ledger_txn.category_id is left NULL
             # even when the categorizer produced a high-confidence suggestion.
@@ -323,8 +344,20 @@ def ingest_signal(
                 txn_date=posted_date,
                 memo=parsed.get("summary") or parsed.get("memo") or "",
             )
+            # Lodging charges open a candidate trip window; the group
+            # sweep asks for one-tap confirmation (suggestions-v2).
+            if pending_txn_id:
+                try:
+                    from bot import trips as _trips
+                    if _trips.is_lodging_payee(payee):
+                        _trips.create_candidate_from_charge(
+                            db_path, pt_id=pending_txn_id, payee=payee,
+                            txn_date=posted_date)
+                except Exception as e:  # noqa: BLE001 — never block ingest
+                    log.warning("trip detection failed: %s", e)
             if pending_txn_id and category_id:
-                auto_commit = categorize_method in ("override", "prior", "order")
+                auto_commit = categorize_method in (
+                    "override", "prior", "order", "trip")
                 with storage.connect(db_path) as con:
                     if auto_commit:
                         # Redesign-v2 Phase 3: HIGH-CONFIDENCE picks commit

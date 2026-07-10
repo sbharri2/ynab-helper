@@ -304,6 +304,27 @@ CREATE INDEX IF NOT EXISTS idx_question_msg
   ON question(tg_chat_id, asked_message_id);
 CREATE INDEX IF NOT EXISTS idx_question_item
   ON question(item_kind, item_id, state);
+
+-- Suggestions-v2: trip windows (docs/suggestions-v2.md). A lodging charge
+-- (or an explicit "we're traveling until ..." message) opens a candidate
+-- trip; ONE group confirmation arms it. While confirmed, away-from-home
+-- charges inside [start_date, end_date] file as Vacation (auto_trip).
+CREATE TABLE IF NOT EXISTS trip (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  state TEXT NOT NULL DEFAULT 'candidate'
+    CHECK (state IN ('candidate','confirmed','dismissed','expired')),
+  start_date DATE NOT NULL,
+  end_date DATE NOT NULL,
+  detected_from_pt INTEGER,            -- pending_txn that triggered detection
+  detect_payee TEXT,
+  tg_chat_id INTEGER,
+  confirm_message_id INTEGER,          -- the group question; replies confirm
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  confirmed_by TEXT,
+  resolved_at TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_trip_dates ON trip(state, start_date, end_date);
+CREATE INDEX IF NOT EXISTS idx_trip_msg ON trip(tg_chat_id, confirm_message_id);
 """
 
 
