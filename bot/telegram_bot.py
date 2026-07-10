@@ -1685,8 +1685,10 @@ async def _push_loop(app: Application) -> None:
 
 async def _post_init(app: Application) -> None:
     """Spawn all background loops after Application startup."""
-    app.bot_data["push_task"] = asyncio.create_task(_push_loop(app))
-    log.info("push loop started")
+    # Redesign-v2 cutover (2026-07-09): the proactive DM ask loop is OFF.
+    # Instant items surface as group pings (group_ping_loop below); the
+    # desktop Inbox holds everything else. /batch, /pending, /skip still
+    # work on demand — only the unprompted button-DMs are gone.
     app.bot_data["daily_task"] = asyncio.create_task(_daily_summary_loop(app))
     log.info("daily summary loop started")
     app.bot_data["weekly_task"] = asyncio.create_task(_weekly_summary_loop(app))
@@ -1705,8 +1707,9 @@ async def _post_init(app: Application) -> None:
     log.info("ynab full-sync loop started")
     app.bot_data["lane_sweep_task"] = asyncio.create_task(_lane_sweep_loop(app))
     log.info("queue-lane sweep loop started")
-    app.bot_data["awareness_task"] = asyncio.create_task(_awareness_ping_loop(app))
-    log.info("awareness ping loop started")
+    # Redesign-v2 cutover (2026-07-09): awareness pings ("N batch items
+    # ready") are OFF — Steven got three in one afternoon and the desktop
+    # Inbox already shows the backlog. The daily summary keeps one count.
     # Redesign-v2 Phase 4 — instant pings to the household group. Dormant
     # (returns immediately) when telegram.group_chat_id is unset.
     from bot.group_chat import group_ping_loop
@@ -1741,82 +1744,9 @@ async def _gmail_poll_loop(app: Application) -> None:
 # single push-to-YNAB path. /ynab triggers it on demand.
 
 
-AWARENESS_PING_HOURS = (10, 14, 19)  # local-time hours when ping fires
-
-
-def _next_awareness_fire_at(now: datetime | None = None) -> datetime:
-    """Return the next local datetime when an awareness ping should fire."""
-    if now is None:
-        now = datetime.now()
-    today_candidates = [
-        now.replace(hour=h, minute=0, second=0, microsecond=0)
-        for h in AWARENESS_PING_HOURS
-    ]
-    future = [t for t in today_candidates if t > now]
-    if future:
-        return min(future)
-    # All today's slots are past — go to tomorrow's earliest
-    tomorrow = (now + timedelta(days=1)).replace(
-        hour=AWARENESS_PING_HOURS[0], minute=0, second=0, microsecond=0,
-    )
-    return tomorrow
-
-
-async def _awareness_ping_loop(app: Application) -> None:
-    """Phase 7 Slice 3 — fire 'N items in your batch queue' DMs at three
-    fixed local times: 10:00, 14:00, 19:00.
-
-    For each user, the ping is suppressed when:
-      * COLD queue is empty (nothing to nudge about), OR
-      * The user is in their configured quiet hours.
-
-    Body comes from ``bot.batch_processor.build_awareness_body`` so the
-    formatting stays in one place.
-    """
-    from bot import batch_processor
-    settings: Settings = app.bot_data["settings"]
-    while True:
-        try:
-            fire_at = _next_awareness_fire_at()
-            sleep_for = max(1.0, (fire_at - datetime.now()).total_seconds())
-            log.info("awareness ping next at %s (in %.0fs)", fire_at, sleep_for)
-            await asyncio.sleep(sleep_for)
-
-            now = datetime.now()
-            for account in settings.gmail_accounts:
-                chat_id = account.chat_id
-                user_id = account.user_id
-                if not chat_id:
-                    continue
-                # Respect this user's quiet hours if configured; else the
-                # bot-wide telegram quiet_hours setting.
-                user_pref_row = storage.get_or_create_user_pref(
-                    settings.paths.database, user_id,
-                )
-                quiet = (user_pref_row.get("quiet_hours")
-                          or settings.telegram.quiet_hours)
-                if _in_quiet_hours(now, quiet):
-                    continue
-
-                body = batch_processor.build_awareness_body(
-                    settings.paths.database, user_id=user_id,
-                )
-                if not body:
-                    continue
-                try:
-                    await _bot_for_chat(app, chat_id).send_message(
-                        chat_id=chat_id, text=body,
-                    )
-                    storage.audit(settings.paths.database, "awareness_ping_sent",
-                                  {"user_id": user_id, "hour": now.hour})
-                except Exception as e:  # noqa: BLE001
-                    log.warning("awareness ping send to %s failed: %s",
-                                 user_id, e)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001
-            log.exception("awareness_ping iteration failed: %s", e)
-            await asyncio.sleep(60)
+# _awareness_ping_loop (Phase 7 Slice 3: thrice-daily "N batch items
+# ready" DMs) was removed in the redesign-v2 cutover 2026-07-09 — the
+# desktop Inbox and the daily summary already carry the count.
 
 
 async def _ui_api_loop(app: Application) -> None:
@@ -1937,11 +1867,24 @@ async def _daily_summary_loop(app: Application) -> None:
                 settings.paths.database, "daily",
             )
             now = datetime.now()
+            group_mode = bool(int(getattr(settings.telegram,
+                                          "group_chat_id", 0) or 0))
             schedule: list[tuple[datetime, str]] = []
-            for r in recipients:
-                fire_str = (r.get("daily_summary_time")
-                            or settings.telegram.daily_summary_time)
-                schedule.append((_next_fire_at(fire_str), r["user_id"]))
+            if group_mode and recipients:
+                # Redesign-v2 (2026-07-09): one household summary to the
+                # group at the earliest configured time — per-user DM
+                # fires would post the same report twice.
+                fire_strs = [(r.get("daily_summary_time")
+                              or settings.telegram.daily_summary_time)
+                             for r in recipients]
+                # zfill: "6:30" must sort as "06:30"
+                earliest = min(fire_strs, key=lambda s: s.strip().zfill(5))
+                schedule.append((_next_fire_at(earliest), "household"))
+            else:
+                for r in recipients:
+                    fire_str = (r.get("daily_summary_time")
+                                or settings.telegram.daily_summary_time)
+                    schedule.append((_next_fire_at(fire_str), r["user_id"]))
             if not schedule:
                 log.info("daily: no opted-in recipients; sleeping 1h")
                 await asyncio.sleep(3600)
@@ -1977,7 +1920,10 @@ async def _daily_summary_loop(app: Application) -> None:
                 except Exception as e:  # noqa: BLE001
                     log.warning("daily: reconcile failed: %s", e)
 
-            await send_daily_summaries(app, only_user_id=user_id)
+            await send_daily_summaries(
+                app,
+                only_user_id=None if user_id == "household" else user_id,
+            )
 
             if is_first_today:
                 # Writer + Amazon aged-out alert are once-per-day, shared

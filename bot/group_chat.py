@@ -70,6 +70,24 @@ def resolve_group_user(settings, tg_user_id: int | None) -> str | None:
     return None
 
 
+def report_target(app) -> "tuple[object, int] | None":
+    """(bot, group_chat_id) when the household group is configured.
+
+    All reports (daily, weekly, writer, ops alerts) go to the group — one
+    shared timeline instead of duplicate per-person DMs (Steven, 2026-07-09).
+    Returns None when unconfigured so callers fall back to DMs.
+    """
+    settings = app.bot_data["settings"]
+    gid = int(getattr(settings.telegram, "group_chat_id", 0) or 0)
+    if not gid:
+        return None
+    bot = app.bot_data.get("chat_to_bot", {}).get(gid)
+    if bot is None:
+        log.warning("report_target: no bot mapped for group %s", gid)
+        return None
+    return bot, gid
+
+
 # ---------------------------------------------------------------------------
 # Instant pings
 # ---------------------------------------------------------------------------
@@ -156,6 +174,14 @@ async def _sweep_once(app: Application, settings, group_id: int) -> None:
 # ---------------------------------------------------------------------------
 
 _SKIP_WORDS = {"skip", "not sure", "idk", "dunno", "no idea", "later", "?"}
+# "yes" to a ping that carries a suggestion = accept the suggestion.
+_AFFIRM_WORDS = {"yes", "y", "yep", "yeah", "sure", "correct", "sounds right",
+                 "that's right", "thats right", "👍"}
+# Bare-text conversational filler that must never be mistaken for an
+# answer attempt when one question happens to be open.
+_CHATTER_WORDS = {"ok", "okay", "k", "no", "nope", "thanks", "thank you",
+                  "lol", "haha", "nice", "cool", "sounds good", "good",
+                  "great", "hi", "hey", "hello", "morning", "night"}
 
 
 async def handle_group_message(
@@ -205,25 +231,57 @@ async def handle_group_message(
             await msg.reply_text(reply)
         return
 
-    # 2. Category-shaped text with exactly ONE open question → treat it as
-    #    the answer (the design's most-recent-open fallback, held to its
-    #    safest case). With several open, ask for a direct reply instead of
-    #    guessing; with none open, it's humans talking — stay out of it.
+    # 2. With exactly ONE open question, short bare text is almost always
+    #    an answer attempt — process it even when it isn't an exact
+    #    category name, so a near-miss ("Apple") gets a helpful nudge
+    #    instead of silence (Steven hit this 2026-07-09). With several
+    #    open, only category-shaped text gets the "reply directly" nudge;
+    #    with none open, it's humans talking — stay out of it.
     from bot.agent_tools import _resolve_category
-    cat = _resolve_category(db_path, text)
-    if cat is not None or text.lower().rstrip(".!") in _SKIP_WORDS:
-        with storage.connect(db_path) as con:
-            open_qs = con.execute(
-                """SELECT * FROM question
-                   WHERE tg_chat_id = ? AND state = 'open'
-                   ORDER BY id DESC LIMIT 2""",
-                (msg.chat_id,),
-            ).fetchall()
-        if len(open_qs) == 1:
-            await _process_answer(db_path, msg, user, dict(open_qs[0]), text)
-        elif len(open_qs) > 1:
-            await msg.reply_text(
-                "A few items are open — reply directly to the one you mean.")
+    with storage.connect(db_path) as con:
+        open_qs = con.execute(
+            """SELECT * FROM question
+               WHERE tg_chat_id = ? AND state = 'open'
+               ORDER BY id DESC LIMIT 2""",
+            (msg.chat_id,),
+        ).fetchall()
+    low_bare = text.lower().strip(".!")
+    looks_like_answer = (
+        len(text.split()) <= 4
+        and "@" not in text
+        and not text.endswith("?")
+        and low_bare not in _CHATTER_WORDS
+        # A bare "yes" with no reply anchor is too ambiguous to act on —
+        # affirmatives only accept a suggestion via reply-to.
+        and low_bare not in _AFFIRM_WORDS
+    )
+    if len(open_qs) == 1 and looks_like_answer:
+        await _process_answer(db_path, msg, user, dict(open_qs[0]), text)
+        return
+    if len(open_qs) > 1 and (
+        _resolve_category(db_path, text) is not None
+        or text.lower().rstrip(".!") in _SKIP_WORDS
+    ):
+        await msg.reply_text(
+            "A few items are open — reply directly to the one you mean.")
+        return
+
+    # 3. A bare question with no @-mention ("You there?", "how much is
+    #    left in dining?") — nobody else is being addressed, so treat it
+    #    as directed at the bot and answer.
+    if text.endswith("?") and "@" not in text:
+        from bot.agent import run_agent_turn
+        try:
+            reply = await asyncio.to_thread(
+                run_agent_turn, db_path,
+                user_text=text, chat_id=msg.chat_id,
+                user_id=user, settings=settings,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.exception("group agent turn failed: %s", e)
+            reply = "Something went wrong answering that — try again."
+        if reply:
+            await msg.reply_text(reply)
         return
 
     # Anything else is human conversation. Referee mode (unprompted
@@ -254,7 +312,7 @@ async def _handle_question_reply(
 async def _process_answer(db_path, msg, user: str, q: dict, text: str) -> None:
     """Apply one human answer to one open question. Shared by the reply-to
     path (deterministic anchor) and the single-open-question fallback."""
-    low = text.lower().rstrip(".!")
+    low = text.lower().strip(".!")
 
     if low in _SKIP_WORDS:
         _close_question(db_path, q["id"], "answered", user, text)
@@ -263,11 +321,30 @@ async def _process_answer(db_path, msg, user: str, q: dict, text: str) -> None:
         return
 
     from bot.agent_tools import _resolve_category
-    cat = _resolve_category(db_path, text)
+    cat = None
+    if low in _AFFIRM_WORDS:
+        # "yes" = accept the suggestion the ping carried, if any.
+        with storage.connect(db_path) as con:
+            row = con.execute(
+                """SELECT c.id, c.name FROM pending_txn pt
+                   JOIN category c ON c.id = pt.suggested_category
+                   WHERE pt.id = ?""", (q["item_id"],),
+            ).fetchone()
+        if row is not None:
+            cat = dict(row)
+        else:
+            await msg.reply_text(
+                "There was no suggestion on that one — "
+                "name the category instead.")
+            return
     if cat is None:
+        cat = _resolve_category(db_path, text)
+    if cat is None:
+        hints = _close_category_names(db_path, text)
+        hint_str = (f" Close matches: {', '.join(hints)}." if hints else "")
         await msg.reply_text(
-            f"Couldn't match “{text}” to a category — "
-            f"try the exact name, or say “skip”."
+            f"Couldn't match “{text}” to a category.{hint_str} "
+            f"Try the exact name, or say “skip”."
         )
         return
 
@@ -286,6 +363,21 @@ async def _process_answer(db_path, msg, user: str, q: dict, text: str) -> None:
         f"✓ Filed {filed['payee']} ({_fmt_money(filed['amount_cents'])}) "
         f"→ {cat['name']}"
     )
+
+
+def _close_category_names(db_path, text: str, n: int = 3) -> list[str]:
+    """Best-effort 'did you mean' for an unmatched category answer:
+    substring hits first, then difflib similarity."""
+    import difflib
+    with storage.connect(db_path) as con:
+        names = [r["name"] for r in con.execute(
+            "SELECT name FROM category WHERE hidden = 0"
+        ).fetchall()]
+    low = text.lower()
+    subs = [nm for nm in names if low in nm.lower()]
+    if subs:
+        return subs[:n]
+    return difflib.get_close_matches(text, names, n=n, cutoff=0.5)
 
 
 def _file_item(db_path, q, category_id: str, user: str) -> dict | None:

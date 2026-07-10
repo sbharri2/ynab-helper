@@ -206,20 +206,32 @@ async def send_progress_report(app) -> None:
     # not household-relevant content. Same rationale as send_writer_report
     # + send_aged_out_alert_if_new (fixed 2026-06-30 after Allison got
     # spammed with the daily writer report).
-    user_to_chat = {a.user_id: a.chat_id for a in settings.gmail_accounts}
-    chat_id = user_to_chat.get("steven")
+    # Redesign-v2 (2026-07-09): group configured → send there instead.
+    from bot.group_chat import report_target
+    target = report_target(app)
     sent = skipped = 0
-    if chat_id is not None:
+    if target is not None:
+        gbot, group_id = target
         try:
-            from bot.telegram_bot import _bot_for_chat
-            await _bot_for_chat(app, chat_id).send_message(
-                chat_id=chat_id, text=body,
-            )
+            await gbot.send_message(chat_id=group_id, text=body)
             sent = 1
         except Exception as e:  # noqa: BLE001
-            log.warning("ynab_progress send to steven failed: %s", e)
+            log.warning("ynab_progress group send failed: %s", e)
             skipped = 1
     else:
-        skipped = 1
+        user_to_chat = {a.user_id: a.chat_id for a in settings.gmail_accounts}
+        chat_id = user_to_chat.get("steven")
+        if chat_id is not None:
+            try:
+                from bot.telegram_bot import _bot_for_chat
+                await _bot_for_chat(app, chat_id).send_message(
+                    chat_id=chat_id, text=body,
+                )
+                sent = 1
+            except Exception as e:  # noqa: BLE001
+                log.warning("ynab_progress send to steven failed: %s", e)
+                skipped = 1
+        else:
+            skipped = 1
     storage.audit(db_path, "ynab_progress_sent",
                   {"sent": sent, "skipped": skipped})

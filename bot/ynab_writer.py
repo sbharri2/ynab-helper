@@ -387,16 +387,27 @@ async def send_writer_report(app) -> dict:
     if body is None:
         return report
 
-    user_to_chat = {a.user_id: a.chat_id for a in settings.gmail_accounts}
-    chat_id = user_to_chat.get("steven")
-    if chat_id:
+    # Redesign-v2 (2026-07-09): reports go to the household group when
+    # configured — Steven asked for all reports in the shared timeline.
+    from bot.group_chat import report_target
+    target = report_target(app)
+    if target is not None:
+        gbot, group_id = target
         try:
-            from bot.telegram_bot import _bot_for_chat
-            await _bot_for_chat(app, chat_id).send_message(
-                chat_id=chat_id, text=body,
-            )
+            await gbot.send_message(chat_id=group_id, text=body)
         except Exception as e:  # noqa: BLE001
-            log.warning("ynab_writer report send to steven failed: %s", e)
+            log.warning("ynab_writer report group send failed: %s", e)
+    else:
+        user_to_chat = {a.user_id: a.chat_id for a in settings.gmail_accounts}
+        chat_id = user_to_chat.get("steven")
+        if chat_id:
+            try:
+                from bot.telegram_bot import _bot_for_chat
+                await _bot_for_chat(app, chat_id).send_message(
+                    chat_id=chat_id, text=body,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("ynab_writer report send to steven failed: %s", e)
     storage.audit(db_path, "ynab_writer_report_sent", {
         "pushed": report.get("pushed", 0),
         "conflicts": len(report.get("conflicts", [])),

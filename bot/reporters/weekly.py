@@ -148,6 +148,22 @@ async def send_weekly_summaries(app) -> None:
     settings = app.bot_data["settings"]
     db_path = settings.paths.database
 
+    # Redesign-v2 (2026-07-09): group configured → one message there.
+    from bot.group_chat import report_target
+    target = report_target(app)
+    if target is not None:
+        bot, group_id = target
+        text = build_weekly_summary(db_path)
+        try:
+            await bot.send_message(chat_id=group_id, text=text)
+            storage.audit(db_path, "weekly_summary_sent",
+                          {"sent": 1, "skipped": 0, "group": True})
+        except Exception as e:  # noqa: BLE001
+            log.warning("weekly: group send failed: %s", e)
+            storage.audit(db_path, "weekly_summary_sent",
+                          {"sent": 0, "skipped": 1, "group": True})
+        return
+
     recipients = storage.list_recipients_for_period(db_path, "weekly")
     if not recipients:
         log.info("weekly: no recipients opted in")

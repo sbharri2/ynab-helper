@@ -168,8 +168,10 @@ def _build_steven_summary(db_path: str, *, as_of: date | None = None) -> str:
 
     queue_lines: list[str] = []
     if batch_n:
+        # Group-era wording: the Inbox (desktop) is where the backlog
+        # lives; /batch still works in a DM but isn't the headline.
         queue_lines.append(
-            f"📥 {batch_n} batch item{'s' if batch_n != 1 else ''} ready — /batch"
+            f"📥 {batch_n} item{'s' if batch_n != 1 else ''} in the Inbox"
         )
     if amazon_ready or amazon_held:
         parts: list[str] = []
@@ -177,7 +179,7 @@ def _build_steven_summary(db_path: str, *, as_of: date | None = None) -> str:
             parts.append(f"{amazon_ready} ready")
         if amazon_held:
             parts.append(f"{amazon_held} waiting for receipt")
-        queue_lines.append(f"📦 Amazon: {' · '.join(parts)} — /amazon")
+        queue_lines.append(f"📦 Amazon: {' · '.join(parts)}")
     if outstanding_orders:
         queue_lines.append(
             f"🛒 {outstanding_orders} order item{'s' if outstanding_orders != 1 else ''} pending"
@@ -472,6 +474,23 @@ async def send_daily_summaries(app, *, only_user_id: str | None = None) -> None:
     """
     settings = app.bot_data["settings"]
     db_path = settings.paths.database
+
+    # Redesign-v2 (2026-07-09): with the household group configured, ONE
+    # full household summary goes to the group instead of per-person DMs.
+    from bot.group_chat import report_target
+    target = report_target(app)
+    if target is not None:
+        bot, group_id = target
+        text = build_daily_summary(db_path, user_id="steven")
+        try:
+            await bot.send_message(chat_id=group_id, text=text)
+            storage.audit(db_path, "daily_summary_sent",
+                          {"sent": 1, "skipped": 0, "group": True})
+        except Exception as e:  # noqa: BLE001
+            log.warning("daily: group send failed: %s", e)
+            storage.audit(db_path, "daily_summary_sent",
+                          {"sent": 0, "skipped": 1, "group": True})
+        return
 
     recipients = storage.list_recipients_for_period(db_path, "daily")
     if only_user_id is not None:

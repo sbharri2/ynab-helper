@@ -121,7 +121,7 @@ def format_tracker_message(snapshot: dict) -> str:
             payee = (r["payee"] or "")[:30]
             lines.append(f"  pt#{r['id']:>4}  {d}  ${amt:>+8.2f}  {payee}")
         lines.append("")
-        lines.append("These won't get an order email. /batch to categorize manually.")
+        lines.append("These won't get an order email — categorize them from the Inbox.")
 
     return "\n".join(lines)
 
@@ -170,18 +170,29 @@ async def send_aged_out_alert_if_new(app) -> None:
     # Steven-only ops alert. Amazon aged-out items are for the operator to
     # investigate (unmatched CC charges, broken parsers) — Allison shouldn't
     # get pinged about ledger drift she can't act on.
-    user_to_chat = {a.user_id: a.chat_id for a in settings.gmail_accounts}
-    chat_id = user_to_chat.get("steven")
+    # Redesign-v2 (2026-07-09): group configured → send there instead.
+    from bot.group_chat import report_target
+    target = report_target(app)
     sent = 0
-    if chat_id:
+    if target is not None:
+        gbot, group_id = target
         try:
-            from bot.telegram_bot import _bot_for_chat
-            await _bot_for_chat(app, chat_id).send_message(
-                chat_id=chat_id, text=body,
-            )
+            await gbot.send_message(chat_id=group_id, text=body)
             sent = 1
         except Exception as e:  # noqa: BLE001
-            log.warning("amazon aged-out send to steven failed: %s", e)
+            log.warning("amazon aged-out group send failed: %s", e)
+    else:
+        user_to_chat = {a.user_id: a.chat_id for a in settings.gmail_accounts}
+        chat_id = user_to_chat.get("steven")
+        if chat_id:
+            try:
+                from bot.telegram_bot import _bot_for_chat
+                await _bot_for_chat(app, chat_id).send_message(
+                    chat_id=chat_id, text=body,
+                )
+                sent = 1
+            except Exception as e:  # noqa: BLE001
+                log.warning("amazon aged-out send to steven failed: %s", e)
     storage.audit(db_path, "amazon_aged_out_alerted", {
         "source_audit_id": recent_aged["id"], "sent": sent,
     })
