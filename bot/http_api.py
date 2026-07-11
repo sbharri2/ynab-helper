@@ -145,7 +145,42 @@ def build_app(settings: Settings) -> FastAPI:
 
     @app.get("/healthz")
     def healthz() -> dict[str, Any]:
-        return {"ok": True, "db": str(db_path)}
+        """One plain-language source of truth for every product surface.
+
+        This endpoint is loopback-only and intentionally contains timestamps
+        and counts, never credentials or transaction contents.  A live process
+        is not necessarily a healthy assistant: these freshness signals make
+        silent email, Telegram, and YNAB-sync failures visible.
+        """
+        with storage.connect(db_path) as con:
+            def scalar(sql: str, params: tuple = ()) -> Any:
+                row = con.execute(sql, params).fetchone()
+                return row[0] if row else None
+
+            return {
+                "ok": True,
+                "db": str(db_path),
+                "api_version": app.version,
+                "last_email_capture": scalar(
+                    "SELECT MAX(received_at) FROM ledger_signal"
+                ),
+                "last_ynab_sync": scalar(
+                    "SELECT MAX(ts) FROM audit_log WHERE event='ynab_full_sync_run'"
+                ),
+                "last_telegram_in": scalar(
+                    "SELECT MAX(ts) FROM chat_message WHERE direction='in'"
+                ),
+                "last_telegram_out": scalar(
+                    "SELECT MAX(ts) FROM chat_message WHERE direction='out'"
+                ),
+                "needs_attention": scalar(
+                    "SELECT COUNT(*) FROM pending_txn "
+                    "WHERE chosen_category IS NULL AND status IN ('pending','skipped')"
+                ) or 0,
+                "open_questions": scalar(
+                    "SELECT COUNT(*) FROM question WHERE state='open'"
+                ) or 0,
+            }
 
     @app.get("/categories", dependencies=[Depends(_require_token)])
     def list_categories() -> list[dict[str, Any]]:

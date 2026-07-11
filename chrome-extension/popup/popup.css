@@ -20,7 +20,7 @@ body {
 }
 
 header {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  background: #007aff;
   color: white;
   padding: 20px;
   text-align: center;
@@ -93,12 +93,12 @@ select:focus {
 }
 
 .btn-primary {
-  background-color: #667eea;
+  background-color: #007aff;
   color: white;
 }
 
 .btn-primary:hover:not(:disabled) {
-  background-color: #5568d3;
+  background-color: #0066d6;
   transform: translateY(-1px);
   box-shadow: 0 2px 8px rgba(102, 126, 234, 0.3);
 }
