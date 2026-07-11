@@ -119,6 +119,19 @@ async def group_ping_loop(app: Application) -> None:
 
 async def _sweep_once(app: Application, settings, group_id: int) -> None:
     db_path = settings.paths.database
+    # Unanswered pings are the normal case — after a week, stop treating
+    # one as "the current question" (it clutters the loose-reply
+    # heuristic that wants a single open question). The item stays in
+    # the Inbox, and a late reply-to on the old message still files it.
+    with storage.connect(db_path) as con:
+        expired = con.execute(
+            """UPDATE question SET state = 'expired', resolved_at = ?
+               WHERE state = 'open'
+                 AND asked_at < datetime('now', '-7 days')""",
+            (storage._utcnow(),),
+        ).rowcount
+    if expired:
+        storage.audit(db_path, "group_questions_expired", {"count": expired})
     await _post_trip_confirms(app, settings, group_id)
     with storage.connect(db_path) as con:
         rows = con.execute(
@@ -237,10 +250,6 @@ def post_instant_ping_sync(settings, pt_id: int) -> int:
     if not group_id:
         raise RuntimeError("no household group configured")
     with storage.connect(db_path) as con:
-        existing = con.execute(
-            """SELECT 1 FROM question WHERE item_kind = 'txn' AND item_id = ?
-               AND state = 'open'""", (pt_id,),
-        ).fetchone()
         r = con.execute(
             """SELECT pt.id, pt.payee, pt.amount_cents, pt.txn_date,
                       c.name AS suggested_name
@@ -250,8 +259,6 @@ def post_instant_ping_sync(settings, pt_id: int) -> int:
         ).fetchone()
     if r is None:
         raise RuntimeError("unknown pending_txn")
-    if existing:
-        raise RuntimeError("already asked in the group — answer that ping")
 
     from bot.config import resolve_user_bot_token
     token = resolve_user_bot_token(
@@ -266,6 +273,22 @@ def post_instant_ping_sync(settings, pt_id: int) -> int:
         raise RuntimeError(f"telegram send failed: {resp}")
     message_id = resp["result"]["message_id"]
     with storage.connect(db_path) as con:
+        # Re-asking supersedes any earlier open ping for this item — the
+        # new message becomes the anchor (unanswered pings are normal;
+        # the button's job is to bump the item back into view). Late
+        # replies to the OLD message still work via the item-still-open
+        # check in _handle_question_reply.
+        superseded = [row["id"] for row in con.execute(
+            """SELECT id FROM question WHERE item_kind = 'txn'
+               AND item_id = ? AND state = 'open'""", (pt_id,),
+        ).fetchall()]
+        for qid in superseded:
+            con.execute(
+                "UPDATE question SET state = 'expired', "
+                "answer_text = 'superseded by re-ask', resolved_at = ? "
+                "WHERE id = ?",
+                (storage._utcnow(), qid),
+            )
         con.execute(
             """INSERT INTO question
                  (kind, item_kind, item_id, tg_chat_id, asked_message_id)
@@ -278,6 +301,7 @@ def post_instant_ping_sync(settings, pt_id: int) -> int:
     storage.audit(db_path, "group_ping_sent", {
         "pt_id": pt_id, "message_id": message_id, "payee": r["payee"],
         "amount_cents": r["amount_cents"], "via": "desktop",
+        "superseded": superseded,
     })
     return message_id
 
@@ -466,8 +490,22 @@ async def _handle_question_reply(
     if q is None:
         return  # reply to something that isn't a tracked question
     if q["state"] != "open":
-        await msg.reply_text("Already handled — nothing to do. ✓")
-        return
+        # Questions are reminders, not locks (Steven, 2026-07-11):
+        # unanswered pings are the NORMAL case, so an old ping keeps
+        # accepting answers for as long as its item is still open.
+        # Only refuse when the item itself was already resolved.
+        item_still_open = False
+        if q["item_kind"] == "txn":
+            with storage.connect(db_path) as con:
+                pt = con.execute(
+                    "SELECT status FROM pending_txn WHERE id = ?",
+                    (q["item_id"],),
+                ).fetchone()
+            item_still_open = (
+                pt is not None and pt["status"] in ("pending", "skipped"))
+        if not item_still_open:
+            await msg.reply_text("Already handled — nothing to do. ✓")
+            return
     await _process_answer(db_path, msg, user, dict(q),
                           (msg.text or "").strip(),
                           known_users=_known_users(settings))
