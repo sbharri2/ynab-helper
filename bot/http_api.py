@@ -587,6 +587,14 @@ def build_app(settings: Settings) -> FastAPI:
         from bot import recon_inspect
         return recon_inspect.balance_report(db_path)
 
+    @app.get("/reconciler/balance_walk", dependencies=[Depends(_require_token)])
+    def reconciler_balance_walk(days: int = 45) -> dict[str, Any]:
+        """Day-by-day bank-delta vs ledger-delta walk — flags windows where
+        a transaction slipped through capture (Steven, 2026-07-11)."""
+        from bot import recon_inspect
+        days = max(3, min(int(days), 365))
+        return recon_inspect.balance_walk(db_path, days=days)
+
     @app.post("/income/job-change", dependencies=[Depends(_require_token)])
     def income_job_change(body: JobChangeBody) -> dict[str, Any]:
         """Handle a job-change transition: retire one source, add another.

@@ -66,13 +66,18 @@ _OUTFLOW_TOKENS = (
 def _classify_direction(type_word: str) -> int:
     """Returns +1 (inflow), -1 (outflow), or 0 (unknown).
 
-    Inflow checks FIRST so that "Deposit ACH VENMO" can't be miscast as
-    outflow via incidental substrings (e.g. "pos" inside "deposit").
+    Coastal's direction word LEADS the line ("Deposit ACH VENMO"), so
+    inflow tokens only count in first position — an inflow word buried
+    mid-line is merchant text, not direction. Real bug this fixes
+    (2026-07-11): "CHASE CREDIT CRD" (an ACH payment TO Chase) matched
+    \\bcredit\\b and recorded $2,012.03 of card payments as deposits.
+    Outflow tokens still match anywhere; unknown defaults negative too,
+    so a false outflow word costs nothing.
     """
     t = type_word.lower().strip()
-    for token in _INFLOW_TOKENS:
-        if re.search(rf"\b{re.escape(token)}\b", t):
-            return +1
+    words = t.split()
+    if words and words[0] in _INFLOW_TOKENS:
+        return +1
     for token in _OUTFLOW_TOKENS:
         if re.search(rf"\b{re.escape(token)}\b", t):
             return -1

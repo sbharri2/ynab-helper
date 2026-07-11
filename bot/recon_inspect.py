@@ -647,7 +647,27 @@ def dedupe_report(db_path: Path | str) -> dict[str, Any]:
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def _ledger_sum_asof(con, account_id: str, as_of) -> int:
+    """Our ledger's running balance: every row up to and including as_of.
+    is_split = 0 counts split children (which sum to the parent), never
+    both."""
+    row = con.execute(
+        """SELECT COALESCE(SUM(amount_cents), 0) AS s
+           FROM ledger_txn
+           WHERE account_id = ? AND is_split = 0 AND posted_date <= ?""",
+        (account_id, as_of),
+    ).fetchone()
+    return int(row["s"] or 0)
+
+
 def balance_report(db_path: Path | str) -> dict[str, Any]:
+    """Per-account OUR-LEDGER vs bank-observed balance.
+
+    Steven, 2026-07-11: the comparison that matters is whether the bot's
+    ledger matches the bank's daily-balance emails — YNAB's balance is on
+    its way out of the picture. expected = ledger running total as of the
+    observation date; delta = bank − ledger.
+    """
     with storage.connect(db_path) as con:
         latest = con.execute(
             """SELECT abo.account_id, MAX(abo.as_of_date) AS as_of_date,
@@ -659,23 +679,30 @@ def balance_report(db_path: Path | str) -> dict[str, Any]:
         ).fetchall()
         latest = [dict(r) for r in latest]
 
-    accounts = []
-    for r in latest:
-        as_of = _d(r["as_of_date"])
-        if as_of is None:
-            continue
-        res = reconciler.reconcile_preview(db_path, r["account_id"], as_of)
-        accounts.append({
-            "account_id": r["account_id"],
-            "name": r["name"],
-            "type": r["type"],
-            "as_of_date": str(r["as_of_date"])[:10],
-            "expected_cents": res["expected_cents"],
-            "observed_cents": res["observed_cents"],
-            "delta_cents": res["delta_cents"],
-            "status": res["status"],
-            "would_reconcile_count": res["reconciled_count"],
-        })
+        accounts = []
+        for r in latest:
+            as_of = _d(r["as_of_date"])
+            if as_of is None:
+                continue
+            observed = con.execute(
+                """SELECT balance_cents FROM account_balance_observed
+                   WHERE account_id = ? AND as_of_date = ?""",
+                (r["account_id"], r["as_of_date"]),
+            ).fetchone()["balance_cents"]
+            expected = _ledger_sum_asof(con, r["account_id"], r["as_of_date"])
+            delta = int(observed) - expected
+            tol = reconciler.DEFAULT_TOLERANCE_CENTS
+            accounts.append({
+                "account_id": r["account_id"],
+                "name": r["name"],
+                "type": r["type"],
+                "as_of_date": str(r["as_of_date"])[:10],
+                "expected_cents": expected,
+                "observed_cents": int(observed),
+                "delta_cents": delta,
+                "status": "ok" if abs(delta) <= tol else "mismatch",
+                "would_reconcile_count": 0,
+            })
 
     # Mismatches first, then by absolute drift.
     accounts.sort(
@@ -689,5 +716,135 @@ def balance_report(db_path: Path | str) -> dict[str, Any]:
             "total": len(accounts),
             "ok": sum(1 for a in accounts if a["status"] == "ok"),
             "mismatch": sum(1 for a in accounts if a["status"] == "mismatch"),
+        },
+    }
+
+
+# How far back the day-walk looks. Slips older than this are baseline
+# drift; the walk's job is catching the recent ones while the bank email
+# trail is still dense.
+_WALK_DAYS = 45
+
+# Gap levels are smoothed with a median over this many observations on
+# each side of a window. Credit-card balances systematically lag the
+# instant charge alerts by 1-2 days (pending vs posted), so raw
+# day-window deltas whipsaw; the median absorbs one-observation wobble
+# and only a level shift that STICKS reads as a slip.
+_SMOOTH_N = 3
+
+# Don't cry slip over drift smaller than this — daily wobble makes tiny
+# shifts meaningless even after smoothing. Credit cards get a much higher
+# bar: their balance emails lag the instant charge alerts by 1-2 days
+# (pending vs posted), so the smoothed gap still wanders by hundreds of
+# cents without anything actually slipping.
+_SLIP_MIN_CENTS = 500
+_SLIP_MIN_CENTS_CC = 2500
+
+
+def _median(xs: list[int]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    mid = n // 2
+    return float(s[mid]) if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def balance_walk(db_path: Path | str, days: int = _WALK_DAYS) -> dict[str, Any]:
+    """Day-by-day slipped-transaction detector.
+
+    For each pair of consecutive bank balance emails: how much did the
+    bank move vs how much did our ledger move? A window where they
+    disagree AND the disagreement sticks (doesn't reverse within
+    _TIMING_LOOKAHEAD later observations) means a transaction slipped
+    through capture — reported with its exact amount.
+    """
+    tol = reconciler.DEFAULT_TOLERANCE_CENTS
+    since = (date.today() - timedelta(days=days)).isoformat()
+    with storage.connect(db_path) as con:
+        accts = con.execute(
+            """SELECT DISTINCT abo.account_id, a.name, a.type
+               FROM account_balance_observed abo
+               JOIN account a ON a.id = abo.account_id
+               WHERE a.closed = 0 AND abo.as_of_date >= ?
+               ORDER BY a.name""",
+            (since,),
+        ).fetchall()
+
+        out = []
+        for acct in accts:
+            obs = con.execute(
+                """SELECT as_of_date, balance_cents
+                   FROM account_balance_observed
+                   WHERE account_id = ? AND as_of_date >= ?
+                   ORDER BY as_of_date""",
+                (acct["account_id"], since),
+            ).fetchall()
+            if len(obs) < 2:
+                continue
+
+            # Gap level at each observation: bank − ledger.
+            levels = []
+            for o in obs:
+                led = _ledger_sum_asof(con, acct["account_id"], o["as_of_date"])
+                levels.append({
+                    "date": str(o["as_of_date"])[:10],
+                    "bank_cents": int(o["balance_cents"]),
+                    "ledger_cents": led,
+                    "gap_cents": int(o["balance_cents"]) - led,
+                })
+
+            gaps = [lv["gap_cents"] for lv in levels]
+            slip_min = (_SLIP_MIN_CENTS_CC
+                        if acct["type"] == "credit_card"
+                        else _SLIP_MIN_CENTS)
+            windows = []
+            for i in range(1, len(levels)):
+                prev, cur = levels[i - 1], levels[i]
+                gap_change = cur["gap_cents"] - prev["gap_cents"]
+                # Smoothed level shift across this window: median of the
+                # gap before vs after. One-observation wobble (bank posts
+                # a charge a day after the alert) cancels; a shift that
+                # sticks survives.
+                pre = _median(gaps[max(0, i - _SMOOTH_N):i])
+                post = _median(gaps[i:i + _SMOOTH_N])
+                shift = post - pre
+                verdict = "ok"
+                if abs(gap_change) > tol:
+                    verdict = ("slip"
+                               if abs(shift) > max(tol, slip_min)
+                               else "timing")
+                windows.append({
+                    "from_date": prev["date"],
+                    "to_date": cur["date"],
+                    "bank_delta_cents": cur["bank_cents"] - prev["bank_cents"],
+                    "ledger_delta_cents": (cur["ledger_cents"]
+                                           - prev["ledger_cents"]),
+                    "gap_change_cents": gap_change,
+                    "shift_cents": int(round(shift)),
+                    "verdict": verdict,
+                })
+
+            slips = [w for w in windows if w["verdict"] == "slip"]
+            baseline = _median(gaps[:_SMOOTH_N])
+            current = _median(gaps[-_SMOOTH_N:])
+            out.append({
+                "account_id": acct["account_id"],
+                "name": acct["name"],
+                "type": acct["type"],
+                "levels": levels,
+                "windows": windows,
+                "slips": slips,
+                "baseline_gap_cents": int(round(baseline)),
+                "current_gap_cents": int(round(current)),
+                "net_drift_cents": int(round(current - baseline)),
+            })
+
+    out.sort(key=lambda a: -abs(a["net_drift_cents"]))
+    return {
+        "tolerance_cents": tol,
+        "days": days,
+        "accounts": out,
+        "counts": {
+            "accounts": len(out),
+            "slips": sum(len(a["slips"]) for a in out),
         },
     }
