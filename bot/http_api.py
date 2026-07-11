@@ -128,6 +128,11 @@ class CategoryCreateBody(BaseModel):
     is_spending: int = 1
 
 
+class ReconcileMonthBody(BaseModel):
+    month: str                # "YYYY-MM"
+    dry_run: bool = True      # preview by default; apply needs explicit False
+
+
 class YnabPushBody(BaseModel):
     ledger_txn_id: int
 
@@ -507,6 +512,18 @@ def build_app(settings: Settings) -> FastAPI:
         except Exception as e:  # noqa: BLE001
             log.warning("recompute after categorize failed: %s", e)
         return {"ok": True}
+
+    @app.post("/envelope/reconcile_month", dependencies=[Depends(_require_token)])
+    def envelope_reconcile_month(body: ReconcileMonthBody) -> dict[str, Any]:
+        """Settle a month's envelopes: cover every negative spending
+        envelope to $0 from same-group surpluses (largest first), then
+        Ready to Assign. Sinking-fund groups excluded. dry_run=True
+        returns the plan without applying (Steven, 2026-07-11)."""
+        import re as _re
+        if not _re.fullmatch(r"\d{4}-\d{2}", body.month):
+            raise HTTPException(400, "month must be YYYY-MM")
+        return envelope.reconcile_overspending(
+            db_path, body.month, dry_run=body.dry_run)
 
     @app.post("/envelope/move", dependencies=[Depends(_require_token)])
     def envelope_move(body: MoveBody) -> dict[str, Any]:

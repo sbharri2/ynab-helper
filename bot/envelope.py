@@ -324,3 +324,118 @@ def move_money(
                 "available_cents": to_available,
             },
         }
+
+
+# Groups that never participate in the month reconcile — sinking funds
+# and mechanics, not spending envelopes (Steven, 2026-07-11: "savings
+# doesn't make sense with this"). Reimbursables float negative by design
+# until paid back; CC payment cats are YNAB plumbing.
+RECONCILE_EXCLUDED_GROUPS = frozenset({
+    "Internal Master Category",
+    "Investments / Savings Transfers",
+    "Investments",
+    "Savings",
+    "Annual or Seasonal Costs",
+    "Credit Card Payments",
+    "Reimbursables",
+})
+
+
+def reconcile_overspending(
+    db_path: Path | str,
+    month: str,
+    *,
+    dry_run: bool = True,
+) -> dict:
+    """Settle a month's envelope score in one shot (Steven, 2026-07-11:
+    a "reconcile" button that nets surplus envelopes against negative
+    ones).
+
+    For every SPENDING category with available < 0 in `month`: cover it
+    to $0, funded first by same-group categories with surplus (largest
+    first), then from Ready to Assign for any remainder. Sinking-fund
+    groups (RECONCILE_EXCLUDED_GROUPS) are never touched on either side.
+
+    Returns the move plan; with dry_run=False also applies it via
+    move_money / assign_to_category and audits.
+    """
+    with storage.connect(db_path) as con:
+        rows = con.execute(
+            """SELECT mc.category_id, c.name, g.name AS group_name,
+                      mc.available_cents
+               FROM month_category mc
+               JOIN category c ON c.id = mc.category_id
+               JOIN category_group g ON g.id = c.group_id
+               WHERE mc.month = ? AND c.hidden = 0 AND g.hidden = 0""",
+            (month,),
+        ).fetchall()
+
+    by_group: dict[str, list[dict]] = {}
+    for r in rows:
+        if r["group_name"] in RECONCILE_EXCLUDED_GROUPS:
+            continue
+        by_group.setdefault(r["group_name"], []).append(dict(r))
+
+    moves: list[dict] = []
+    for group_name, cats in sorted(by_group.items()):
+        targets = sorted(
+            (c for c in cats if c["available_cents"] < 0),
+            key=lambda c: c["available_cents"],
+        )
+        sources = sorted(
+            (dict(c) for c in cats if c["available_cents"] > 0),
+            key=lambda c: -c["available_cents"],
+        )
+        for t in targets:
+            need = -t["available_cents"]
+            for s in sources:
+                if need <= 0:
+                    break
+                take = min(s["available_cents"], need)
+                if take <= 0:
+                    continue
+                s["available_cents"] -= take
+                need -= take
+                moves.append({
+                    "from_category_id": s["category_id"],
+                    "from_name": s["name"],
+                    "to_category_id": t["category_id"],
+                    "to_name": t["name"],
+                    "group_name": group_name,
+                    "cents": take,
+                })
+            if need > 0:
+                moves.append({
+                    "from_category_id": None,
+                    "from_name": "Ready to Assign",
+                    "to_category_id": t["category_id"],
+                    "to_name": t["name"],
+                    "group_name": group_name,
+                    "cents": need,
+                })
+
+    rta_cents = sum(m["cents"] for m in moves if m["from_category_id"] is None)
+    covered = sum(m["cents"] for m in moves)
+
+    if not dry_run:
+        for m in moves:
+            if m["from_category_id"] is None:
+                assign_to_category(db_path, month, m["to_category_id"],
+                                   m["cents"])
+            else:
+                move_money(db_path, month,
+                           from_category_id=m["from_category_id"],
+                           to_category_id=m["to_category_id"],
+                           cents=m["cents"])
+        storage.audit(db_path, "reconcile_month", {
+            "month": month, "moves": len(moves),
+            "covered_cents": covered, "from_rta_cents": rta_cents,
+        })
+
+    return {
+        "month": month,
+        "dry_run": dry_run,
+        "moves": moves,
+        "covered_cents": covered,
+        "from_rta_cents": rta_cents,
+    }
