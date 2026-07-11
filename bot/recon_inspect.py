@@ -738,7 +738,7 @@ _SMOOTH_N = 3
 # (pending vs posted), so the smoothed gap still wanders by hundreds of
 # cents without anything actually slipping.
 _SLIP_MIN_CENTS = 500
-_SLIP_MIN_CENTS_CC = 2500
+_SLIP_MIN_CENTS_CC = 10000
 
 
 def _median(xs: list[int]) -> float:
@@ -809,9 +809,23 @@ def balance_walk(db_path: Path | str, days: int = _WALK_DAYS) -> dict[str, Any]:
                 shift = post - pre
                 verdict = "ok"
                 if abs(gap_change) > tol:
-                    verdict = ("slip"
-                               if abs(shift) > max(tol, slip_min)
-                               else "timing")
+                    # A slip must PERSIST at a NEW level: timing noise
+                    # either returns to the pre-window level later, or
+                    # lands back on a level the series already visited
+                    # (bank and ledger recording the same money on
+                    # different days). Only a shift to unexplored
+                    # territory that sticks reads as a lost transaction.
+                    ret_tol = max(tol, slip_min // 2)
+                    returned = any(
+                        abs(g - pre) <= ret_tol for g in gaps[i:]
+                    ) or any(
+                        abs(post - g) <= ret_tol
+                        for g in gaps[:max(0, i - _SMOOTH_N)]
+                    )
+                    verdict = (
+                        "timing"
+                        if returned or abs(shift) <= max(tol, slip_min)
+                        else "slip")
                 windows.append({
                     "from_date": prev["date"],
                     "to_date": cur["date"],

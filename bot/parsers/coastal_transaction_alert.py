@@ -46,8 +46,15 @@ import re
 from datetime import date
 from email.utils import parsedate_to_datetime
 
+# Payee class deliberately wide: the old [A-Za-z\s/] class silently
+# DROPPED any line whose payee contains a digit or punctuation — which
+# turned out to include every paycheck ("O'BRIEN/ATKINS" — apostrophe),
+# "VGI 529 ACH", "COINBASE INC.", "Actalent, Inc.", ITM/POS/Shared-Branch
+# lines. Found 2026-07-11 when the balance walk showed $5,487.49 of Joint
+# transactions the bank had and we didn't. Still requires a leading
+# letter so we never eat into the next "$X.XX" amount.
 TXN_LINE_RE = re.compile(
-    r"\$\s*([\d,]+\.\d{2})\s+([A-Za-z][A-Za-z\s/]*?)(?:\s{2,}|\n|$)",
+    r"\$\s*([\d,]+\.\d{2})\s+([A-Za-z][\w\s/&.,'#*:%-]*?)(?:\s{2,}|\n|$)",
 )
 ACCOUNT_RE = re.compile(
     r"occurred on your\s+([A-Z][A-Z\s]+?)\s+account",
