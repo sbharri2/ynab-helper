@@ -152,6 +152,7 @@ def run_once(settings: Settings) -> dict:
         "ts": _utcnow().isoformat(),
         "pushed": 0,
         "already_synced": 0,
+        "local_only": 0,
         "rewired": 0,
         "no_ynab_match": [],     # (pt_id, payee, amount_cents, date)
         "conflicts": [],         # (pt_id, payee, bot_cat_name, ynab_cat_name)
@@ -204,6 +205,18 @@ def run_once(settings: Settings) -> dict:
         yid = r["ynab_txn_id"] or ""
         bot_cat = r["chosen_category"]
         bot_cat_name = r["bot_cat_name"]
+
+        # App-created category with no YNAB counterpart: nothing to push —
+        # YNAB keeps the txn uncategorized (the bot's budget is the truth,
+        # YNAB is on its way out). Stamp synced so it doesn't retry daily.
+        if not r["ynab_category_id"]:
+            with storage.connect(db_path) as con:
+                con.execute(
+                    "UPDATE pending_txn SET synced_to_ynab_at = ? WHERE id = ?",
+                    (_utcnow(), pt_id),
+                )
+            report["local_only"] += 1
+            continue
 
         # Step 1: resolve to a real YNAB UUID if we don't have one yet
         if yid.startswith("ledger:"):
@@ -305,6 +318,7 @@ def run_once(settings: Settings) -> dict:
     storage.audit(db_path, "ynab_writer_run", {
         "pushed": report["pushed"],
         "already_synced": report["already_synced"],
+        "local_only": report["local_only"],
         "rewired": report["rewired"],
         "no_ynab_match": len(report["no_ynab_match"]),
         "conflicts": len(report["conflicts"]),

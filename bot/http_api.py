@@ -117,7 +117,15 @@ class JobChangeBody(BaseModel):
 
 
 class AskInChatBody(BaseModel):
-    pt_id: int
+    pt_id: int | None = None
+    ledger_txn_id: int | None = None
+
+
+class CategoryCreateBody(BaseModel):
+    name: str
+    group_id: str | None = None       # existing group…
+    new_group_name: str | None = None  # …or create one
+    is_spending: int = 1
 
 
 class YnabPushBody(BaseModel):
@@ -162,23 +170,155 @@ def build_app(settings: Settings) -> FastAPI:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    @app.get("/category_groups", dependencies=[Depends(_require_token)])
+    def category_groups() -> list[dict[str, Any]]:
+        """Unhidden category groups, for the new-category modal's group
+        picker. Excludes the YNAB-internal group (Income lives there)."""
+        with storage.connect(db_path) as con:
+            rows = con.execute(
+                "SELECT id, name FROM category_group "
+                "WHERE hidden = 0 AND name != 'Internal Master Category' "
+                "ORDER BY sort_order, name"
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    @app.post("/category/create", dependencies=[Depends(_require_token)])
+    def category_create(body: CategoryCreateBody) -> dict[str, Any]:
+        """Create a category (and optionally its group) locally.
+
+        The bot's budget is its own truth (YNAB is on its way out), so
+        app-created categories get a local uuid and NO ynab_category_id —
+        ynab_writer counts them as 'local_only' instead of pushing.
+        (Steven, 2026-07-11: add-category + Hobbies group.)
+        """
+        import uuid
+
+        name = (body.name or "").strip()
+        if not name:
+            raise HTTPException(400, "name required")
+        if body.group_id is None and not (body.new_group_name or "").strip():
+            raise HTTPException(400, "group_id or new_group_name required")
+
+        with storage.connect(db_path) as con:
+            dupe = con.execute(
+                "SELECT id FROM category WHERE hidden = 0 "
+                "AND lower(name) = lower(?)", (name,),
+            ).fetchone()
+            if dupe:
+                raise HTTPException(409, f"a category named '{name}' already exists")
+
+            if body.group_id is not None:
+                grp = con.execute(
+                    "SELECT id, name FROM category_group WHERE id = ?",
+                    (body.group_id,),
+                ).fetchone()
+                if not grp:
+                    raise HTTPException(404, "unknown category group")
+                group_id, group_name = grp["id"], grp["name"]
+            else:
+                group_name = body.new_group_name.strip()
+                existing = con.execute(
+                    "SELECT id, name FROM category_group "
+                    "WHERE hidden = 0 AND lower(name) = lower(?)",
+                    (group_name,),
+                ).fetchone()
+                if existing:
+                    group_id, group_name = existing["id"], existing["name"]
+                else:
+                    group_id = f"local-{uuid.uuid4()}"
+                    max_sort = con.execute(
+                        "SELECT COALESCE(MAX(sort_order), 0) AS m "
+                        "FROM category_group"
+                    ).fetchone()["m"]
+                    con.execute(
+                        "INSERT INTO category_group (id, name, sort_order) "
+                        "VALUES (?, ?, ?)",
+                        (group_id, group_name, max_sort + 1),
+                    )
+
+            category_id = f"local-{uuid.uuid4()}"
+            con.execute(
+                "INSERT INTO category (id, group_id, name, is_spending) "
+                "VALUES (?, ?, ?, ?)",
+                (category_id, group_id, name, 1 if body.is_spending else 0),
+            )
+
+        storage.audit(db_path, "ui_category_create", {
+            "category_id": category_id, "name": name,
+            "group_id": group_id, "group_name": group_name,
+        })
+        # Seed this month's month_category row — the Budget grid reads
+        # FROM month_category, so without it the new category is invisible.
+        try:
+            envelope.recompute_month(
+                db_path, datetime.now().strftime("%Y-%m"),
+                category_ids=[category_id])
+        except Exception as e:  # noqa: BLE001
+            log.warning("recompute after category create failed: %s", e)
+        return {"ok": True, "category_id": category_id,
+                "group_id": group_id, "group_name": group_name}
+
     @app.post("/ask_in_chat", dependencies=[Depends(_require_token)])
     def ask_in_chat(body: AskInChatBody) -> dict[str, Any]:
-        """Push one Inbox item to the household group as a ping (question
-        row + Telegram message), so it can be answered per chat. Desktop
-        'Ask in chat' button (Steven, 2026-07-10)."""
+        """Push one item to the household group as a ping (question row +
+        Telegram message), so it can be answered per chat. Desktop 'Ask in
+        chat' button (Steven, 2026-07-10).
+
+        Accepts either a pending_txn id (Inbox rows) or a ledger_txn id
+        (Transactions tab, 2026-07-11). A ledger row is resolved to its
+        pending_txn via ynab_txn_id — or gets a fresh pending row
+        backfilled from the ledger data, the same trick /categorize uses,
+        so the group-reply filing path has something to stamp.
+        """
         from bot.group_chat import post_instant_ping_sync
+        if body.pt_id is None and body.ledger_txn_id is None:
+            raise HTTPException(400, "pt_id or ledger_txn_id required")
+
+        pt_id = body.pt_id
+        if pt_id is None:
+            with storage.connect(db_path) as con:
+                lt = con.execute(
+                    "SELECT id, posted_date, amount_cents, payee, memo, "
+                    "category_id, ynab_txn_id "
+                    "FROM ledger_txn WHERE id = ?",
+                    (body.ledger_txn_id,),
+                ).fetchone()
+                if not lt:
+                    raise HTTPException(404, "unknown ledger_txn")
+                if lt["category_id"]:
+                    raise HTTPException(409, "item is already categorized")
+                yid = lt["ynab_txn_id"] or f"ledger:{lt['id']}"
+                existing_pt = con.execute(
+                    "SELECT id FROM pending_txn WHERE ynab_txn_id = ?",
+                    (yid,),
+                ).fetchone()
+                if existing_pt:
+                    pt_id = existing_pt["id"]
+                else:
+                    cur = con.execute(
+                        "INSERT INTO pending_txn "
+                        "  (user_id, ynab_txn_id, payee, amount_cents, "
+                        "   txn_date, memo, status, queue_lane) "
+                        "VALUES (?, ?, ?, ?, ?, ?, 'pending', 'cold')",
+                        ("steven", yid,
+                         (lt["payee"] or "")[:200],
+                         int(lt["amount_cents"]),
+                         str(lt["posted_date"])[:10],
+                         (lt["memo"] or "")[:500]),
+                    )
+                    pt_id = cur.lastrowid
+
         with storage.connect(db_path) as con:
             pt = con.execute(
                 "SELECT id, status FROM pending_txn WHERE id = ?",
-                (body.pt_id,),
+                (pt_id,),
             ).fetchone()
         if not pt:
             raise HTTPException(404, "unknown pending_txn")
         if pt["status"] not in ("pending", "skipped"):
             raise HTTPException(409, "item is already categorized")
         try:
-            message_id = post_instant_ping_sync(settings, body.pt_id)
+            message_id = post_instant_ping_sync(settings, pt_id)
         except RuntimeError as e:
             raise HTTPException(409, str(e))
         return {"ok": True, "message_id": message_id}
