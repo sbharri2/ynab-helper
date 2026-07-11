@@ -384,6 +384,11 @@ def build_app(settings: Settings) -> FastAPI:
         if body.pt_id is None and body.ledger_txn_id is None:
             raise HTTPException(400, "pt_id or ledger_txn_id required")
 
+        # The ledger row's PRE-change category + posted date drive the
+        # envelope recompute below: recategorizing must refresh the OLD
+        # category too, back to the transaction's month.
+        old_row = None
+
         with storage.connect(db_path) as con:
             cat = con.execute(
                 "SELECT name FROM category WHERE id = ? AND hidden = 0",
@@ -399,6 +404,22 @@ def build_app(settings: Settings) -> FastAPI:
                 ).fetchone()
                 if not pt:
                     raise HTTPException(404, "unknown pending_txn")
+                pre_yid = pt["ynab_txn_id"] or ""
+                if pre_yid.startswith("ledger:"):
+                    try:
+                        old_row = con.execute(
+                            "SELECT category_id, posted_date FROM ledger_txn "
+                            "WHERE id = ?",
+                            (int(pre_yid.split(":", 1)[1]),),
+                        ).fetchone()
+                    except (ValueError, IndexError):
+                        pass
+                elif pre_yid:
+                    old_row = con.execute(
+                        "SELECT category_id, posted_date FROM ledger_txn "
+                        "WHERE ynab_txn_id = ?",
+                        (pre_yid,),
+                    ).fetchone()
                 con.execute(
                     "UPDATE pending_txn SET chosen_category = ?, "
                     "chosen_at = ?, status = 'categorized', "
@@ -433,12 +454,13 @@ def build_app(settings: Settings) -> FastAPI:
             else:
                 lt = con.execute(
                     "SELECT id, posted_date, amount_cents, payee, memo, "
-                    "ynab_txn_id "
+                    "category_id, ynab_txn_id "
                     "FROM ledger_txn WHERE id = ?",
                     (body.ledger_txn_id,),
                 ).fetchone()
                 if not lt:
                     raise HTTPException(404, "unknown ledger_txn")
+                old_row = lt
                 con.execute(
                     "UPDATE ledger_txn SET category_id = ?, "
                     "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
@@ -501,14 +523,29 @@ def build_app(settings: Settings) -> FastAPI:
             "category_id": body.category_id,
             "category_name": cat["name"],
         })
-        # Re-derive envelope state for both old + new month_category in
-        # case the categorize crossed months. Cheap: one category at a
-        # time. Caller can pick the month from posted_date but it's
-        # easier to recompute the current month broadly.
+        # Re-derive envelope state for BOTH old + new category, from the
+        # transaction's month through the current month — available chains
+        # forward, so fixing June must refresh July too (Budget activity
+        # popup recategorizes past months, 2026-07-11). Capped at 24
+        # months of chain for ancient rows.
         try:
-            month_str = datetime.now().strftime("%Y-%m")
-            envelope.recompute_month(db_path, month_str,
-                                       category_ids=[body.category_id])
+            affected = {body.category_id}
+            now = datetime.now()
+            start = now.strftime("%Y-%m")
+            if old_row is not None:
+                if old_row["category_id"]:
+                    affected.add(old_row["category_id"])
+                start = min(start, str(old_row["posted_date"])[:7])
+            months = []
+            y, m = int(start[:4]), int(start[5:7])
+            while (y, m) <= (now.year, now.month):
+                months.append(f"{y:04d}-{m:02d}")
+                m += 1
+                if m > 12:
+                    m, y = 1, y + 1
+            for mo in months[-24:]:
+                envelope.recompute_month(db_path, mo,
+                                         category_ids=sorted(affected))
         except Exception as e:  # noqa: BLE001
             log.warning("recompute after categorize failed: %s", e)
         return {"ok": True}
