@@ -446,11 +446,6 @@ def build_app(settings: Settings) -> FastAPI:
                         (body.category_id, yid),
                     )
                 target = {"pt_id": body.pt_id}
-                # Close any open group-chat question about this item so the
-                # two surfaces agree (redesign-v2 cross-surface rule).
-                from bot.group_chat import resolve_open_questions_for_item
-                resolve_open_questions_for_item(
-                    db_path, "txn", body.pt_id, "steven-desktop")
             else:
                 lt = con.execute(
                     "SELECT id, posted_date, amount_cents, payee, memo, "
@@ -517,6 +512,17 @@ def build_app(settings: Settings) -> FastAPI:
                              _utcnow()),
                         )
                 target = {"ledger_txn_id": body.ledger_txn_id}
+
+        # Close any open group-chat question about this item so the two
+        # surfaces agree (redesign-v2 cross-surface rule). MUST run after
+        # the write transaction commits: it opens its own connection, and
+        # doing that inside the with-block deadlocked on SQLite's write
+        # lock — every desktop pt-path categorize 500'd (found 2026-07-12
+        # filing Knights Play to Golf).
+        if body.pt_id is not None:
+            from bot.group_chat import resolve_open_questions_for_item
+            resolve_open_questions_for_item(
+                db_path, "txn", body.pt_id, "steven-desktop")
 
         storage.audit(db_path, "ui_categorize", {
             **target,
