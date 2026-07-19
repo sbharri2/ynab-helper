@@ -133,6 +133,13 @@ class ReconcileMonthBody(BaseModel):
     dry_run: bool = True      # preview by default; apply needs explicit False
 
 
+class MarkTransferBody(BaseModel):
+    ledger_txn_id: int
+    # Optional: force the counterparty account (needed for one-sided
+    # transfers, e.g. to an off-budget account whose side we never see).
+    counterpart_account_id: str | None = None
+
+
 class YnabPushBody(BaseModel):
     ledger_txn_id: int
 
@@ -555,6 +562,105 @@ def build_app(settings: Settings) -> FastAPI:
         except Exception as e:  # noqa: BLE001
             log.warning("recompute after categorize failed: %s", e)
         return {"ok": True}
+
+    @app.post("/mark_transfer", dependencies=[Depends(_require_token)])
+    def mark_transfer(body: MarkTransferBody) -> dict[str, Any]:
+        """Mark a ledger row as a transfer leg (Steven, 2026-07-19).
+
+        Auto-detects the counterpart: opposite amount in a different
+        account within ±4 days that isn't already a transfer. When found,
+        links BOTH rows (mutual transfer_account_id, category cleared) and
+        retires their pending items + open questions — transfers need no
+        category and no human decision. Without a counterpart row,
+        ``counterpart_account_id`` is required and the row is linked
+        one-sided (off-budget destinations like Marcus).
+        """
+        from bot.group_chat import resolve_open_questions_for_item
+
+        resolved_pts: list[int] = []
+        with storage.connect(db_path) as con:
+            lt = con.execute(
+                "SELECT id, account_id, posted_date, amount_cents, payee, "
+                "transfer_account_id, ynab_txn_id "
+                "FROM ledger_txn WHERE id = ?",
+                (body.ledger_txn_id,),
+            ).fetchone()
+            if not lt:
+                raise HTTPException(404, "unknown ledger_txn")
+            if lt["transfer_account_id"]:
+                raise HTTPException(409, "already marked as a transfer")
+
+            counterpart = con.execute(
+                """SELECT id, account_id FROM ledger_txn
+                   WHERE amount_cents = ? AND account_id != ?
+                     AND transfer_account_id IS NULL AND is_split = 0
+                     AND ABS(julianday(posted_date) - julianday(?)) <= 4
+                     AND (? IS NULL OR account_id = ?)
+                   ORDER BY ABS(julianday(posted_date) - julianday(?))
+                   LIMIT 1""",
+                (-lt["amount_cents"], lt["account_id"], lt["posted_date"],
+                 body.counterpart_account_id, body.counterpart_account_id,
+                 lt["posted_date"]),
+            ).fetchone()
+
+            if counterpart is None and not body.counterpart_account_id:
+                raise HTTPException(
+                    404, "no matching opposite transaction found — pick "
+                         "the counterparty account explicitly")
+
+            other_acct = (counterpart["account_id"] if counterpart
+                          else body.counterpart_account_id)
+            acct_ok = con.execute(
+                "SELECT 1 FROM account WHERE id = ?", (other_acct,),
+            ).fetchone()
+            if not acct_ok:
+                raise HTTPException(404, "unknown counterpart account")
+
+            legs = [(lt["id"], other_acct)]
+            if counterpart:
+                legs.append((counterpart["id"], lt["account_id"]))
+            for leg_id, xfer_acct in legs:
+                real_yid = con.execute(
+                    "SELECT ynab_txn_id FROM ledger_txn WHERE id = ?",
+                    (leg_id,),
+                ).fetchone()["ynab_txn_id"]
+                con.execute(
+                    "UPDATE ledger_txn SET transfer_account_id = ?, "
+                    "category_id = NULL, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?",
+                    (xfer_acct, leg_id),
+                )
+                # Transfer legs need no human decision — retire pendings
+                # (keyed by either the synthetic ledger:N or the real yid).
+                for pt in con.execute(
+                    "SELECT id FROM pending_txn WHERE ynab_txn_id IN (?, ?)",
+                    (f"ledger:{leg_id}", real_yid or ""),
+                ).fetchall():
+                    con.execute(
+                        "UPDATE pending_txn SET status = 'categorized', "
+                        "chosen_category = NULL, filed_by = 'transfer', "
+                        "memo = COALESCE(NULLIF(memo,''),'') || "
+                        "  ' [marked transfer]' WHERE id = ?",
+                        (pt["id"],),
+                    )
+                    resolved_pts.append(pt["id"])
+
+        for pt_id in resolved_pts:
+            resolve_open_questions_for_item(
+                db_path, "txn", pt_id, "steven-desktop")
+        storage.audit(db_path, "ui_mark_transfer", {
+            "ledger_txn_id": body.ledger_txn_id,
+            "counterpart_ledger_txn_id":
+                counterpart["id"] if counterpart else None,
+            "counterpart_account_id": other_acct,
+            "pendings_retired": resolved_pts,
+        })
+        return {
+            "ok": True,
+            "linked_pair": counterpart is not None,
+            "counterpart_ledger_txn_id":
+                counterpart["id"] if counterpart else None,
+        }
 
     @app.post("/envelope/reconcile_month", dependencies=[Depends(_require_token)])
     def envelope_reconcile_month(body: ReconcileMonthBody) -> dict[str, Any]:
