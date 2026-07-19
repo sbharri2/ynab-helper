@@ -91,6 +91,27 @@ def _classify_direction(type_word: str) -> int:
     return 0
 
 
+# Leading direction words to strip from the DISPLAY payee. The sign
+# already encodes direction, and keeping "Deposit " in the payee broke
+# income-source detection, which groups inflows by exact payee: the bank
+# says "Deposit ACH O'BRIEN/ATKINS A" but the known source is
+# "ACH O'BRIEN/ATKINS A", so paychecks showed ⚠ overdue while the money
+# sat right there under a different key (found 2026-07-19). Only strip
+# when a real payee remains after the word — "Check 1234" keeps its
+# prefix rather than becoming a bare number.
+_STRIP_LEADING = ("deposit", "withdrawal")
+
+
+def _display_payee(type_word: str | None) -> str:
+    if not type_word:
+        return "Coastal transaction"
+    words = type_word.split()
+    if (len(words) > 1 and words[0].lower() in _STRIP_LEADING
+            and any(c.isalpha() for c in words[1])):
+        return " ".join(words[1:])[:120]
+    return type_word[:120]
+
+
 def _parse_date_header(s: str) -> date | None:
     if not s:
         return None
@@ -146,8 +167,8 @@ def parse(body: str, *, subject: str = "", date_header: str = "") -> dict:
         missing.append("amount")
     out["type_word"] = primary_type_word
     # Coastal doesn't give us a merchant per se — the type word + remainder
-    # of the line is the closest thing.
-    out["payee"] = (primary_type_word or "Coastal transaction")[:120]
+    # of the line is the closest thing (minus the direction word).
+    out["payee"] = _display_payee(primary_type_word)
     out["merchant"] = primary_type_word
 
     # Additional transaction lines beyond the first. ``bot.ingest`` can
@@ -155,7 +176,7 @@ def parse(body: str, *, subject: str = "", date_header: str = "") -> dict:
     # isn't silently truncated to the first line.
     out["additional_txns"] = [
         {"amount_cents": amt, "type_word": tw,
-         "payee": (tw or "Coastal transaction")[:120],
+         "payee": _display_payee(tw),
          "merchant": tw}
         for (amt, tw) in all_lines[1:]
     ]
