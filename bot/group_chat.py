@@ -421,6 +421,19 @@ async def handle_group_message(
             (msg.chat_id,),
         ).fetchall()
     low_bare = text.lower().strip(".!")
+    # A bare letter answers the most recent lettered-choice prompt
+    # ("kids" → a) .. c), reply "b") without needing a reply-to anchor.
+    if len(low_bare) == 1 and low_bare in _CHOICE_LETTERS:
+        with storage.connect(db_path) as con:
+            choice = con.execute(
+                """SELECT * FROM chat_choice WHERE tg_chat_id = ?
+                   ORDER BY id DESC LIMIT 1""",
+                (msg.chat_id,),
+            ).fetchone()
+        if choice is not None:
+            await _handle_choice_reply(db_path, msg, user, dict(choice),
+                                       settings)
+        return
     looks_like_answer = (
         len(text.split()) <= 4
         and "@" not in text
@@ -479,6 +492,17 @@ async def _handle_question_reply(
         ).fetchone()
     if trip is not None:
         await _handle_trip_reply(db_path, msg, user, dict(trip))
+        return
+    # Lettered-options messages anchor to chat_choice, not question.
+    with storage.connect(db_path) as con:
+        choice = con.execute(
+            """SELECT * FROM chat_choice
+               WHERE tg_chat_id = ? AND message_id = ?
+               ORDER BY id DESC LIMIT 1""",
+            (msg.chat_id, replied_message_id),
+        ).fetchone()
+    if choice is not None:
+        await _handle_choice_reply(db_path, msg, user, dict(choice), settings)
         return
     with storage.connect(db_path) as con:
         q = con.execute(
@@ -569,6 +593,91 @@ def _find_user_word(low: str, known_users: frozenset) -> str | None:
     return None
 
 
+_CHOICE_LETTERS = "abcd"
+
+
+def _close_categories(db_path, text: str, n: int = 4) -> list[dict]:
+    """Categories plausibly meant by `text`: substring hits first, then
+    fuzzy name matches. Returns [{id, name}] with at most n entries."""
+    with storage.connect(db_path) as con:
+        rows = [dict(r) for r in con.execute(
+            "SELECT id, name FROM category WHERE hidden = 0").fetchall()]
+    low = text.lower()
+    subs = [r for r in rows if low in r["name"].lower()]
+    if subs:
+        return subs[:n]
+    by_name = {r["name"]: r for r in rows}
+    close = difflib.get_close_matches(text, list(by_name), n=n, cutoff=0.5)
+    return [by_name[nm] for nm in close]
+
+
+async def _offer_choices(db_path, msg, q: dict, text: str,
+                         options: list[dict]) -> None:
+    """“kids” matched several categories → offer a) .. d), remember the
+    mapping keyed by the options message so a single letter picks one
+    (Steven, 2026-07-19)."""
+    import json
+    lines = [f"“{text}” matches a few categories:"]
+    for letter, o in zip(_CHOICE_LETTERS, options):
+        lines.append(f"  {letter}) {o['name']}")
+    lines.append("Reply with the letter — or the full name, or “skip”.")
+    sent = await msg.reply_text("\n".join(lines))
+    with storage.connect(db_path) as con:
+        con.execute(
+            "INSERT INTO chat_choice "
+            "  (tg_chat_id, message_id, question_id, options_json) "
+            "VALUES (?, ?, ?, ?)",
+            (msg.chat_id, sent.message_id, q["id"],
+             json.dumps(options[:len(_CHOICE_LETTERS)])),
+        )
+
+
+async def _handle_choice_reply(db_path, msg, user: str, choice: dict,
+                               settings) -> None:
+    """A reply to (or bare letter after) a lettered-options message."""
+    import json
+    options = json.loads(choice["options_json"])
+    with storage.connect(db_path) as con:
+        q = con.execute("SELECT * FROM question WHERE id = ?",
+                        (choice["question_id"],)).fetchone()
+    if q is None:
+        return
+    low = (msg.text or "").strip().lower().strip(".!")
+    if len(low) == 1:
+        idx = _CHOICE_LETTERS.find(low)
+        if 0 <= idx < len(options):
+            await _file_and_confirm(db_path, msg, user, dict(q),
+                                    options[idx], low)
+        else:
+            await msg.reply_text(
+                "Pick one of the letters above, or type the full "
+                "category name.")
+        return
+    # Anything longer is a fresh answer against the same item.
+    await _process_answer(db_path, msg, user, dict(q),
+                          (msg.text or "").strip(),
+                          known_users=_known_users(settings))
+
+
+async def _file_and_confirm(db_path, msg, user: str, q: dict, cat: dict,
+                            text: str) -> None:
+    """Shared tail of every filing path: commit, close, audit, confirm."""
+    filed = _file_item(db_path, q, cat["id"], user)
+    if not filed:
+        await msg.reply_text("That item seems to be gone — nothing filed.")
+        _close_question(db_path, q["id"], "resolved_elsewhere", user, text)
+        return
+    _close_question(db_path, q["id"], "answered", user, text)
+    storage.audit(db_path, "group_reply_filed", {
+        "question_id": q["id"], "item_kind": q["item_kind"],
+        "item_id": q["item_id"], "category_id": cat["id"], "by": user,
+    })
+    await msg.reply_text(
+        f"✓ Filed {filed['payee']} ({_fmt_money(filed['amount_cents'])}) "
+        f"→ {cat['name']}"
+    )
+
+
 async def _process_answer(db_path, msg, user: str, q: dict, text: str,
                           known_users: frozenset = frozenset()) -> None:
     """Apply one human answer to one open question. Shared by the reply-to
@@ -581,12 +690,21 @@ async def _process_answer(db_path, msg, user: str, q: dict, text: str,
             "No problem — it stays in the Inbox for later.")
         return
 
-    # Routing, not categorizing: "Allison" / "ask allison" means "this is
-    # hers to file" (Steven, 2026-07-09). Reassign + re-ask addressed to her.
-    target = _routing_target(low, known_users)
-    if target is not None:
-        await _reroute_item(db_path, msg, user, q, target, text)
-        return
+    # A bare member name files to that member's personal-spending
+    # envelope (Steven, 2026-07-19: routing-by-name is retired — typing
+    # "Allison" means "this purchase is hers", i.e. Allison Personal
+    # Savings, not "forward it to her").
+    name_word = low[4:].strip() if low.startswith("ask ") else low
+    if name_word in known_users:
+        with storage.connect(db_path) as con:
+            row = con.execute(
+                "SELECT id, name FROM category WHERE hidden = 0 "
+                "AND LOWER(name) = ?",
+                (f"{name_word} personal savings",),
+            ).fetchone()
+        if row is not None:
+            await _file_and_confirm(db_path, msg, user, q, dict(row), text)
+            return
 
     from bot.agent_tools import _resolve_category
     cat = None
@@ -611,33 +729,21 @@ async def _process_answer(db_path, msg, user: str, q: dict, text: str,
         # "I'm telling you Allison needs to categorize this" — a member's
         # name inside text that isn't a category = route it to them.
         # (Safe ordering: "Allison Personal Savings" already resolved above.)
-        target = _find_user_word(low, known_users)
-        if target is not None:
-            await _reroute_item(db_path, msg, user, q, target, text)
+        # Several plausible categories → lettered options, single-letter
+        # pick (Steven, 2026-07-19). Guard len ≥ 3: one- and two-char
+        # text substring-matches half the category list.
+        options = (_close_categories(db_path, text)
+                   if len(text.strip()) >= 3 else [])
+        if options:
+            await _offer_choices(db_path, msg, q, text, options)
             return
-        hints = _close_category_names(db_path, text)
-        hint_str = (f" Close matches: {', '.join(hints)}." if hints else "")
         await msg.reply_text(
-            f"Couldn't match “{text}” to a category.{hint_str} "
+            f"Couldn't match “{text}” to a category. "
             f"Try the exact name, or say “skip”."
         )
         return
 
-    filed = _file_item(db_path, q, cat["id"], user)
-    if not filed:
-        await msg.reply_text("That item seems to be gone — nothing filed.")
-        _close_question(db_path, q["id"], "resolved_elsewhere", user, text)
-        return
-
-    _close_question(db_path, q["id"], "answered", user, text)
-    storage.audit(db_path, "group_reply_filed", {
-        "question_id": q["id"], "item_kind": q["item_kind"],
-        "item_id": q["item_id"], "category_id": cat["id"], "by": user,
-    })
-    await msg.reply_text(
-        f"✓ Filed {filed['payee']} ({_fmt_money(filed['amount_cents'])}) "
-        f"→ {cat['name']}"
-    )
+    await _file_and_confirm(db_path, msg, user, q, cat, text)
 
 
 async def _reroute_item(db_path, msg, user: str, q: dict,

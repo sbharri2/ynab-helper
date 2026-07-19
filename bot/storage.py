@@ -305,6 +305,20 @@ CREATE INDEX IF NOT EXISTS idx_question_msg
 CREATE INDEX IF NOT EXISTS idx_question_item
   ON question(item_kind, item_id, state);
 
+-- Lettered category choices ("kids" matched several categories → the
+-- bot offers a) .. d); a single-letter reply picks one). Anchored by the
+-- options message id, same pattern as trip confirms (Steven, 2026-07-19).
+CREATE TABLE IF NOT EXISTS chat_choice (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tg_chat_id INTEGER NOT NULL,
+  message_id INTEGER NOT NULL,          -- the bot's lettered message
+  question_id INTEGER NOT NULL REFERENCES question(id),
+  options_json TEXT NOT NULL,           -- [{"id":..,"name":..}, ...]
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_chat_choice_msg
+  ON chat_choice(tg_chat_id, message_id);
+
 -- Suggestions-v2: trip windows (docs/suggestions-v2.md). A lodging charge
 -- (or an explicit "we're traveling until ..." message) opens a candidate
 -- trip; ONE group confirmation arms it. While confirmed, away-from-home
