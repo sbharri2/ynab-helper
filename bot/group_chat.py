@@ -21,6 +21,7 @@ untouched until these are proven — additive cutover.
 from __future__ import annotations
 
 import asyncio
+import difflib
 import logging
 from datetime import datetime, time as dtime
 

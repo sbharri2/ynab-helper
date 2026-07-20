@@ -25,6 +25,7 @@ import asyncio
 import json
 import logging
 import re
+from pathlib import Path
 from datetime import datetime, time as dtime, timedelta, timezone
 
 
@@ -1048,8 +1049,20 @@ async def _handle_telegram_error(
     )
 
     if not is_conflict:
-        # Pass through to default logging — other errors should be loud
-        log.warning("telegram error: %s", err)
+        # Full traceback — the scheduled task discards stdout, so this
+        # rides the WARNING file handler in __main__ to bot_errors.log.
+        log.warning("telegram error: %s", err, exc_info=err)
+        # A swallowed handler exception reads as the bot ignoring a human
+        # (2026-07-20: "Nails" hit a NameError and the group just went
+        # silent). Best-effort: tell the chat something broke.
+        msg = getattr(update, "effective_message", None)
+        if msg is not None:
+            try:
+                await msg.reply_text(
+                    "⚠️ That one hit an internal error — it's logged. "
+                    "Try again, or file it from the app.")
+            except Exception:
+                pass
         return
 
     now = time.time()
@@ -2546,4 +2559,14 @@ def run(settings: Settings | None = None) -> None:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
+    # The scheduled task runs headless — stdout vanishes. Keep WARNING+
+    # (handler tracebacks included) in a file we can actually read.
+    _fh = logging.FileHandler(
+        Path(__file__).resolve().parent.parent / "bot_errors.log",
+        encoding="utf-8",
+    )
+    _fh.setLevel(logging.WARNING)
+    _fh.setFormatter(logging.Formatter(
+        "%(asctime)s %(name)s %(levelname)s %(message)s"))
+    logging.getLogger().addHandler(_fh)
     run()

@@ -133,6 +133,11 @@ class ReconcileMonthBody(BaseModel):
     dry_run: bool = True      # preview by default; apply needs explicit False
 
 
+class TopUpMonthBody(BaseModel):
+    month: str                # "YYYY-MM"
+    dry_run: bool = True      # preview by default; apply needs explicit False
+
+
 class MarkTransferBody(BaseModel):
     ledger_txn_id: int
     # Optional: force the counterparty account (needed for one-sided
@@ -672,6 +677,18 @@ def build_app(settings: Settings) -> FastAPI:
         if not _re.fullmatch(r"\d{4}-\d{2}", body.month):
             raise HTTPException(400, "month must be YYYY-MM")
         return envelope.reconcile_overspending(
+            db_path, body.month, dry_run=body.dry_run)
+
+    @app.post("/envelope/top_up_month", dependencies=[Depends(_require_token)])
+    def envelope_top_up_month(body: TopUpMonthBody) -> dict[str, Any]:
+        """Reduce each spending envelope's budgeted by its positive
+        carryover — the envelope keeps its usual monthly target, the
+        double-funded slack returns to Ready to Assign. Sinking-fund
+        groups excluded (Steven, 2026-07-19)."""
+        import re as _re
+        if not _re.fullmatch(r"\d{4}-\d{2}", body.month):
+            raise HTTPException(400, "month must be YYYY-MM")
+        return envelope.top_up_month(
             db_path, body.month, dry_run=body.dry_run)
 
     @app.post("/envelope/move", dependencies=[Depends(_require_token)])

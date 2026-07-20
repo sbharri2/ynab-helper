@@ -340,6 +340,93 @@ RECONCILE_EXCLUDED_GROUPS = frozenset({
     "Reimbursables",
 })
 
+# Sinking-fund categories that live INSIDE spending groups, so the
+# group-level exclusion can't see them. Their carryover is intentional
+# accumulation — top-up must not drain their assignments. (A per-category
+# "protected" flag in the DB is the eventual home for this list.)
+PROTECTED_CATEGORY_NAMES = frozenset({
+    "vacation",
+    "steven personal savings",
+    "allison personal savings",
+})
+
+
+def top_up_month(
+    db_path: Path | str,
+    month: str,
+    *,
+    dry_run: bool = True,
+) -> dict:
+    """Stop double-funding envelopes that already carried money in
+    (Steven, 2026-07-19: "if 430 rolls over... it should stand to logic
+    that 430 less should be contributed towards the budget in july").
+
+    For every SPENDING category with budgeted > 0 and a positive
+    carryover from the prior month: reduce budgeted to
+    max(0, budgeted - carried). The envelope still holds its usual
+    target for the month (carried + new budgeted == old target); the
+    freed slack returns to Ready to Assign implicitly. Sinking-fund
+    groups (RECONCILE_EXCLUDED_GROUPS) are meant to accumulate and are
+    never touched.
+
+    Returns the reduction plan; with dry_run=False also applies it via
+    assign_to_category and audits.
+    """
+    with storage.connect(db_path) as con:
+        rows = con.execute(
+            """SELECT mc.category_id, c.name, g.name AS group_name,
+                      mc.budgeted_cents, mc.activity_cents,
+                      mc.available_cents
+               FROM month_category mc
+               JOIN category c ON c.id = mc.category_id
+               JOIN category_group g ON g.id = c.group_id
+               WHERE mc.month = ? AND c.hidden = 0 AND g.hidden = 0""",
+            (month,),
+        ).fetchall()
+
+    reductions: list[dict] = []
+    for r in rows:
+        if r["group_name"] in RECONCILE_EXCLUDED_GROUPS:
+            continue
+        if r["name"].strip().lower() in PROTECTED_CATEGORY_NAMES:
+            continue
+        budgeted = int(r["budgeted_cents"])
+        # Envelope identity: available = carried + budgeted + activity,
+        # so the carryover needs no prior-month lookup.
+        carried = (int(r["available_cents"]) - budgeted
+                   - int(r["activity_cents"]))
+        if budgeted <= 0 or carried <= 0:
+            continue
+        new_budgeted = max(0, budgeted - carried)
+        reductions.append({
+            "category_id": r["category_id"],
+            "name": r["name"],
+            "group_name": r["group_name"],
+            "carried_cents": carried,
+            "budgeted_cents": budgeted,
+            "new_budgeted_cents": new_budgeted,
+            "freed_cents": budgeted - new_budgeted,
+        })
+
+    reductions.sort(key=lambda x: -x["freed_cents"])
+    freed = sum(x["freed_cents"] for x in reductions)
+
+    if not dry_run:
+        for x in reductions:
+            assign_to_category(db_path, month, x["category_id"],
+                               -x["freed_cents"])
+        storage.audit(db_path, "top_up_month", {
+            "month": month, "reductions": len(reductions),
+            "freed_cents": freed,
+        })
+
+    return {
+        "month": month,
+        "dry_run": dry_run,
+        "reductions": reductions,
+        "freed_cents": freed,
+    }
+
 
 def reconcile_overspending(
     db_path: Path | str,
