@@ -518,17 +518,26 @@ async def _handle_question_reply(
         # Questions are reminders, not locks (Steven, 2026-07-11):
         # unanswered pings are the NORMAL case, so an old ping keeps
         # accepting answers for as long as its item is still open.
-        # Only refuse when the item itself was already resolved.
-        item_still_open = False
+        item_status = None
         if q["item_kind"] == "txn":
             with storage.connect(db_path) as con:
                 pt = con.execute(
                     "SELECT status FROM pending_txn WHERE id = ?",
                     (q["item_id"],),
                 ).fetchone()
-            item_still_open = (
-                pt is not None and pt["status"] in ("pending", "skipped"))
-        if not item_still_open:
+            item_status = pt["status"] if pt is not None else None
+        if item_status not in ("pending", "skipped"):
+            # Answers aren't locks either ("I input the wrong category
+            # and it's not letting me update it" — Allison, 2026-07-22).
+            # The desktop recategorizes filed txns freely; a reply that
+            # names a category (or a member) supersedes the same way.
+            # Chatter ("thanks", "ok") on a closed ping stays inert.
+            text = (msg.text or "").strip()
+            if item_status == "categorized" and _is_category_shaped(
+                    db_path, text, _known_users(settings)):
+                await _process_answer(db_path, msg, user, dict(q), text,
+                                      known_users=_known_users(settings))
+                return
             await msg.reply_text("Already handled — nothing to do. ✓")
             return
     await _process_answer(db_path, msg, user, dict(q),
@@ -612,6 +621,24 @@ def _close_categories(db_path, text: str, n: int = 4) -> list[dict]:
     return [by_name[nm] for nm in close]
 
 
+def _is_category_shaped(db_path, text: str, known_users: frozenset) -> bool:
+    """Does this reply plausibly name a category (or a member, which
+    files to their personal envelope)? Gates the correction path on
+    already-filed items. Affirmatives are excluded: "y" agrees with a
+    suggestion, and a filed item has nothing left to agree to."""
+    low = text.lower().strip(".!")
+    if (not low or low in _SKIP_WORDS or low in _CHATTER_WORDS
+            or _is_affirmative(low)):
+        return False
+    name_word = low[4:].strip() if low.startswith("ask ") else low
+    if name_word in known_users:
+        return True
+    from bot.agent_tools import _resolve_category
+    if _resolve_category(db_path, text) is not None:
+        return True
+    return len(text.strip()) >= 3 and bool(_close_categories(db_path, text))
+
+
 async def _offer_choices(db_path, msg, q: dict, text: str,
                          options: list[dict]) -> None:
     """“kids” matched several categories → offer a) .. d), remember the
@@ -669,10 +696,29 @@ async def _file_and_confirm(db_path, msg, user: str, q: dict, cat: dict,
         _close_question(db_path, q["id"], "resolved_elsewhere", user, text)
         return
     _close_question(db_path, q["id"], "answered", user, text)
+    prev_cat_id = (filed["chosen_category"]
+                   if filed.get("status") == "categorized" else None)
     storage.audit(db_path, "group_reply_filed", {
         "question_id": q["id"], "item_kind": q["item_kind"],
         "item_id": q["item_id"], "category_id": cat["id"], "by": user,
+        "prev_category_id": prev_cat_id,
     })
+    if prev_cat_id == cat["id"]:
+        await msg.reply_text(
+            f"✓ {filed['payee']} is already filed as {cat['name']} — "
+            f"all set.")
+        return
+    if prev_cat_id is not None:
+        with storage.connect(db_path) as con:
+            old = con.execute("SELECT name FROM category WHERE id = ?",
+                              (prev_cat_id,)).fetchone()
+        old_name = old["name"] if old else "another category"
+        await msg.reply_text(
+            f"✓ Changed {filed['payee']} "
+            f"({_fmt_money(filed['amount_cents'])}): "
+            f"{old_name} → {cat['name']}"
+        )
+        return
     await msg.reply_text(
         f"✓ Filed {filed['payee']} ({_fmt_money(filed['amount_cents'])}) "
         f"→ {cat['name']}"
@@ -810,14 +856,21 @@ def _file_item(db_path, q, category_id: str, user: str) -> dict | None:
         return None  # order questions arrive with the batch feature
     with storage.connect(db_path) as con:
         pt = con.execute(
-            "SELECT id, payee, amount_cents, ynab_txn_id, status "
-            "FROM pending_txn WHERE id = ?", (q["item_id"],),
+            "SELECT id, payee, amount_cents, ynab_txn_id, status, "
+            "chosen_category FROM pending_txn WHERE id = ?",
+            (q["item_id"],),
         ).fetchone()
-        if pt is None or pt["status"] not in ("pending", "skipped"):
+        # 'categorized' is re-fileable: corrections supersede, matching
+        # the desktop /categorize endpoint (which has no status guard).
+        if pt is None or pt["status"] not in ("pending", "skipped",
+                                              "categorized"):
             return None
         con.execute(
+            # synced_to_ynab_at = NULL so the writer re-pushes a
+            # corrected category instead of considering it done.
             "UPDATE pending_txn SET chosen_category = ?, chosen_at = ?, "
-            "status = 'categorized', filed_by = ? WHERE id = ?",
+            "status = 'categorized', filed_by = ?, "
+            "synced_to_ynab_at = NULL WHERE id = ?",
             (category_id, storage._utcnow(), user, pt["id"]),
         )
         yid = pt["ynab_txn_id"] or ""
