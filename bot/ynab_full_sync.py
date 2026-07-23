@@ -30,6 +30,7 @@ Design choices:
 """
 from __future__ import annotations
 
+import html
 import logging
 from datetime import date, timedelta
 from pathlib import Path
@@ -165,8 +166,13 @@ def _upsert_ledger_txn(db_path: Path | str, *, ytx: dict,
     ``'updated'`` and ledger_txn_id is the local row id (needed to attach
     split children).
     """
-    payee = (ytx.get("payee") or "")[:200]
-    memo = (ytx.get("memo") or "")[:500]
+    # YNAB preserves bank-OFX entity escaping ("O&apos;BRIEN",
+    # "Dave &amp; Buster's"); email-captured rows have the real chars.
+    # Unescape here or the same merchant splits into two payee keys —
+    # found 2026-07-23 when the O'BRIEN paycheck source lost its July
+    # deposit and flagged it overdue.
+    payee = html.unescape(ytx.get("payee") or "")[:200]
+    memo = html.unescape(ytx.get("memo") or "")[:500]
     cleared = ytx.get("cleared") or "uncleared"
     txn_date = ytx["txn_date"]
     amount_cents = int(ytx["amount_cents"])

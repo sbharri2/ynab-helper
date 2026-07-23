@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import html
 import re
 import sys
 from datetime import date, datetime, timedelta
@@ -36,7 +37,9 @@ _TRN_RE = re.compile(r"<STMTTRN>(.*?)</STMTTRN>", re.S)
 
 def _tag(block: str, name: str) -> str | None:
     m = re.search(rf"<{name}>([^<\r\n]*)", block)
-    return m.group(1).strip() if m else None
+    # OFX/SGML escapes &amp;/&apos;/&lt;&gt; — unescape or the same
+    # merchant splits into two payee keys vs email-captured rows.
+    return html.unescape(m.group(1).strip()) if m else None
 
 
 def parse_qfx(text: str) -> list[dict]:
