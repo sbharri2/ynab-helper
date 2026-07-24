@@ -484,6 +484,8 @@ def full_sync(settings: Settings, *,
         else:
             updated += 1
 
+    pending_closed = close_stale_pending(db_path)
+
     summary = {
         "since_date": str(since_date) if since_date else None,
         "accounts_refreshed": accounts_refreshed,
@@ -493,10 +495,48 @@ def full_sync(settings: Settings, *,
         "txns_updated": updated,
         "txns_orphan": orphan,
         "split_children": children,
+        "pending_closed": pending_closed,
     }
     storage.audit(db_path, "ynab_full_sync_run", summary)
     log.info("ynab_full_sync: %s", summary)
     return summary
+
+
+def close_stale_pending(db_path) -> int:
+    """Close Inbox rows whose ledger transaction already has a category.
+
+    Several paths write ledger_txn.category_id directly (Amazon
+    auto-bucket, YNAB sync adopting categorized txns) without touching
+    the pending_txn that anchors the Inbox / needs-attention view, so
+    decided transactions kept "needing attention" forever (Steven,
+    2026-07-24: 69 stale rows, some from February). Runs after every
+    full sync as a janitor: any pending/skipped row whose ledger txn is
+    categorized adopts that category and closes.
+    """
+    with storage.connect(db_path) as con:
+        cur = con.execute(
+            """UPDATE pending_txn SET
+                 status = 'categorized',
+                 chosen_category = (
+                   SELECT l.category_id FROM ledger_txn l
+                   WHERE ('ledger:' || l.id = pending_txn.ynab_txn_id
+                          OR l.ynab_txn_id = pending_txn.ynab_txn_id)
+                     AND l.category_id IS NOT NULL
+                   LIMIT 1),
+                 chosen_at = ?,
+                 filed_by = COALESCE(filed_by, 'auto_close')
+               WHERE status IN ('pending', 'skipped')
+                 AND EXISTS (
+                   SELECT 1 FROM ledger_txn l
+                   WHERE ('ledger:' || l.id = pending_txn.ynab_txn_id
+                          OR l.ynab_txn_id = pending_txn.ynab_txn_id)
+                     AND l.category_id IS NOT NULL)""",
+            (storage._utcnow(),),
+        )
+        n = cur.rowcount
+    if n:
+        log.info("closed %d stale pending rows (ledger already categorized)", n)
+    return n
 
 
 if __name__ == "__main__":
