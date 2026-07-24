@@ -409,6 +409,22 @@ def _refresh_account_balances(db_path: Path | str,
                      a["cleared_balance_cents"]),
                 )
                 added += 1
+
+        # Bank ledger is the source of truth (Steven, 2026-07-24):
+        # wherever a fresh bank-observed balance exists (daily Coastal /
+        # Chase / Citi balance-summary emails), it overrides YNAB's
+        # number. YNAB only fills accounts with no bank feed. This makes
+        # every drift/reconciler comparison mean "ledger vs BANK".
+        con.execute(
+            """UPDATE account SET balance_cents = (
+                 SELECT o.balance_cents FROM account_balance_observed o
+                 WHERE o.account_id = account.id
+                 ORDER BY o.as_of_date DESC, o.observed_at DESC LIMIT 1)
+               WHERE EXISTS (
+                 SELECT 1 FROM account_balance_observed o
+                 WHERE o.account_id = account.id
+                   AND o.as_of_date >= date('now', '-3 days'))"""
+        )
     return {"updated": updated, "added": added}
 
 
