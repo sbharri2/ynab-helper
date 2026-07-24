@@ -239,9 +239,16 @@ def q_transactions(
         "JOIN account a ON a.id = t.account_id "
         "LEFT JOIN category c ON c.id = t.category_id "
         "LEFT JOIN account ta ON ta.id = t.transfer_account_id "
-        "LEFT JOIN pending_txn pt "
-        "  ON (pt.ynab_txn_id = t.ynab_txn_id "
-        "      OR pt.ynab_txn_id = 'ledger:' || t.id) "
+        # Exactly ONE pending row per txn: a ledger row can be claimed
+        # by two pts under the two key forms (a coastal 'ledger:<id>' pt
+        # AND a YNAB-uuid pt for the same charge — the nail-spa dupe,
+        # 2026-07-24). Prefer the open one, newest wins.
+        "LEFT JOIN pending_txn pt ON pt.id = ("
+        "  SELECT p2.id FROM pending_txn p2 "
+        "  WHERE p2.ynab_txn_id = t.ynab_txn_id "
+        "     OR p2.ynab_txn_id = 'ledger:' || t.id "
+        "  ORDER BY CASE WHEN p2.status IN ('pending','skipped') "
+        "           THEN 0 ELSE 1 END, p2.id DESC LIMIT 1) "
         "LEFT JOIN category suggested ON suggested.id = pt.suggested_category "
         "WHERE 1=1 "
     )
