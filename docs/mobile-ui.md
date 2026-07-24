@@ -135,3 +135,13 @@ initiated restart.
   `ui_api_tokens.json` (everyone else, `{"<token>": "<username>"}` map —
   currently just Allison). Both are repo-root files, both gitignored, both
   read once at bot startup and merged into one token→username map.
+
+## One-scan onboarding (added 2026-07-24)
+
+Skip manual token pasting: generate a QR encoding
+`https://loft-pc.tailf0edd4.ts.net/#token=<value>` (the fragment never
+reaches the server; TokenGate stores it and scrubs the URL before first
+paint). Scan with the phone camera, then Add to Home Screen. Regenerate
+QRs with `scratchpad make_qrs`-style script after any token rotation.
+Prereq once per tailnet: enable Serve via the link `tailscale serve`
+prints, then run `tailscale serve --bg 127.0.0.1:8765` on the desktop.
