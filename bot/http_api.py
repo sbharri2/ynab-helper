@@ -9,10 +9,14 @@ and the daily ynab_writer all keep working as one coherent system.
 
 Binding:
   * Loopback only — 127.0.0.1:8765 by default.
-  * Token auth via ``X-API-Token`` header. Token comes from the
-    ``YNABHELPER_API_TOKEN`` env var. If unset on first start, we
-    generate one and persist it to ``ui_api_token.txt`` next to the
-    config so the Tauri side can read it without extra plumbing.
+  * Token auth via ``X-API-Token`` header. The legacy single token comes
+    from the ``YNABHELPER_API_TOKEN`` env var, falling back to
+    ``ui_api_token.txt`` next to the config (generated + persisted there
+    on first start) — always identifies as "steven", so the desktop app
+    keeps working unchanged. Additional named per-user tokens (e.g. for
+    Allison's phone) live in ``ui_api_tokens.json``:
+    ``{"<token>": "<username>", ...}``. Writes that stamp ``filed_by``
+    use whichever username the request's token mapped to.
 
 Endpoints:
   * ``GET  /healthz``         — liveness probe
@@ -27,6 +31,7 @@ Endpoints:
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from datetime import datetime, timezone
@@ -41,35 +46,52 @@ from bot.config import Settings
 
 log = logging.getLogger(__name__)
 
-# Where the token gets cached when YNABHELPER_API_TOKEN env var isn't set.
-_TOKEN_FILE = Path(__file__).resolve().parent.parent / "ui_api_token.txt"
+# Repo root — default location for both token files when no token_dir is
+# given (the desktop app's real deployment).
+_DEFAULT_TOKEN_DIR = Path(__file__).resolve().parent.parent
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def _load_or_generate_token() -> str:
+def _load_token_map(token_dir: Path) -> dict[str, str]:
+    """Build the token -> username map for one app instance.
+
+    ``ui_api_token.txt`` is the legacy single-token file (env var
+    ``YNABHELPER_API_TOKEN`` overrides it); it always maps to "steven" so
+    the existing desktop UI keeps working unchanged. ``ui_api_tokens.json``
+    adds named per-user tokens: ``{"<token>": "<username>", ...}`` (e.g. one
+    for Allison's phone).
+    """
+    tokens: dict[str, str] = {}
+
     env = os.environ.get("YNABHELPER_API_TOKEN", "").strip()
+    token_file = token_dir / "ui_api_token.txt"
     if env:
-        return env
-    if _TOKEN_FILE.exists():
-        cached = _TOKEN_FILE.read_text().strip()
+        tokens[env] = "steven"
+    else:
+        cached = token_file.read_text().strip() if token_file.exists() else ""
         if cached:
-            os.environ["YNABHELPER_API_TOKEN"] = cached
-            return cached
-    import secrets as _secrets
-    token = _secrets.token_hex(24)
-    _TOKEN_FILE.write_text(token)
-    os.environ["YNABHELPER_API_TOKEN"] = token
-    log.info("ui_api: generated new token; wrote to %s", _TOKEN_FILE)
-    return token
+            tokens[cached] = "steven"
+        else:
+            import secrets as _secrets
+            generated = _secrets.token_hex(24)
+            token_file.write_text(generated)
+            log.info("ui_api: generated new token; wrote to %s", token_file)
+            tokens[generated] = "steven"
 
+    tokens_json = token_dir / "ui_api_tokens.json"
+    if tokens_json.exists():
+        try:
+            extra = json.loads(tokens_json.read_text())
+        except (OSError, ValueError) as e:
+            log.warning("ui_api: failed to read %s: %s", tokens_json, e)
+        else:
+            if isinstance(extra, dict):
+                tokens.update({str(k): str(v) for k, v in extra.items()})
 
-def _require_token(x_api_token: str = Header(...)) -> None:
-    expected = _load_or_generate_token()
-    if x_api_token != expected:
-        raise HTTPException(status_code=401, detail="bad token")
+    return tokens
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -149,14 +171,27 @@ class YnabPushBody(BaseModel):
     ledger_txn_id: int
 
 
-def build_app(settings: Settings) -> FastAPI:
+def build_app(
+    settings: Settings | None = None,
+    *,
+    db_path: str | Path | None = None,
+    token_dir: str | Path | None = None,
+) -> FastAPI:
     app = FastAPI(
         title="ynabhelper UI API",
         description="Localhost write API for the Tauri desktop UI.",
         version="0.1.0",
     )
-    db_path = settings.paths.database
-    _load_or_generate_token()  # warm cache on startup
+    if db_path is None:
+        db_path = settings.paths.database
+    resolved_token_dir = Path(token_dir) if token_dir is not None else _DEFAULT_TOKEN_DIR
+    tokens = _load_token_map(resolved_token_dir)  # loaded once at build time
+
+    def _require_token(x_api_token: str = Header(...)) -> str:
+        user = tokens.get(x_api_token)
+        if user is None:
+            raise HTTPException(status_code=401, detail="bad token")
+        return user
 
     # ── Routes ────────────────────────────────────────────────────────────
 
@@ -375,8 +410,10 @@ def build_app(settings: Settings) -> FastAPI:
             raise HTTPException(409, str(e))
         return {"ok": True, "message_id": message_id}
 
-    @app.post("/categorize", dependencies=[Depends(_require_token)])
-    def categorize(body: CategorizeBody) -> dict[str, Any]:
+    @app.post("/categorize")
+    def categorize(
+        body: CategorizeBody, user: str = Depends(_require_token)
+    ) -> dict[str, Any]:
         """Set the category on either a pending_txn OR a ledger_txn.
 
         ``pt_id`` path mirrors `_apply_choice` in the Telegram bot:
@@ -435,9 +472,9 @@ def build_app(settings: Settings) -> FastAPI:
                 con.execute(
                     "UPDATE pending_txn SET chosen_category = ?, "
                     "chosen_at = ?, status = 'categorized', "
-                    # Desktop UI writes are Steven acting (his machine).
-                    "filed_by = 'steven' WHERE id = ?",
-                    (body.category_id, _utcnow(), body.pt_id),
+                    # filed_by = whoever's token authenticated this request.
+                    "filed_by = ? WHERE id = ?",
+                    (body.category_id, _utcnow(), user, body.pt_id),
                 )
                 yid = pt["ynab_txn_id"] or ""
                 if yid.startswith("ledger:"):

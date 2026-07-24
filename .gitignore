@@ -56,6 +56,7 @@ __pycache__/
 # Secrets & local-only artifacts (never commit)
 _LOCAL_SECRETS_/
 ui_api_token.txt
+ui_api_tokens.json
 *.bak
 *.pre-move-bak
 
