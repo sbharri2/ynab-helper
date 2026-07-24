@@ -41,7 +41,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-from bot import envelope, storage
+from bot import envelope, storage, webui_queries
 from bot.config import Settings
 
 log = logging.getLogger(__name__)
@@ -53,6 +53,22 @@ _DEFAULT_TOKEN_DIR = Path(__file__).resolve().parent.parent
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _snake(key: str) -> str:
+    """camelCase -> snake_case (e.g. accountId -> account_id).
+
+    Mirrors the SPA's db.ts conventions; keys already snake_case pass
+    through unchanged.
+    """
+    out = []
+    for ch in key:
+        if ch.isupper():
+            out.append("_")
+            out.append(ch.lower())
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 def _load_token_map(token_dir: Path) -> dict[str, str]:
@@ -268,6 +284,21 @@ def build_app(
                 "ORDER BY sort_order, name"
             ).fetchall()
         return [dict(r) for r in rows]
+
+    @app.post("/q/{name}", dependencies=[Depends(_require_token)])
+    def q_dispatch(name: str, body: dict[str, Any] | None = None) -> Any:
+        """Dispatch to a read-only query in ``webui_queries.REGISTRY``.
+
+        Mobile web UI's read path — mirrors the desktop Tauri IPC commands
+        (see ynabhelper-ui/src-tauri/src/commands.rs) over plain HTTP.
+        Body keys may be camelCase (the SPA's db.ts convention) or already
+        snake_case; both are normalized before dispatch.
+        """
+        fn = webui_queries.REGISTRY.get(name)
+        if fn is None:
+            raise HTTPException(404, f"unknown query {name}")
+        args = {_snake(k): v for k, v in (body or {}).items() if v is not None}
+        return fn(db_path, **args)
 
     @app.post("/category/create", dependencies=[Depends(_require_token)])
     def category_create(body: CategoryCreateBody) -> dict[str, Any]:

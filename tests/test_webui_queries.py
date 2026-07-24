@@ -39,3 +39,19 @@ def test_token_identity(tmp_path, fixture_db):
                  headers={"x-api-token": "allison-tok"}).status_code == 200
     assert c.get("/categories",
                  headers={"x-api-token": "wrong"}).status_code == 401
+
+
+def test_registry_q_categories(fixture_db):
+    from bot.webui_queries import REGISTRY
+    rows = REGISTRY["q_categories"](fixture_db)
+    assert rows and {"id", "group_id", "group_name", "name",
+                     "is_spending", "hidden"} <= set(rows[0])
+
+
+def test_q_route(tmp_path, fixture_db):
+    app = make_app(tmp_path, fixture_db)
+    c = TestClient(app)
+    h = {"x-api-token": "legacy-tok"}
+    assert c.post("/q/q_categories", json={}, headers=h).status_code == 200
+    assert c.post("/q/nope", json={}, headers=h).status_code == 404
+    assert c.post("/q/q_categories", json={}).status_code in (401, 422)
