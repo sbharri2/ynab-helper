@@ -687,11 +687,15 @@ def _find_dedupe_match(
     comparing returned amount to the incoming amount.
     """
     with storage.connect(db_path) as con:
+        # Signed comparison: a deposit is NEVER a duplicate of an
+        # equal-sized withdrawal. abs() here silently swallowed the
+        # +$7,000 Marcus deposit whose alert arrived hours after the
+        # -$7,000 transfer-out on the same account/day (2026-07-17).
         row = con.execute(
             """SELECT id, posted_date, amount_cents, payee, memo
                FROM ledger_txn
                WHERE account_id = ?
-                 AND ABS(amount_cents) = ABS(?)
+                 AND amount_cents = ?
                  AND posted_date BETWEEN date(?, ?) AND date(?, ?)
                ORDER BY ABS(julianday(posted_date) - julianday(?)) ASC
                LIMIT 1""",
@@ -735,6 +739,7 @@ def _find_dedupe_match(
                WHERE account_id = ?
                  AND posted_date BETWEEN date(?, ?) AND date(?, ?)
                  AND LOWER(payee) LIKE ?
+                 AND SIGN(amount_cents) = SIGN(?)
                  AND (
                    (ABS(amount_cents) BETWEEN ? AND ?)
                    OR (? BETWEEN ABS(amount_cents) AND CAST(ABS(amount_cents) * 1.4 AS INTEGER))
@@ -746,6 +751,7 @@ def _find_dedupe_match(
              posted_date, f"-{window_days} days",
              posted_date, f"+{window_days} days",
              pattern,
+             amount_cents,             # same direction only
              amt, int(amt * 1.4),     # existing amount within ±40% of new
              amt,                      # new amount within ±40% of existing
              posted_date,
