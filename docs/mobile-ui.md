@@ -78,6 +78,10 @@ since `Copy-Item` only overwrites files that exist in the source `dist/`.
    - **Allison**: `60bf1vhTFLMlgzUAjvVtLIw3J4UJxH6EzcJZwheYrQE` (generated
      2026-07-24, stored in `ui_api_tokens.json` at the repo root as
      `{"<token>": "allison"}`).
+     ⚠ This token is recorded in this repo's git history (this file) —
+     if this repo is ever pushed, shared, or given a remote, rotate the
+     token (regenerate, update `ui_api_tokens.json`, restart the bot)
+     before doing so.
 4. Once the token is accepted, use the browser's "Add to Home Screen" (iOS
    Safari: share sheet → Add to Home Screen; Android Chrome: menu → Add to
    Home screen) so it launches like an app, full-screen, without browser
