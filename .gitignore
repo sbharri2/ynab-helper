@@ -62,3 +62,8 @@ ui_api_tokens.json
 
 # Local agent / editor config
 .claude/
+
+# Built mobile-web SPA bundle (Task 5, 2026-07-24) — deployed by copying
+# the built dist/ here at runtime, never committed.
+webui/*
+!webui/.gitkeep

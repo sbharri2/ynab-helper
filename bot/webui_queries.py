@@ -737,6 +737,18 @@ def q_ready_to_assign(db_path: str, month: str, **_: Any) -> dict[str, Any]:
     }
 
 
+def q_seasonal_funds(db_path: str, **_: Any) -> list[dict[str, Any]]:
+    """Stub — deliberate MVP degradation (2026-07-24, Task 5).
+
+    The Seasonal panel (sinking-fund envelopes like holiday/travel) has no
+    mobile-web port yet; it isn't reachable from the mobile nav. Returning
+    an empty list keeps `/q/q_seasonal_funds` callable (and the desktop-
+    shared Budget page's optional seasonal section tolerant of no data)
+    without porting the full desktop commands.rs logic in this pass.
+    """
+    return []
+
+
 REGISTRY: dict[str, Callable[..., Any]] = {
     "q_categories": q_categories,
     "q_category_groups": q_category_groups,
@@ -748,4 +760,5 @@ REGISTRY: dict[str, Callable[..., Any]] = {
     "q_inbox": q_inbox,
     "q_income_sources": q_income_sources,
     "q_ready_to_assign": q_ready_to_assign,
+    "q_seasonal_funds": q_seasonal_funds,
 }

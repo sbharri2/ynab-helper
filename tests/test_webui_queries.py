@@ -27,7 +27,8 @@ def make_app(tmp_path, db_path):
     (tmp_path / "ui_api_tokens.json").write_text(
         json.dumps({"allison-tok": "allison"}))
     from bot import http_api
-    return http_api.build_app(db_path=db_path, token_dir=tmp_path)
+    return http_api.build_app(db_path=db_path, token_dir=tmp_path,
+                               webui_dir=tmp_path / "webui")
 
 
 def test_token_identity(tmp_path, fixture_db):
@@ -148,6 +149,47 @@ def test_rta_matches_identity(fixture_db):
          if p["source_payee"] == "ACH O'BRIEN/ATKINS A"]
     assert "2026-07-14" in " ".join(
         (p.get("actual_date") or p["expected_date"]) for p in rta["paychecks"])
+
+
+def test_q_seasonal_funds_stub(fixture_db):
+    from bot.webui_queries import REGISTRY
+    assert REGISTRY["q_seasonal_funds"](fixture_db) == []
+
+
+def test_spa_serving(tmp_path, fixture_db):
+    from fastapi.testclient import TestClient
+    app = make_app(tmp_path, fixture_db)
+    (tmp_path / "webui").mkdir()
+    (tmp_path / "webui" / "index.html").write_text("<html>hb</html>")
+    c = TestClient(app)
+    assert c.get("/").text == "<html>hb</html>"
+    assert c.get("/budget").text == "<html>hb</html>"      # SPA fallback
+    assert c.post("/q/q_seasonal_funds", json={},
+                  headers={"x-api-token": "legacy-tok"}).json() == []
+
+
+def test_spa_serving_missing_bundle_404s(tmp_path, fixture_db):
+    """No webui/index.html at all (bundle never deployed) -> a helpful 404,
+    not a crash."""
+    from fastapi.testclient import TestClient
+    app = make_app(tmp_path, fixture_db)
+    c = TestClient(app)
+    resp = c.get("/")
+    assert resp.status_code == 404
+    assert "webui bundle not deployed" in resp.json()["detail"]
+
+
+def test_spa_fallback_404s_for_unknown_api_prefix(tmp_path, fixture_db):
+    """A path under a real API prefix that isn't a real route (e.g. a typo)
+    must 404, never fall through to index.html."""
+    from fastapi.testclient import TestClient
+    app = make_app(tmp_path, fixture_db)
+    (tmp_path / "webui").mkdir()
+    (tmp_path / "webui" / "index.html").write_text("<html>hb</html>")
+    c = TestClient(app)
+    resp = c.get("/q/nonexistent-path")
+    assert resp.status_code == 404
+    assert resp.text != "<html>hb</html>"
 
 
 def test_q_transactions_camelcase_body_filters(tmp_path, fixture_db):

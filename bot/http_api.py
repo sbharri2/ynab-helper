@@ -28,6 +28,11 @@ Endpoints:
                                  category-month
   * ``GET  /categories``      — return all spending + non-spending
                                  categories (for the picker)
+  * ``POST /q/{name}``        — dispatch a read-only query for the mobile
+                                 web UI (see ``webui_queries.REGISTRY``)
+  * ``GET  /assets/*``        — static mount for the built SPA bundle
+  * ``GET  /{path}``          — SPA fallback (serves webui/index.html);
+                                 both unauthenticated, the bundle isn't secret
 """
 from __future__ import annotations
 
@@ -39,6 +44,8 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from bot import envelope, storage, webui_queries
@@ -47,8 +54,10 @@ from bot.config import Settings
 log = logging.getLogger(__name__)
 
 # Repo root — default location for both token files when no token_dir is
-# given (the desktop app's real deployment).
+# given (the desktop app's real deployment), and default parent of the
+# built mobile-web SPA bundle (see webui_dir below).
 _DEFAULT_TOKEN_DIR = Path(__file__).resolve().parent.parent
+_DEFAULT_WEBUI_DIR = _DEFAULT_TOKEN_DIR / "webui"
 
 
 def _utcnow() -> datetime:
@@ -192,6 +201,7 @@ def build_app(
     *,
     db_path: str | Path | None = None,
     token_dir: str | Path | None = None,
+    webui_dir: str | Path | None = None,
 ) -> FastAPI:
     app = FastAPI(
         title="ynabhelper UI API",
@@ -202,6 +212,8 @@ def build_app(
         db_path = settings.paths.database
     resolved_token_dir = Path(token_dir) if token_dir is not None else _DEFAULT_TOKEN_DIR
     tokens = _load_token_map(resolved_token_dir)  # loaded once at build time
+    resolved_webui_dir = Path(webui_dir) if webui_dir is not None else _DEFAULT_WEBUI_DIR
+    webui_index = resolved_webui_dir / "index.html"
 
     def _require_token(x_api_token: str = Header(...)) -> str:
         user = tokens.get(x_api_token)
@@ -1082,6 +1094,69 @@ def build_app(
             "ledger_txn_id": row["id"], "ynab_txn_id": created["id"],
         })
         return {"ok": True, "ynab_txn_id": created["id"]}
+
+    # ── Mobile web UI: static SPA bundle ────────────────────────────────────
+    #
+    # Unauthenticated on purpose — the built JS/CSS/HTML bundle isn't secret
+    # (every data route it calls still goes through _require_token). Mounting
+    # StaticFiles on a directory that doesn't exist raises at mount time, so
+    # only mount /assets when the built bundle is actually present; tests
+    # (and a bot not yet paired with a UI build) only ever create index.html.
+    assets_dir = resolved_webui_dir / "assets"
+    if assets_dir.is_dir():
+        app.mount("/assets", StaticFiles(directory=str(assets_dir)),
+                  name="webui-assets")
+
+    # Every registered API route's path, split into segments, collected
+    # BEFORE the catch-all below is registered. SPA client-side routes are
+    # single-segment (/budget, /transactions, ...) while every real API
+    # route here has a distinctive multi-segment or exact single-segment
+    # shape (/q/{name}, /budget/set, /categories, /healthz, ...) — matching
+    # on segment COUNT + static segments (not just the first segment) is
+    # what lets "/budget" fall through to the SPA while "/budget/set" and
+    # "/q/anything" still 404 instead of silently serving index.html.
+    # Computed from app.routes rather than hardcoded so it can't drift out
+    # of sync with the routes actually registered above.
+    _api_route_shapes: list[list[str]] = [
+        [seg for seg in r.path.strip("/").split("/") if seg]
+        for r in app.routes if getattr(r, "path", None)
+    ]
+
+    def _matches_known_api_shape(full_path: str) -> bool:
+        req_segs = [seg for seg in full_path.strip("/").split("/") if seg]
+        if not req_segs:
+            return False
+        for shape in _api_route_shapes:
+            if len(shape) != len(req_segs):
+                continue
+            if all(
+                a == b or (a.startswith("{") and a.endswith("}"))
+                for a, b in zip(shape, req_segs)
+            ):
+                return True
+        return False
+
+    @app.get("/{full_path:path}")
+    def spa_fallback(full_path: str) -> FileResponse:
+        """Serve the SPA's index.html for every non-API GET (client-side
+        routing — /budget, /transactions, etc. all resolve to the same
+        bundle). Registered LAST: FastAPI/Starlette matches routes in
+        registration order, and every API route above (including the
+        auto-generated /docs, /openapi.json) was added earlier, so this
+        catch-all only ever sees paths nothing else claimed — the shape
+        check below is just a second guard so a mistyped/removed API path
+        (e.g. GET /q/nonexistent, wrong method on /budget/set) 404s instead
+        of silently rendering the SPA shell.
+        """
+        if _matches_known_api_shape(full_path):
+            raise HTTPException(404, "not found")
+        if not webui_index.exists():
+            raise HTTPException(
+                404,
+                f"webui bundle not deployed — build the SPA and copy "
+                f"dist/ to {resolved_webui_dir}",
+            )
+        return FileResponse(webui_index)
 
     return app
 
