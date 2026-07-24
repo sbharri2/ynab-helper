@@ -4,8 +4,11 @@
 real data without ever touching the live file (bot stays the single
 writer — see feedback_bulk_db_ops_on_gdrive / project_db_on_gdrive memory).
 """
+import datetime as _dt
 import json
+import re
 import shutil
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -133,12 +136,34 @@ def test_q_inbox_shape(fixture_db):
 
 
 def test_income_sources_golden(fixture_db):
+    """Structural, not date-pinned: `last_seen` moves forward with every
+    real paycheck, and even a genuinely-biweekly payee can classify as
+    "semi-monthly" some months depending on where its dates land in the
+    calendar (see the cadence heuristic in q_income_sources) — so this
+    only asserts shape-stable properties, not values that age out."""
     from bot.webui_queries import REGISTRY
     srcs = {s["payee_key"]: s for s in REGISTRY["q_income_sources"](fixture_db)}
-    assert "ACH O'BRIEN/ATKINS A" in srcs
-    assert srcs["ACH O'BRIEN/ATKINS A"]["last_seen"] == "2026-07-14"
-    assert "ACH ACTALENT, INC." in srcs          # manual weekly override
-    assert srcs["ACH ACTALENT, INC."]["cadence"] == "weekly"
+
+    obrien_key = "ACH O'BRIEN/ATKINS A"
+    assert obrien_key in srcs
+    assert srcs[obrien_key]["cadence"] in ("biweekly", "semi-monthly")
+    assert re.match(r"^\d{4}-\d{2}-\d{2}$", srcs[obrien_key]["last_seen"])
+    assert srcs[obrien_key]["last_seen"] <= _dt.date.today().isoformat()
+
+    # Actalent is a manual override, not auto-detected — derive the
+    # expectation from the fixture's own override table rather than
+    # hardcoding a cadence that a future override edit could change.
+    con = sqlite3.connect(fixture_db)
+    con.row_factory = sqlite3.Row
+    override = con.execute(
+        "SELECT cadence FROM income_source_override "
+        "WHERE payee_key = ? AND status = 'active'",
+        ("ACH ACTALENT, INC.",),
+    ).fetchone()
+    con.close()
+    if override is not None:
+        assert "ACH ACTALENT, INC." in srcs
+        assert srcs["ACH ACTALENT, INC."]["cadence"] == override["cadence"]
 
 
 def test_rta_matches_identity(fixture_db):
@@ -214,3 +239,56 @@ def test_q_transactions_camelcase_body_filters(tmp_path, fixture_db):
     rows = resp.json()
     assert rows
     assert all(r["account_id"] == target_account_id for r in rows)
+
+
+def test_categorize_stamps_filed_by_per_token(tmp_path, fixture_db):
+    """POST /categorize must stamp pending_txn.filed_by with the username
+    the AUTHENTICATING TOKEN maps to (per-user attribution), not a
+    hardcoded "steven" — proves the token->user wiring added for the
+    mobile web UI actually reaches the write path."""
+    app = make_app(tmp_path, fixture_db)
+    c = TestClient(app)
+
+    con = sqlite3.connect(fixture_db)
+    con.row_factory = sqlite3.Row
+    row = con.execute(
+        "SELECT id FROM pending_txn WHERE status IN ('pending', 'skipped') "
+        "LIMIT 1"
+    ).fetchone()
+    if row is None:
+        # Fixture had nothing pending/skipped (unlikely but possible on a
+        # freshly-cleared inbox) — insert a minimal synthetic row into the
+        # FIXTURE db (never the live one) so the test still exercises the
+        # real write path.
+        con.execute(
+            "INSERT INTO pending_txn "
+            "  (user_id, ynab_txn_id, payee, amount_cents, txn_date, status) "
+            "VALUES ('steven', 'synthetic-filed-by-test', 'Test Payee', "
+            "        -1234, '2026-07-01', 'pending')"
+        )
+        con.commit()
+        row = con.execute(
+            "SELECT id FROM pending_txn WHERE ynab_txn_id = "
+            "'synthetic-filed-by-test'"
+        ).fetchone()
+    pt_id = row["id"]
+
+    cat = con.execute(
+        "SELECT id FROM category WHERE hidden = 0 LIMIT 1"
+    ).fetchone()
+    cat_id = cat["id"]
+    con.close()
+
+    resp = c.post(
+        "/categorize",
+        json={"pt_id": pt_id, "category_id": cat_id},
+        headers={"x-api-token": "allison-tok"},
+    )
+    assert resp.status_code == 200
+
+    con2 = sqlite3.connect(fixture_db)
+    filed_by = con2.execute(
+        "SELECT filed_by FROM pending_txn WHERE id = ?", (pt_id,)
+    ).fetchone()[0]
+    con2.close()
+    assert filed_by == "allison"
