@@ -9,6 +9,7 @@ exactly (both surfaces share one shape).
 from __future__ import annotations
 
 import datetime as _dt
+import math
 from typing import Any, Callable
 
 from bot import storage
@@ -303,6 +304,439 @@ def q_inbox(db_path: str, **_: Any) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+def _is_calendar_semi_monthly(dates: list[_dt.date]) -> bool:
+    """Port of commands.rs:1916 `is_calendar_semi_monthly` — distinguishes
+    calendar-anchored semi-monthly pay (~15th + ~end of month) from true
+    biweekly (every 14 days, drifts across the calendar) when both produce
+    similar median gaps. Requires >=6 dates (>=5 gaps) for stability."""
+    if len(dates) < 6:
+        return False
+    has_early = any(d.day <= 18 for d in dates)
+    has_late = any(d.day >= 17 for d in dates)
+    if not (has_early and has_late):
+        return False
+    gaps = sorted((dates[i] - dates[i - 1]).days for i in range(1, len(dates)))
+    gaps.pop()  # drop the single largest gap (weekend/holiday shift)
+    if not gaps:
+        return False
+    spread = max(gaps) - min(gaps)
+    return spread >= 3
+
+
+def _next_predicted_date(
+    prev: _dt.date, cadence: str, median_delta_days: int,
+) -> _dt.date:
+    """Port of commands.rs:1944 `next_predicted_date`. Advances `prev` by
+    one cycle of `cadence`: semi-monthly jumps to the opposite calendar
+    half (29th / 15th, clamped to month-end), monthly keeps the same
+    day-of-month (clamped to month-end), everything else falls back to
+    +median_delta_days."""
+    if cadence == "semi-monthly":
+        day = prev.day
+        if day <= 18:
+            y, m = prev.year, prev.month
+            try:
+                return _dt.date(y, m, 29)
+            except ValueError:
+                next_first = (
+                    _dt.date(y + 1, 1, 1) if m == 12
+                    else _dt.date(y, m + 1, 1)
+                )
+                return next_first - _dt.timedelta(days=1)
+        else:
+            y, m = (prev.year + 1, 1) if prev.month == 12 else (prev.year, prev.month + 1)
+            return _dt.date(y, m, 15)
+    elif cadence == "monthly":
+        y, m = (prev.year + 1, 1) if prev.month == 12 else (prev.year, prev.month + 1)
+        day = prev.day
+        try:
+            return _dt.date(y, m, day)
+        except ValueError:
+            next_first = (
+                _dt.date(y + 1, 1, 1) if m == 12
+                else _dt.date(y, m + 1, 1)
+            )
+            return next_first - _dt.timedelta(days=1)
+    else:
+        return prev + _dt.timedelta(days=median_delta_days)
+
+
+def q_income_sources(db_path: str, **_: Any) -> list[dict[str, Any]]:
+    """Auto-detect recurring income sources from the last 6 months of
+    inflows, then merge in `income_source_override` rows — port of
+    commands.rs:2018 (`IncomeSource[]`). See the Rust docstring for the
+    full algorithm (6-month grouping -> cv/median/cadence filter -> 5%
+    dedupe -> manual override merge with retired-key filtering)."""
+    with storage.connect(db_path) as con:
+        rows = con.execute(
+            "SELECT "
+            "  UPPER(TRIM(COALESCE(payee, '(no payee)'))) AS payee_key, "
+            "  COALESCE(payee, '(no payee)') AS display, "
+            "  COUNT(*) AS n, "
+            "  MIN(posted_date) AS first_seen, "
+            "  MAX(posted_date) AS last_seen, "
+            "  GROUP_CONCAT(amount_cents, ',') AS amounts, "
+            "  GROUP_CONCAT(posted_date, ',') AS dates "
+            "FROM ledger_txn "
+            "WHERE amount_cents > 0 "
+            "  AND posted_date >= date('now', '-6 months') "
+            "  AND parent_txn_id IS NULL "
+            "  AND (payee IS NULL OR payee NOT LIKE 'Transfer :%') "
+            "  AND transfer_account_id IS NULL "
+            "  AND account_id IN (SELECT id FROM account WHERE on_budget = 1) "
+            "GROUP BY payee_key "
+            "HAVING n >= 3"
+        ).fetchall()
+        override_rows = con.execute(
+            "SELECT payee_key, status, display_name, expected_amount_cents, "
+            "  cadence, first_expected_date, median_delta_days "
+            "FROM income_source_override"
+        ).fetchall()
+
+    candidates: list[dict[str, Any]] = []
+    for r in rows:
+        amounts = sorted(
+            int(x) for x in (r["amounts"] or "").split(",") if x != ""
+        )
+        if not amounts:
+            continue
+        median = amounts[len(amounts) // 2]
+        if median < 50_000:  # skip < $500
+            continue
+        mean = sum(amounts) / len(amounts)
+        variance = sum((a - mean) ** 2 for a in amounts) / len(amounts)
+        cv = (math.sqrt(variance) / mean) if mean > 0 else 1.0
+        if cv > 0.20:
+            continue
+        last_amount = amounts[-1]  # NB: max of amounts, not most-recent by
+                                    # date — this mislabeling is in the Rust
+                                    # source too; ported as-is.
+
+        dates: list[_dt.date] = []
+        for s in (r["dates"] or "").split(","):
+            try:
+                dates.append(_dt.datetime.strptime(s, "%Y-%m-%d").date())
+            except ValueError:
+                continue
+        dates.sort()
+        deltas = sorted(
+            (dates[i] - dates[i - 1]).days for i in range(1, len(dates))
+        )
+        median_delta = deltas[len(deltas) // 2] if deltas else 30
+
+        if 13 <= median_delta <= 15:
+            cadence = (
+                "semi-monthly" if _is_calendar_semi_monthly(dates)
+                else "biweekly"
+            )
+        elif 16 <= median_delta <= 17:
+            cadence = "semi-monthly"
+        elif 28 <= median_delta <= 32:
+            cadence = "monthly"
+        else:
+            continue
+
+        candidates.append({
+            "key": r["payee_key"],
+            "display": r["display"],
+            "median": median,
+            "last_amount": last_amount,
+            "n": r["n"],
+            "cadence": cadence,
+            "median_delta": median_delta,
+            "last_seen": r["last_seen"],
+        })
+
+    # Dedupe: walk most-recent-first, drop anything within 5% of a median
+    # already kept (handles the CC-alert-vs-YNAB-payee duplication).
+    candidates.sort(key=lambda c: c["last_seen"], reverse=True)
+    kept: list[dict[str, Any]] = []
+    for cand in candidates:
+        is_dup = any(
+            abs(cand["median"] - k["median"]) / max(k["median"], 1) < 0.05
+            for k in kept
+        )
+        if not is_dup:
+            kept.append(cand)
+
+    today = _dt.date.today()
+    out: list[dict[str, Any]] = []
+    for c in kept:
+        try:
+            last = _dt.datetime.strptime(c["last_seen"], "%Y-%m-%d").date()
+        except ValueError:
+            last = today
+        expected_next = last + _dt.timedelta(days=c["median_delta"])
+        out.append({
+            "payee_key": c["key"],
+            "display_payee": c["display"],
+            "median_cents": c["median"],
+            "occurrences": c["n"],
+            "cadence": c["cadence"],
+            "median_delta_days": c["median_delta"],
+            "last_seen": c["last_seen"],
+            "last_amount_cents": c["last_amount"],
+            "expected_next": expected_next.strftime("%Y-%m-%d"),
+        })
+
+    # Apply manual overrides: filter retired auto-detected keys, append
+    # active manual entries not already auto-detected.
+    retired: set[str] = set()
+    manual_active: list[dict[str, Any]] = []
+    for r in override_rows:
+        key = r["payee_key"]
+        status = r["status"]
+        if status == "retired":
+            retired.add(key)
+        elif status == "active":
+            if any(s["payee_key"] == key for s in out):
+                continue
+            display = r["display_name"]
+            display_payee = display if display is not None else key
+            median = (
+                r["expected_amount_cents"]
+                if r["expected_amount_cents"] is not None else 0
+            )
+            median_delta = (
+                r["median_delta_days"]
+                if r["median_delta_days"] is not None else 14
+            )
+            first_date = r["first_expected_date"]
+            # posted/DATE columns come back as `date` objects via the
+            # storage layer's PARSE_DECLTYPES converter, not strings.
+            first_date_s = (
+                first_date.strftime("%Y-%m-%d")
+                if isinstance(first_date, _dt.date) else first_date
+            )
+            last_seen = (
+                first_date_s if first_date_s is not None
+                else today.strftime("%Y-%m-%d")
+            )
+            expected_next = first_date_s if first_date_s is not None else last_seen
+            cadence = r["cadence"] if r["cadence"] is not None else "monthly"
+            manual_active.append({
+                "payee_key": key,
+                "display_payee": display_payee,
+                "median_cents": median,
+                "occurrences": 0,
+                "cadence": cadence,
+                "median_delta_days": median_delta,
+                "last_seen": last_seen,
+                "last_amount_cents": median,
+                "expected_next": expected_next,
+            })
+
+    out = [s for s in out if s["payee_key"] not in retired]
+    out.extend(manual_active)
+    return out
+
+
+def q_ready_to_assign(db_path: str, month: str, **_: Any) -> dict[str, Any]:
+    """Ready-to-Assign for one month — port of commands.rs:2237
+    (`ReadyToAssign`). Predicts each detected income source's hits in the
+    month, matches actual inflows within +/-3 days, surfaces unmatched
+    in-month actuals for a known source as "received" rows (2026-07-24
+    fix), sums misc/assigned, and computes the cash-anchored RTA plus the
+    in-flight transfer-leg detector."""
+    sources = q_income_sources(db_path)
+    today = _dt.date.today()
+    month_start = _dt.datetime.strptime(f"{month}-01", "%Y-%m-%d").date()
+    if month_start.month == 12:
+        month_end = _dt.date(month_start.year + 1, 1, 1)
+    else:
+        month_end = _dt.date(month_start.year, month_start.month + 1, 1)
+    month_start_s = month_start.strftime("%Y-%m-%d")
+    month_end_s = month_end.strftime("%Y-%m-%d")
+
+    with storage.connect(db_path) as con:
+        actual_rows = con.execute(
+            "SELECT "
+            "  UPPER(TRIM(COALESCE(payee, '(no payee)'))) AS payee_key, "
+            "  posted_date, amount_cents "
+            "FROM ledger_txn "
+            "WHERE amount_cents > 0 "
+            "  AND posted_date >= ? AND posted_date < ? "
+            "  AND parent_txn_id IS NULL "
+            "  AND (payee IS NULL OR payee NOT LIKE 'Transfer :%') "
+            "  AND transfer_account_id IS NULL "
+            "  AND account_id IN (SELECT id FROM account WHERE on_budget = 1)",
+            (month_start_s, month_end_s),
+        ).fetchall()
+
+        assigned_row = con.execute(
+            "SELECT COALESCE(SUM(mc.budgeted_cents), 0) "
+            "FROM month_category mc "
+            "JOIN category c ON c.id = mc.category_id "
+            "JOIN category_group g ON g.id = c.group_id "
+            "WHERE mc.month = ? AND g.name != 'Internal Master Category'",
+            (month,),
+        ).fetchone()
+        assigned_cents = assigned_row[0] if assigned_row[0] is not None else 0
+
+        cash_row = con.execute(
+            "SELECT COALESCE(SUM(lt.amount_cents), 0) "
+            "FROM ledger_txn lt "
+            "JOIN account a ON a.id = lt.account_id "
+            "WHERE a.on_budget = 1 AND a.closed = 0 AND lt.is_split = 0"
+        ).fetchone()
+        cash_cents = cash_row[0] if cash_row[0] is not None else 0
+
+        available_row = con.execute(
+            "SELECT COALESCE(SUM(mc.available_cents), 0) "
+            "FROM month_category mc "
+            "JOIN category c ON c.id = mc.category_id "
+            "JOIN category_group g ON g.id = c.group_id "
+            "WHERE mc.month = ? AND g.name != 'Internal Master Category'",
+            (month,),
+        ).fetchone()
+        available_cents = available_row[0] if available_row[0] is not None else 0
+
+        in_flight_row = con.execute(
+            "SELECT COALESCE(SUM(-lt.amount_cents), 0) "
+            "FROM ledger_txn lt "
+            "JOIN account a  ON a.id  = lt.account_id "
+            "JOIN account a2 ON a2.id = lt.transfer_account_id "
+            "WHERE a.on_budget = 1 AND a.closed = 0 "
+            "  AND a2.on_budget = 1 AND a2.closed = 0 "
+            "  AND lt.is_split = 0 "
+            "  AND lt.posted_date >= date('now', '-10 days') "
+            "  AND NOT EXISTS ( "
+            "    SELECT 1 FROM ledger_txn m "
+            "    WHERE m.account_id = lt.transfer_account_id "
+            "      AND m.amount_cents = -lt.amount_cents "
+            "      AND m.is_split = 0 "
+            "      AND ABS(julianday(m.posted_date) - julianday(lt.posted_date)) <= 5 "
+            "  )"
+        ).fetchone()
+        in_flight_cents = in_flight_row[0] if in_flight_row[0] is not None else 0
+
+    actuals_by_key: dict[str, list[tuple[_dt.date, int]]] = {}
+    for r in actual_rows:
+        d = r["posted_date"]
+        if isinstance(d, str):
+            try:
+                d = _dt.datetime.strptime(d, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+        elif not isinstance(d, _dt.date):
+            continue
+        actuals_by_key.setdefault(r["payee_key"], []).append((d, r["amount_cents"]))
+
+    paychecks: list[dict[str, Any]] = []
+    any_overdue = False
+    total_paycheck_cents = 0
+    matched_actuals: set[tuple[str, str]] = set()
+
+    for src in sources:
+        src_rows_start = len(paychecks)
+        cadence = src["cadence"]
+        median_delta_days = src["median_delta_days"]
+        try:
+            last = _dt.datetime.strptime(src["last_seen"], "%Y-%m-%d").date()
+        except ValueError:
+            last = today
+        cursor = last
+
+        # Walk forward until we land at/past the month's start.
+        while True:
+            nxt = _next_predicted_date(cursor, cadence, median_delta_days)
+            if nxt >= month_start:
+                break
+            cursor = nxt
+
+        # Step forward through the month, recording predicted hits.
+        while True:
+            cursor = _next_predicted_date(cursor, cadence, median_delta_days)
+            if cursor >= month_end:
+                break
+            if cursor < month_start:
+                continue
+
+            actuals = actuals_by_key.get(src["payee_key"])
+            actual_match = None
+            if actuals:
+                for d, c in actuals:
+                    if abs((d - cursor).days) <= 3:
+                        actual_match = (d, c)
+                        break
+
+            if actual_match is not None:
+                d, c = actual_match
+                matched_actuals.add((src["payee_key"], d.strftime("%Y-%m-%d")))
+                actual_date: str | None = d.strftime("%Y-%m-%d")
+                actual_cents: int | None = c
+                status = "received"
+            elif cursor > today:
+                actual_date, actual_cents, status = None, None, "expected"
+            else:
+                any_overdue = True
+                actual_date, actual_cents, status = None, None, "overdue"
+
+            effective_cents = (
+                actual_cents if actual_cents is not None else src["median_cents"]
+            )
+            total_paycheck_cents += effective_cents
+            paychecks.append({
+                "source_payee": src["display_payee"],
+                "expected_date": cursor.strftime("%Y-%m-%d"),
+                "expected_cents": src["median_cents"],
+                "actual_date": actual_date,
+                "actual_cents": actual_cents,
+                "status": status,
+            })
+
+        # A detected source's walk anchors at last_seen and only steps
+        # forward, so its own most recent deposit never gets a row on its
+        # own — surface every unmatched in-month actual for a known
+        # source as a received paycheck (2026-07-24 fix).
+        actuals = actuals_by_key.get(src["payee_key"])
+        if actuals:
+            for d, c in actuals:
+                date_s = d.strftime("%Y-%m-%d")
+                k = (src["payee_key"], date_s)
+                if k not in matched_actuals:
+                    matched_actuals.add(k)
+                    total_paycheck_cents += c
+                    paychecks.append({
+                        "source_payee": src["display_payee"],
+                        "expected_date": date_s,
+                        "expected_cents": src["median_cents"],
+                        "actual_date": date_s,
+                        "actual_cents": c,
+                        "status": "received",
+                    })
+
+        paychecks[src_rows_start:] = sorted(
+            paychecks[src_rows_start:], key=lambda p: p["expected_date"]
+        )
+
+    # Misc = actual inflows not matched to any paycheck prediction.
+    misc_cents = 0
+    for key, hits in actuals_by_key.items():
+        for d, c in hits:
+            date_s = d.strftime("%Y-%m-%d")
+            if (key, date_s) not in matched_actuals:
+                misc_cents += c
+
+    # Cash-anchored RTA: on-budget cash minus everything sitting in this
+    # month's envelopes (Steven, 2026-07-11 — every month rolls over).
+    rta = cash_cents - available_cents
+
+    return {
+        "month": month,
+        "expected_paycheck_cents": total_paycheck_cents,
+        "actual_misc_cents": misc_cents,
+        "assigned_cents": assigned_cents,
+        "ready_to_assign_cents": rta,
+        "monthly_net_cents": total_paycheck_cents + misc_cents - assigned_cents,
+        "cash_cents": cash_cents,
+        "available_cents": available_cents,
+        "paychecks": paychecks,
+        "any_overdue": any_overdue,
+        "in_flight_cents": in_flight_cents,
+    }
+
+
 REGISTRY: dict[str, Callable[..., Any]] = {
     "q_categories": q_categories,
     "q_category_groups": q_category_groups,
@@ -312,4 +746,6 @@ REGISTRY: dict[str, Callable[..., Any]] = {
     "q_cc_balance_summary": q_cc_balance_summary,
     "q_transactions": q_transactions,
     "q_inbox": q_inbox,
+    "q_income_sources": q_income_sources,
+    "q_ready_to_assign": q_ready_to_assign,
 }

@@ -131,6 +131,25 @@ def test_q_inbox_shape(fixture_db):
         assert all(r["status"] in ("pending", "skipped") for r in rows)
 
 
+def test_income_sources_golden(fixture_db):
+    from bot.webui_queries import REGISTRY
+    srcs = {s["payee_key"]: s for s in REGISTRY["q_income_sources"](fixture_db)}
+    assert "ACH O'BRIEN/ATKINS A" in srcs
+    assert srcs["ACH O'BRIEN/ATKINS A"]["last_seen"] == "2026-07-14"
+    assert "ACH ACTALENT, INC." in srcs          # manual weekly override
+    assert srcs["ACH ACTALENT, INC."]["cadence"] == "weekly"
+
+
+def test_rta_matches_identity(fixture_db):
+    from bot.webui_queries import REGISTRY
+    rta = REGISTRY["q_ready_to_assign"](fixture_db, month="2026-07")
+    assert rta["ready_to_assign_cents"] == rta["cash_cents"] - rta["available_cents"]
+    _ = [p["expected_date"] for p in rta["paychecks"]
+         if p["source_payee"] == "ACH O'BRIEN/ATKINS A"]
+    assert "2026-07-14" in " ".join(
+        (p.get("actual_date") or p["expected_date"]) for p in rta["paychecks"])
+
+
 def test_q_transactions_camelcase_body_filters(tmp_path, fixture_db):
     """DEBT from Task 2's review: prove POST /q/{name} converts a camelCase
     body key (accountId) to the snake_case kwarg (account_id) the query
