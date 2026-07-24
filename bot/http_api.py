@@ -115,6 +115,10 @@ def _load_token_map(token_dir: Path) -> dict[str, str]:
         else:
             if isinstance(extra, dict):
                 tokens.update({str(k): str(v) for k, v in extra.items()})
+            else:
+                log.warning(
+                    "ui_api: %s parsed but is not a JSON object (got %s); "
+                    "ignoring", tokens_json, type(extra).__name__)
 
     return tokens
 

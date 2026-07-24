@@ -75,13 +75,13 @@ since `Copy-Item` only overwrites files that exist in the source `dist/`.
 3. `TokenGate` will prompt for a token. Paste the per-user token:
    - **Steven**: the value in `ui_api_token.txt` at the repo root (the
      legacy single-user token; always maps to `"steven"`).
-   - **Allison**: `60bf1vhTFLMlgzUAjvVtLIw3J4UJxH6EzcJZwheYrQE` (generated
-     2026-07-24, stored in `ui_api_tokens.json` at the repo root as
-     `{"<token>": "allison"}`).
-     ⚠ This token is recorded in this repo's git history (this file) —
-     if this repo is ever pushed, shared, or given a remote, rotate the
-     token (regenerate, update `ui_api_tokens.json`, restart the bot)
-     before doing so.
+   - **Allison**: her token is the `allison` entry in `ui_api_tokens.json`
+     at the repo root (open that file and copy the key).
+     ⚠ A previous version of Allison's token was recorded in this repo's
+     git history (an earlier revision of this file) — that token has
+     since been rotated and is dead. Never paste the live token into this
+     doc or any other committed file again; keep it in `ui_api_tokens.json`
+     only (gitignored).
 4. Once the token is accepted, use the browser's "Add to Home Screen" (iOS
    Safari: share sheet → Add to Home Screen; Android Chrome: menu → Add to
    Home screen) so it launches like an app, full-screen, without browser
