@@ -211,6 +211,77 @@ def roll_forward(
     return touched
 
 
+def _delta_write(con, month: str, category_id: str, *,
+                 budget_delta: int = 0) -> dict:
+    """Apply a budget/activity change to one envelope-month ADDITIVELY.
+
+    The month_category chain is full of intentionally anchored values
+    (seeded baselines, reconciliation adjustments) — recomputing
+    `available` from the identity (prior + budgeted + activity) tramples
+    them and, worse, drags pre-budget-era unfunded activity into recent
+    carryovers (the 2026-07-24 Groceries -16.5k incident). Additive
+    deltas preserve every anchor by construction: refresh this month's
+    activity from the ledger, shift available by (budget_delta +
+    activity_delta), and propagate that shift into every LATER stored
+    month so downstream carryovers stay consistent.
+    """
+    row = con.execute(
+        """SELECT budgeted_cents, activity_cents, available_cents
+           FROM month_category WHERE month = ? AND category_id = ?""",
+        (month, category_id),
+    ).fetchone()
+    live_act = _activity_for_month(con, month, category_id)
+    if row is None:
+        prior = _prior_available(con, month, category_id)
+        new_budgeted = budget_delta
+        available = prior + new_budgeted + live_act
+        _upsert_month_category(
+            con, month=month, category_id=category_id,
+            budgeted_cents=new_budgeted, activity_cents=live_act,
+            available_cents=available,
+        )
+        total_delta = new_budgeted + live_act
+    else:
+        act_delta = live_act - int(row["activity_cents"])
+        total_delta = budget_delta + act_delta
+        new_budgeted = int(row["budgeted_cents"]) + budget_delta
+        available = int(row["available_cents"]) + total_delta
+        con.execute(
+            """UPDATE month_category SET budgeted_cents = ?,
+                 activity_cents = ?, available_cents = ?
+               WHERE month = ? AND category_id = ?""",
+            (new_budgeted, live_act, available, month, category_id),
+        )
+    if total_delta:
+        con.execute(
+            """UPDATE month_category SET available_cents =
+                 available_cents + ?
+               WHERE category_id = ? AND month > ?""",
+            (total_delta, category_id, month),
+        )
+    return {
+        "budgeted_cents": new_budgeted,
+        "activity_cents": live_act,
+        "available_cents": available,
+    }
+
+
+def apply_activity_delta(
+    db_path: Path | str,
+    month: str,
+    category_ids: Iterable[str],
+) -> dict[str, int]:
+    """Refresh `month`'s activity for the given categories from the
+    ledger and shift available (this month + all later months) by the
+    change. The anchor-preserving replacement for chain recompute after
+    a past-month recategorization."""
+    results: dict[str, int] = {}
+    with storage.connect(db_path) as con:
+        for cid in category_ids:
+            results[cid] = _delta_write(con, month, cid)["available_cents"]
+    return results
+
+
 def assign_to_category(
     db_path: Path | str,
     month: str,
@@ -219,8 +290,10 @@ def assign_to_category(
 ) -> dict:
     """Add `cents` to a category's `budgeted_cents` for the month.
 
-    Positive `cents` adds, negative subtracts. Recomputes available_cents.
-    Returns {budgeted_cents, activity_cents, available_cents} after the change.
+    Positive `cents` adds, negative subtracts. Shifts available_cents by
+    the same delta (plus any ledger-activity drift) and propagates the
+    shift into later months — see `_delta_write` for why this must be
+    additive rather than identity-recomputed.
 
     Note: this does NOT touch a "Ready to Assign" pool — that's the user's
     mental model in YNAB but in this ledger, "Ready to Assign" is implicit
@@ -228,31 +301,7 @@ def assign_to_category(
     surface it in reports, not in this math.
     """
     with storage.connect(db_path) as con:
-        existing = con.execute(
-            """SELECT budgeted_cents FROM month_category
-               WHERE month = ? AND category_id = ?""",
-            (month, category_id),
-        ).fetchone()
-        old_budgeted = int(existing["budgeted_cents"]) if existing else 0
-        new_budgeted = old_budgeted + cents
-
-        activity = _activity_for_month(con, month, category_id)
-        prior_avail = _prior_available(con, month, category_id)
-        available = prior_avail + new_budgeted + activity
-
-        _upsert_month_category(
-            con,
-            month=month,
-            category_id=category_id,
-            budgeted_cents=new_budgeted,
-            activity_cents=activity,
-            available_cents=available,
-        )
-        return {
-            "budgeted_cents": new_budgeted,
-            "activity_cents": activity,
-            "available_cents": available,
-        }
+        return _delta_write(con, month, category_id, budget_delta=cents)
 
 
 def move_money(
@@ -270,59 +319,13 @@ def move_money(
     if cents <= 0:
         raise ValueError("move_money requires positive cents")
     with storage.connect(db_path) as con:
-        # `from` loses budgeted
-        from_existing = con.execute(
-            """SELECT budgeted_cents FROM month_category
-               WHERE month = ? AND category_id = ?""",
-            (month, from_category_id),
-        ).fetchone()
-        from_old = int(from_existing["budgeted_cents"]) if from_existing else 0
-        from_new = from_old - cents
-        from_activity = _activity_for_month(con, month, from_category_id)
-        from_prior = _prior_available(con, month, from_category_id)
-        from_available = from_prior + from_new + from_activity
-        _upsert_month_category(
-            con,
-            month=month,
-            category_id=from_category_id,
-            budgeted_cents=from_new,
-            activity_cents=from_activity,
-            available_cents=from_available,
-        )
-
-        # `to` gains budgeted
-        to_existing = con.execute(
-            """SELECT budgeted_cents FROM month_category
-               WHERE month = ? AND category_id = ?""",
-            (month, to_category_id),
-        ).fetchone()
-        to_old = int(to_existing["budgeted_cents"]) if to_existing else 0
-        to_new = to_old + cents
-        to_activity = _activity_for_month(con, month, to_category_id)
-        to_prior = _prior_available(con, month, to_category_id)
-        to_available = to_prior + to_new + to_activity
-        _upsert_month_category(
-            con,
-            month=month,
-            category_id=to_category_id,
-            budgeted_cents=to_new,
-            activity_cents=to_activity,
-            available_cents=to_available,
-        )
-
+        from_state = _delta_write(con, month, from_category_id,
+                                  budget_delta=-cents)
+        to_state = _delta_write(con, month, to_category_id,
+                                budget_delta=cents)
         return {
-            "from": {
-                "category_id": from_category_id,
-                "budgeted_cents": from_new,
-                "activity_cents": from_activity,
-                "available_cents": from_available,
-            },
-            "to": {
-                "category_id": to_category_id,
-                "budgeted_cents": to_new,
-                "activity_cents": to_activity,
-                "available_cents": to_available,
-            },
+            "from": {"category_id": from_category_id, **from_state},
+            "to": {"category_id": to_category_id, **to_state},
         }
 
 
@@ -449,7 +452,7 @@ def reconcile_overspending(
     with storage.connect(db_path) as con:
         rows = con.execute(
             """SELECT mc.category_id, c.name, g.name AS group_name,
-                      mc.available_cents
+                      mc.available_cents, mc.budgeted_cents
                FROM month_category mc
                JOIN category c ON c.id = mc.category_id
                JOIN category_group g ON g.id = c.group_id
@@ -478,10 +481,17 @@ def reconcile_overspending(
             for s in sources:
                 if need <= 0:
                     break
-                take = min(s["available_cents"], need)
+                # A donor gives no more than its surplus AND no more
+                # than its own fresh assignment: taking beyond budgeted
+                # would drive budgeted negative (the 2026-07-23 donor
+                # bug). Carryover-only surpluses stay put; the remainder
+                # comes from Ready to Assign below.
+                take = min(s["available_cents"], need,
+                           max(0, s["budgeted_cents"]))
                 if take <= 0:
                     continue
                 s["available_cents"] -= take
+                s["budgeted_cents"] -= take
                 need -= take
                 moves.append({
                     "from_category_id": s["category_id"],

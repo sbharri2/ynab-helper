@@ -625,31 +625,30 @@ def build_app(
             "category_id": body.category_id,
             "category_name": cat["name"],
         })
-        # Re-derive envelope state for BOTH old + new category, from the
-        # transaction's month through the current month — available chains
-        # forward, so fixing June must refresh July too (Budget activity
-        # popup recategorizes past months, 2026-07-11). Capped at 24
-        # months of chain for ancient rows.
+        # Refresh envelope state for BOTH old + new category in the
+        # transaction's month via ADDITIVE deltas — recompute_month's
+        # identity math tramples the chain's anchored values and dragged
+        # pre-budget-era activity into live carryovers (the 2026-07-24
+        # Groceries -16.5k incident). apply_activity_delta refreshes the
+        # month's activity and propagates the shift into later months
+        # itself, so no month loop is needed.
         try:
             affected = {body.category_id}
-            now = datetime.now()
-            start = now.strftime("%Y-%m")
+            mo = datetime.now().strftime("%Y-%m")
             if old_row is not None:
                 if old_row["category_id"]:
                     affected.add(old_row["category_id"])
-                start = min(start, str(old_row["posted_date"])[:7])
-            months = []
-            y, m = int(start[:4]), int(start[5:7])
-            while (y, m) <= (now.year, now.month):
-                months.append(f"{y:04d}-{m:02d}")
-                m += 1
-                if m > 12:
-                    m, y = 1, y + 1
-            for mo in months[-24:]:
-                envelope.recompute_month(db_path, mo,
-                                         category_ids=sorted(affected))
+                mo = min(mo, str(old_row["posted_date"])[:7])
+            envelope.apply_activity_delta(db_path, mo, sorted(affected))
+            now_mo = datetime.now().strftime("%Y-%m")
+            if mo != now_mo:
+                # The txn month's delta already propagated forward; also
+                # refresh the CURRENT month's own activity for these
+                # categories (cheap, keeps the visible month exact).
+                envelope.apply_activity_delta(db_path, now_mo,
+                                              sorted(affected))
         except Exception as e:  # noqa: BLE001
-            log.warning("recompute after categorize failed: %s", e)
+            log.warning("delta refresh after categorize failed: %s", e)
         return {"ok": True}
 
     @app.post("/mark_transfer", dependencies=[Depends(_require_token)])
@@ -1009,6 +1008,13 @@ def build_app(
         envelope module only exposes the additive ``assign_to_category``.
         Net result: month_category.budgeted_cents = body.cents.
         """
+        if body.cents < 0:
+            # No UI flow legitimately assigns a negative amount; the
+            # 2026-07-23 incident wrote several. Whatever client path
+            # tries it again should surface as a loud 400, not data.
+            raise HTTPException(
+                400, "budgeted_cents must be >= 0 — negative assignments "
+                     "are always a client bug")
         with storage.connect(db_path) as con:
             existing = con.execute(
                 "SELECT budgeted_cents FROM month_category "
