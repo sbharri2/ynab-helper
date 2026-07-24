@@ -534,9 +534,37 @@ def close_stale_pending(db_path) -> int:
             (storage._utcnow(),),
         )
         n = cur.rowcount
-    if n:
-        log.info("closed %d stale pending rows (ledger already categorized)", n)
-    return n
+
+        # Undecidable rows: the ledger txn was deleted (dedupe/orphan
+        # cleanup) or became a linked transfer — nothing left to decide.
+        # filed_by='dismissed' + chosen NULL keeps them out of the
+        # writer (it inner-joins chosen_category). The 7-day grace on
+        # ledger-less rows covers watcher pts created hours before their
+        # ledger row lands.
+        cur = con.execute(
+            """UPDATE pending_txn SET
+                 status = 'categorized', chosen_at = ?,
+                 filed_by = 'dismissed'
+               WHERE status IN ('pending', 'skipped')
+                 AND (
+                   (txn_date < date('now', '-7 days')
+                    AND NOT EXISTS (
+                      SELECT 1 FROM ledger_txn l
+                      WHERE 'ledger:' || l.id = pending_txn.ynab_txn_id
+                         OR l.ynab_txn_id = pending_txn.ynab_txn_id))
+                   OR EXISTS (
+                      SELECT 1 FROM ledger_txn l
+                      WHERE ('ledger:' || l.id = pending_txn.ynab_txn_id
+                             OR l.ynab_txn_id = pending_txn.ynab_txn_id)
+                        AND l.transfer_account_id IS NOT NULL)
+                 )""",
+            (storage._utcnow(),),
+        )
+        dismissed = cur.rowcount
+    if n or dismissed:
+        log.info("pending janitor: %d closed (ledger categorized), "
+                 "%d dismissed (undecidable)", n, dismissed)
+    return n + dismissed
 
 
 if __name__ == "__main__":
