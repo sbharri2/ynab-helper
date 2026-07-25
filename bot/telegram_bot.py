@@ -1870,7 +1870,7 @@ async def _daily_summary_loop(app: Application) -> None:
     """
     settings: Settings = app.bot_data["settings"]
     from bot.reporters.daily import send_daily_summaries
-    from bot.envelope import recompute_month
+    from bot.envelope import refresh_month
     from bot.reconciler import reconcile_all_observed
     last_shared_run_date: "str | None" = None
     while True:
@@ -1914,12 +1914,15 @@ async def _daily_summary_loop(app: Application) -> None:
             is_first_today = last_shared_run_date != today_key
             if is_first_today:
                 try:
-                    recompute_month(
+                    # Anchor-safe: additive activity refresh, never the
+                    # identity recompute (it reverted same-month anchor
+                    # writes — 2026-07-25 RTA divergence incident).
+                    refresh_month(
                         settings.paths.database,
                         datetime.now().strftime("%Y-%m"),
                     )
                 except Exception as e:  # noqa: BLE001
-                    log.warning("daily: recompute failed: %s", e)
+                    log.warning("daily: refresh failed: %s", e)
                 try:
                     from datetime import date as _date_cls, timedelta as _td
                     yesterday = _date_cls.today() - _td(days=1)

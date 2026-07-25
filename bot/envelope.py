@@ -112,12 +112,15 @@ def recompute_month(
 ) -> dict[str, int]:
     """Recompute activity + available for every (or given) category in `month`.
 
+    WARNING: identity math (prior + budgeted + activity) DESTROYS any
+    anchor value written into `month` (carryover releases, seeded
+    baselines). Use `refresh_month` / `apply_activity_delta` for
+    routine refreshes; reserve this for initializing a brand-new month
+    whose identity state IS the intended baseline (roll-forward).
+
     Reads ledger_txn for the month and updates month_category accordingly.
     Preserves the existing `budgeted_cents` value (use `assign_to_category` to
     change that). Returns {category_id: available_cents} for what was touched.
-
-    Idempotent — safe to run any time. Doesn't roll forward; for that, also
-    call `recompute_month(next_month)` after this.
     """
     results: dict[str, int] = {}
     with storage.connect(db_path) as con:
@@ -280,6 +283,28 @@ def apply_activity_delta(
         for cid in category_ids:
             results[cid] = _delta_write(con, month, cid)["available_cents"]
     return results
+
+
+def refresh_month(db_path: Path | str, month: str) -> int:
+    """Anchor-safe daily refresh: fold ledger-activity changes for EVERY
+    category into `month` additively. The replacement for the daily
+    job's recompute_month(current-month) call, which rebuilt available
+    from the identity and trampled same-month anchor writes (found
+    2026-07-25: the 06:30 run reverted the CC-envelope releases and the
+    Vacation trim). Returns how many categories actually changed."""
+    changed = 0
+    with storage.connect(db_path) as con:
+        for cid in _all_categories(con):
+            before = con.execute(
+                """SELECT activity_cents FROM month_category
+                   WHERE month = ? AND category_id = ?""",
+                (month, cid),
+            ).fetchone()
+            state = _delta_write(con, month, cid)
+            if before is None or int(before["activity_cents"]) != \
+                    state["activity_cents"]:
+                changed += 1
+    return changed
 
 
 def assign_to_category(

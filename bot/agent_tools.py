@@ -176,7 +176,9 @@ def get_flex_budget(db_path: str) -> str:
             ).fetchall()
         ]
     if cat_ids:
-        envelope.recompute_month(db_path, month, category_ids=cat_ids)
+        # Anchor-safe additive refresh (identity recompute tramples
+        # same-month anchor writes — 2026-07-25 incident).
+        envelope.apply_activity_delta(db_path, month, cat_ids)
 
     with storage.connect(db_path) as con:
         rows = con.execute(
