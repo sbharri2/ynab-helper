@@ -1992,8 +1992,13 @@ In `bot/http_api.py`, replace the whole `# ── Investments ──` block (~li
                 as_of_date=body.as_of_date,
                 seed_from_previous=body.seed_from_previous,
             )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(400, f"could not create round: {e}")
+            # A duplicate as_of_date is the operator's problem; anything
+            # else is ours, and reporting it as 400 with no log would hide it.
+            log.exception("create_round failed: %s", e)
+            raise HTTPException(500, f"could not create round: {e}")
         storage.audit(db_path, "ui_investments_round", {
             "round_id": rid, "label": body.label, "as_of_date": body.as_of_date,
             "seeded": body.seed_from_previous,
@@ -2064,8 +2069,11 @@ In `bot/http_api.py`, replace the whole `# ── Investments ──` block (~li
                 source=body.source,
                 note=body.note,
             )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(400, f"could not record premium: {e}")
+            log.exception("record_premium failed: %s", e)
+            raise HTTPException(500, f"could not record premium: {e}")
         storage.audit(db_path, "ui_investments_premium", {
             "policy_id": body.policy_id, "amount_cents": body.amount_cents,
             "source": body.source,
@@ -2148,6 +2156,15 @@ def _cells_by_date(holding: dict) -> dict[str, int]:
     return {v["snapshot_date"]: v["cents"] for v in holding["values"]}
 
 
+def _undated(holding: dict) -> bool:
+    """True if any column header failed to yield a date.
+
+    Two undated columns collapse into one dict key, silently hiding a whole
+    column from the diff. The gate must refuse to certify that.
+    """
+    return any(not v.get("snapshot_date") for v in holding["values"])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--xlsx", type=Path, default=None)
@@ -2166,35 +2183,106 @@ def main() -> int:
     sheet_h = {h["name"]: h for h in sheet["holdings"]}
     db_h = {h["name"]: h for h in db["holdings"]}
 
+    # 0. An undated column can't be diffed at all — refuse to certify.
+    for name in sorted(sheet_h):
+        if _undated(sheet_h[name]):
+            problems.append(f"{name}: xlsx has a value column with no parseable date")
+
+    # 1. Holding names, both directions.
     for name in sorted(set(sheet_h) - set(db_h)):
         problems.append(f"missing from DB: {name}")
     for name in sorted(set(db_h) - set(sheet_h)):
         problems.append(f"extra in DB (not in xlsx): {name}")
 
+    # 2. Value cells, BOTH directions, keyed by date. The DB zero-fills every
+    #    holding for every round while the xlsx omits blanks, so an absent
+    #    xlsx cell must read 0 in the DB — anything else is data the import
+    #    invented, and iterating only the xlsx side would never see it.
     for name in sorted(set(sheet_h) & set(db_h)):
         want = _cells_by_date(sheet_h[name])
         got = _cells_by_date(db_h[name])
-        for iso, cents in sorted(want.items()):
-            if got.get(iso) != cents:
+        for iso in sorted(set(want) | set(got)):
+            if want.get(iso, 0) != got.get(iso, 0):
                 problems.append(
-                    f"{name} @ {iso}: xlsx {cents} != db {got.get(iso)}"
+                    f"{name} @ {iso}: xlsx {want.get(iso, 0)} != db {got.get(iso, 0)}"
                 )
 
-    sheet_t = {t["label"]: t["cells"] for t in sheet["totals_rows"]}
+    # 3. Totals, anchored to dates rather than list position.
+    #    The xlsx's own totals row is NOT trusted as the comparand: the
+    #    parser drops blank cells, so its cells can't be aligned to rounds,
+    #    and this sheet has shipped wrong header dates before. Recompute the
+    #    expected total from the xlsx holdings instead — that is a genuine
+    #    cross-implementation check rather than two lists that happen to be
+    #    the same length.
+    db_dates = (
+        [v["snapshot_date"] for v in db["holdings"][0]["values"]]
+        if db["holdings"] else []
+    )
     db_t = {t["label"]: t["cells"] for t in db["totals_rows"]}
-    for label in ("Total", "Minus Home Equity"):
-        want, got = sheet_t.get(label), db_t.get(label)
-        if want is None:
-            problems.append(f"xlsx has no {label!r} row")
-            continue
-        want_clean = [c for c in want if c is not None]
-        if want_clean != got:
-            problems.append(f"{label}: xlsx {want_clean} != db {got}")
+    total_cells = db_t.get("Total", [])
+    minus_home = db_t.get("Minus Home Equity", [])
 
-    n_sheet_ins = len(sheet["insurance"])
+    if len(total_cells) != len(db_dates):
+        problems.append(
+            f"DB Total has {len(total_cells)} cells for {len(db_dates)} rounds"
+        )
+    else:
+        for i, iso in enumerate(db_dates):
+            expected = sum(_cells_by_date(h).get(iso, 0) for h in sheet["holdings"])
+            if expected != total_cells[i]:
+                problems.append(
+                    f"Total @ {iso}: xlsx sum {expected} != db {total_cells[i]}"
+                )
+
+    # 4. Minus Home Equity must subtract exactly one real-estate holding's
+    #    value — the primary residence. Subtracting both properties, or the
+    #    rental instead, is a ~$63,000 error that looks entirely plausible
+    #    on screen. This is the arithmetic that was misread once already.
+    #    The snapshot payload doesn't carry primary-residence identity, only
+    #    raw values — so ask the store directly. Matching "some real-estate
+    #    value" is not enough: subtracting the RENTAL instead of the home
+    #    lands inside that set and passes. Only an exact match against the
+    #    flagged primary residence closes the $63,000 error.
+    primary_names = [
+        h["name"] for h in store.list_holdings(args.db)
+        if h.get("is_primary_residence")
+    ]
+    if len(primary_names) != 1:
+        problems.append(
+            f"expected exactly 1 primary residence, found {len(primary_names)}: "
+            f"{sorted(primary_names)}"
+        )
+    elif len(minus_home) == len(total_cells) == len(db_dates):
+        primary = primary_names[0]
+        primary_cells = _cells_by_date(db_h[primary]) if primary in db_h else {}
+        for i, iso in enumerate(db_dates):
+            subtracted = total_cells[i] - minus_home[i]
+            expected = primary_cells.get(iso, 0)
+            if subtracted != expected:
+                problems.append(
+                    f"Minus Home Equity @ {iso}: subtracted {subtracted}, but the "
+                    f"primary residence ({primary}) is {expected}"
+                )
+
+    # 5. Insurance: types AND premiums, not just a row count. Premium drift
+    #    is the defect this whole system exists to surface — a gate blind to
+    #    it would certify the one thing that must not slip through.
+    sheet_ins = {p["insurance_type"]: p for p in sheet["insurance"]}
+    db_ins = {p["insurance_type"]: p for p in db["insurance"]}
+    if len(sheet_ins) != len(sheet["insurance"]):
+        problems.append(
+            "xlsx has duplicate insurance types; premiums can't be matched by type"
+        )
+    for t in sorted(set(sheet_ins) - set(db_ins)):
+        problems.append(f"insurance missing from DB: {t}")
+    for t in sorted(set(db_ins) - set(sheet_ins)):
+        problems.append(f"insurance extra in DB: {t}")
+    for t in sorted(set(sheet_ins) & set(db_ins)):
+        w = sheet_ins[t].get("annual_premium_cents")
+        g = db_ins[t].get("annual_premium_cents")
+        if w != g:
+            problems.append(f"insurance {t}: xlsx premium {w} != db {g}")
     n_db_ins = len(db["insurance"])
-    if n_sheet_ins != n_db_ins:
-        problems.append(f"insurance rows: xlsx {n_sheet_ins} != db {n_db_ins}")
 
     if problems:
         print(f"FAIL — {len(problems)} difference(s):")
