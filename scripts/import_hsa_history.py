@@ -101,6 +101,7 @@ RULES: list[tuple[str, tuple[str, ...]]] = [
     (CAT_PHARMACY, (
         "CVS",
         "WWW CVS COM",
+        "WALGREEN",
         "GLENWOOD SOUTH PHARMAC",
         "MC CORMACKS PHARMACY",
         "MCCORMACKS PHARMACY",

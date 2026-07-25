@@ -260,15 +260,23 @@ Note this does not contradict "the bot's budget is its own truth" — that conce
 *assignments* in `month_category`, which the bot owns. Per-transaction categories are
 still mirrored from YNAB.
 
-Exposure across all rows matching a Pharmacy / Mental Health / Dental / Weight Loss rule:
+**Measured exposure is far smaller than first estimated.** The initial read was that all
+118 rows carrying a `ynab_txn_id` would revert. They do not: `full_sync` pulls only
+`since_date = last_sync - 7 days` (`ynab_full_sync.py:443-446`), so exposure is a rolling
+~7-day window, not all history.
+
+Observed over a real sync (2026-07-25 19:08:19, the first after the bot restart):
+**2 rows reverted**, both recent — a Mochi charge (-$79.00, 2026-07-19) and a dental
+charge (-$118.00). Both were re-asserted by re-running the script.
 
 | | Rows | Durable? |
 | --- | ---: | --- |
-| Local-only (the imported HSA rows) | 140 | Yes — no `ynab_txn_id`, sync cannot touch them |
-| Carrying a `ynab_txn_id` | 118 | **No — will revert** (116 on Citi Double Cash) |
+| Imported HSA rows | 140 | Yes — no `ynab_txn_id` |
+| Card rows outside the 7-day window | ~116 | Yes in practice — sync never pulls them |
+| Card rows inside the rolling 7-day window | a few | No — revert until YNAB agrees |
 
-So the HSA history itself is safe; the credit-card re-files are not. Options, needing
-Steven's call:
+So the five years of history are safe. The live exposure is only newly-posted charges,
+which drift back to whatever category YNAB holds. Options, needing Steven's call:
 
 1. **Make it durable in YNAB.** Create `Pharmacy`, `Mental Health` and `Dental/Ortho` in
    YNAB by hand (the YNAB API has no create-category endpoint), map their
