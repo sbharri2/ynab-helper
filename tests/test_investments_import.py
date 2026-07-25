@@ -50,7 +50,9 @@ def test_import_is_idempotent(tmp_path):
     imp.import_xlsx(db, xlsx)
     second = imp.import_xlsx(db, xlsx)
     assert second["rounds"] == 0
+    assert second["holdings"] == 0
     assert second["values"] == 0
+    assert second["policies"] == 0
     assert second["skipped_values"] == 4
     assert len(second["skipped_rounds"]) == 2
     assert len(store.list_rounds(db)) == 2
@@ -58,6 +60,85 @@ def test_import_is_idempotent(tmp_path):
     with connect(db) as con:
         n = con.execute("SELECT COUNT(*) FROM holding_value").fetchone()[0]
     assert n == 4
+
+
+def test_same_name_different_account_type_creates_two_holdings(tmp_path):
+    """The real sheet has 'Schwab (Transfered from TD AmeriTrade)' twice:
+    a Roth IRA and a separate Stock Account, both Steven's. Name alone must
+    NOT be treated as the holding's identity, or the second row's values
+    silently vanish (this is the $25,606.62 data-loss bug from cutover).
+    """
+    db = tmp_path / "t.db"
+    init_db(db)
+    xlsx = tmp_path / "dup_name_type.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Account", "Type", "Number", "Owner",
+               "2026 Value (07-25-26)", "Notes"])
+    ws.append(["Schwab (Transfered from TD AmeriTrade)", "Roth IRA Savings",
+               "", "Steven", "$393.60", ""])
+    ws.append(["Schwab (Transfered from TD AmeriTrade)", "Stock Account",
+               "", "Steven", "$25,606.62", ""])
+    wb.save(xlsx)
+
+    result = imp.import_xlsx(db, xlsx)
+    assert result["holdings"] == 2
+    assert result["values"] == 2
+
+    holdings = store.list_holdings(db)
+    matching = [h for h in holdings
+                if h["name"] == "Schwab (Transfered from TD AmeriTrade)"]
+    assert len(matching) == 2
+    assert {h["account_type"] for h in matching} == {
+        "Roth IRA Savings", "Stock Account",
+    }
+
+    with connect(db) as con:
+        cents = [
+            r["value_cents"] for r in con.execute(
+                "SELECT value_cents FROM holding_value WHERE holding_id IN (?, ?)",
+                (matching[0]["id"], matching[1]["id"]),
+            )
+        ]
+    assert sorted(cents) == [39360, 2560662]
+
+
+def test_same_name_and_type_different_owner_creates_two_holdings(tmp_path):
+    """'Treasury Direct - US Government' appears twice on the real sheet —
+    same name, same account type, differing only by owner (Steven vs
+    Allison). Owner must be part of the holding's identity too.
+    """
+    db = tmp_path / "t.db"
+    init_db(db)
+    xlsx = tmp_path / "dup_name_owner.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Account", "Type", "Number", "Owner",
+               "2026 Value (07-25-26)", "Notes"])
+    ws.append(["Treasury Direct - US Government", "Savings Bonds",
+               "", "Steven", "$1,000.00", ""])
+    ws.append(["Treasury Direct - US Government", "Savings Bonds",
+               "", "Allison", "$2,000.00", ""])
+    wb.save(xlsx)
+
+    result = imp.import_xlsx(db, xlsx)
+    assert result["holdings"] == 2
+    assert result["values"] == 2
+
+    holdings = store.list_holdings(db)
+    matching = [h for h in holdings
+                if h["name"] == "Treasury Direct - US Government"]
+    assert len(matching) == 2
+    assert {h["owner"] for h in matching} == {"Steven", "Allison"}
+
+    with connect(db) as con:
+        cents = [
+            r["value_cents"] for r in con.execute(
+                "SELECT value_cents FROM holding_value WHERE holding_id IN (?, ?)",
+                (matching[0]["id"], matching[1]["id"]),
+            )
+        ]
+    assert sorted(cents) == [100000, 200000]
 
 
 def test_reimport_does_not_revert_a_hand_edited_value(tmp_path):

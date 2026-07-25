@@ -4,12 +4,17 @@ Reuses ``bot/investments.py`` as the parser rather than reimplementing it,
 so the two paths can be diffed against each other at cutover
 (``scripts/verify_investments_import.py``).
 
-Idempotent and additive-only on round ``as_of_date`` and holding ``name``:
-re-running adds nothing and never overwrites a value that already exists,
-so a hand-corrected number (``source='manual'``) can never be silently
-reverted to the sheet's number by a later re-run. An unparseable column
-header raises — this runs once, under supervision, and a silently invented
-date is the exact class of error this design exists to remove.
+Idempotent and additive-only on round ``as_of_date`` and holding
+``(name, account_type, owner)`` — name alone is not unique on the real
+sheet (e.g. two "Schwab (Transfered from TD AmeriTrade)" rows, a Roth IRA
+and a separate Stock Account): re-running adds nothing and never overwrites
+a value that already exists, so a hand-corrected number
+(``source='manual'``) can never be silently reverted to the sheet's number
+by a later re-run. Insurance policies have no usable composite identity at
+all, so their idempotency is all-or-nothing: import runs once against an
+empty registry. An unparseable column header raises — this runs once,
+under supervision, and a silently invented date is the exact class of
+error this design exists to remove.
 """
 from __future__ import annotations
 
@@ -105,13 +110,20 @@ def import_xlsx(
             )
             created_rounds += 1
 
-    # ── Holdings, keyed by name so re-import updates rather than duplicates ──
-    # ``existing_values`` makes the import additive-only: a hand-corrected
-    # value (source='manual') must never be silently reverted to the
-    # sheet's number by a later re-run.
+    # ── Holdings, keyed by (name, account_type, owner) so re-import updates
+    # rather than duplicates. Name alone is NOT a unique identity on the
+    # real sheet: e.g. "Schwab (Transfered from TD AmeriTrade)" appears
+    # twice — a Roth IRA and a separate Stock Account, both Steven's — and
+    # collapsing them into one holding silently drops the second row's
+    # values. ``existing_values`` makes the import additive-only: a
+    # hand-corrected value (source='manual') must never be silently
+    # reverted to the sheet's number by a later re-run.
     with connect(db_path) as con:
-        by_name = {
-            r["name"]: r["id"] for r in con.execute("SELECT id, name FROM holding")
+        by_key = {
+            (r["name"], r["account_type"], r["owner"]): r["id"]
+            for r in con.execute(
+                "SELECT id, name, account_type, owner FROM holding"
+            )
         }
         existing_values = {
             (r["holding_id"], r["round_id"]) for r in con.execute(
@@ -124,7 +136,6 @@ def import_xlsx(
     skipped_values = 0
     for order, h in enumerate(snap["holdings"]):
         kind, tax = _classify(h.get("account_type", ""))
-        hid = by_name.get(h["name"])
         fields = dict(
             name=h["name"],
             owner=h.get("owner") or None,
@@ -135,9 +146,14 @@ def import_xlsx(
             notes=h.get("notes") or None,
             sort_order=order,
         )
+        # Key off the normalized fields, not the raw parser output — fields
+        # turns "" into None, so the key must match what was actually
+        # written or an empty string will never match a stored NULL.
+        key = (fields["name"], fields["account_type"], fields["owner"])
+        hid = by_key.get(key)
         if hid is None:
             hid = store.upsert_holding(db_path, **fields)
-            by_name[h["name"]] = hid
+            by_key[key] = hid
             created_holdings += 1
         # else: the holding already exists — its metadata is left alone.
         # Re-importing must not clobber anything the operator has since
@@ -170,16 +186,20 @@ def import_xlsx(
             written_values += 1
 
     # ── Insurance: registry + one baseline observation at the newest date ──
+    # Policies have no usable identity: "Life - Steven" appears four times
+    # across different providers, and two of those share provider AND
+    # coverage, differing only in premium. No composite key separates them,
+    # so idempotency here is all-or-nothing — if the registry already has
+    # any rows, this run contributes nothing rather than guessing which
+    # rows are "new."
     newest_iso = max(dates)
     with connect(db_path) as con:
-        known = {
-            r["insurance_type"] for r in con.execute(
-                "SELECT insurance_type FROM insurance_policy"
-            )
-        }
+        already_imported = con.execute(
+            "SELECT COUNT(*) FROM insurance_policy"
+        ).fetchone()[0] > 0
     created_policies = 0
     for order, p in enumerate(snap["insurance"]):
-        if p["insurance_type"] in known:
+        if already_imported:
             continue
         pid = ins.upsert_policy(
             db_path,
