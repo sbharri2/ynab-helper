@@ -288,6 +288,34 @@ which drift back to whatever category YNAB holds. Options, needing Steven's call
 3. **Accept the drift.** Keep the 140 durable HSA rows; the card rows revert to Medical
    on the next sync. Re-running this script re-applies the split at any time.
 
+## Analytics coverage, and why history is NOT backfilled
+
+Two data sources, two outcomes.
+
+**Correct, full 5-year history (these read `ledger_txn` directly):**
+`q_category_time_series`, `q_treemap_categories`, `q_daily_spend_heatmap`,
+`q_payee_summary`, `q_category_avg_activity`. Trailing-12-month averages come out as
+Mental Health $430.28/mo, Medical $394.54, Dental/Ortho $321.70, Weight Loss $207.50,
+Pharmacy $47.60 — **$1,401.62/mo combined**.
+
+**Stale (reads `month_category`):** `q_month_categories`, the Budget month grid. For
+historical months the new categories are **absent, not zero** — the query is
+`FROM month_category mc JOIN category c`, so a missing row does not render as $0, it
+vanishes. And `Medical`'s historical figures stay inflated because they still contain the
+spend moved out of them (2025-06 shows -$1,012.92 against a true -$134.50).
+
+**The fix is worse than the problem — measured, not assumed.** Recomputing the 60
+affected months (2021-06..2026-07) for just the 5 medical categories moves Ready-to-Assign
+by **+$10,491.96**. Categories never budgeted historically accumulate years of negative
+activity with no budgeted offset; their `available` collapses, total `available_cents`
+drops, and `rta = cash_cents - available_cents` inflates by the whole amount. The
+intuition that "moving spend between categories nets to zero" holds within a month but
+NOT across a rebuilt rollover chain.
+
+Decision: accept the stale history. Refresh the CURRENT month only — safe, and what the
+nightly job already does (verified: +$121.29, entirely the stale Water and Trash bill,
+nothing to do with the HSA).
+
 ## Deployment
 
 - `bot/envelope.py` goes live only on the next restart of the `YNAB-Helper-Bot`
