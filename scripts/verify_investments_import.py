@@ -24,6 +24,15 @@ def _cells_by_date(holding: dict) -> dict[str, int]:
     return {v["snapshot_date"]: v["cents"] for v in holding["values"]}
 
 
+def _undated(holding: dict) -> bool:
+    """True if any column header failed to yield a date.
+
+    Two undated columns collapse into one dict key, silently hiding a whole
+    column from the diff. The gate must refuse to certify that.
+    """
+    return any(not v.get("snapshot_date") for v in holding["values"])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--xlsx", type=Path, default=None)
@@ -47,30 +56,74 @@ def main() -> int:
     for name in sorted(set(db_h) - set(sheet_h)):
         problems.append(f"extra in DB (not in xlsx): {name}")
 
-    for name in sorted(set(sheet_h) & set(db_h)):
+    undated_names = {name for name, h in sheet_h.items() if _undated(h)}
+    for name in sorted(undated_names):
+        problems.append(f"{name}: xlsx has a value column with no parseable date")
+
+    # A holding with an undated column has an untrustworthy `None` key in
+    # its date dict, which can't be compared against real ISO date strings
+    # (sorted() would raise). It's already been flagged above, so skip its
+    # per-date diff rather than let that surface as an unhandled crash.
+    for name in sorted((set(sheet_h) & set(db_h)) - undated_names):
         want = _cells_by_date(sheet_h[name])
         got = _cells_by_date(db_h[name])
-        for iso, cents in sorted(want.items()):
-            if got.get(iso) != cents:
+        for iso in sorted(set(want) | set(got)):
+            if want.get(iso, 0) != got.get(iso, 0):
                 problems.append(
-                    f"{name} @ {iso}: xlsx {cents} != db {got.get(iso)}"
+                    f"{name} @ {iso}: xlsx {want.get(iso, 0)} != db {got.get(iso, 0)}"
                 )
 
-    sheet_t = {t["label"]: t["cells"] for t in sheet["totals_rows"]}
+    db_dates = (
+        [v["snapshot_date"] for v in db["holdings"][0]["values"]]
+        if db["holdings"] else []
+    )
     db_t = {t["label"]: t["cells"] for t in db["totals_rows"]}
-    for label in ("Total", "Minus Home Equity"):
-        want, got = sheet_t.get(label), db_t.get(label)
-        if want is None:
-            problems.append(f"xlsx has no {label!r} row")
-            continue
-        want_clean = [c for c in want if c is not None]
-        if want_clean != got:
-            problems.append(f"{label}: xlsx {want_clean} != db {got}")
+    total_cells = db_t.get("Total", [])
+    minus_home = db_t.get("Minus Home Equity", [])
 
-    n_sheet_ins = len(sheet["insurance"])
+    if len(total_cells) != len(db_dates):
+        problems.append(
+            f"DB Total has {len(total_cells)} cells for {len(db_dates)} rounds"
+        )
+    else:
+        for i, iso in enumerate(db_dates):
+            expected = sum(_cells_by_date(h).get(iso, 0) for h in sheet["holdings"])
+            if expected != total_cells[i]:
+                problems.append(
+                    f"Total @ {iso}: xlsx sum {expected} != db {total_cells[i]}"
+                )
+
+    if len(minus_home) == len(total_cells) == len(db_dates):
+        for i, iso in enumerate(db_dates):
+            subtracted = total_cells[i] - minus_home[i]
+            if subtracted == 0:
+                continue
+            re_values = {
+                _cells_by_date(h).get(iso, 0)
+                for h in sheet["holdings"] if h.get("is_real_estate")
+            }
+            if subtracted not in re_values:
+                problems.append(
+                    f"Minus Home Equity @ {iso}: subtracted {subtracted}, which "
+                    f"matches no single real-estate holding {sorted(re_values)}"
+                )
+
+    sheet_ins = {p["insurance_type"]: p for p in sheet["insurance"]}
+    db_ins = {p["insurance_type"]: p for p in db["insurance"]}
+    if len(sheet_ins) != len(sheet["insurance"]):
+        problems.append(
+            "xlsx has duplicate insurance types; premiums can't be matched by type"
+        )
+    for t in sorted(set(sheet_ins) - set(db_ins)):
+        problems.append(f"insurance missing from DB: {t}")
+    for t in sorted(set(db_ins) - set(sheet_ins)):
+        problems.append(f"insurance extra in DB: {t}")
+    for t in sorted(set(sheet_ins) & set(db_ins)):
+        w = sheet_ins[t].get("annual_premium_cents")
+        g = db_ins[t].get("annual_premium_cents")
+        if w != g:
+            problems.append(f"insurance {t}: xlsx premium {w} != db {g}")
     n_db_ins = len(db["insurance"])
-    if n_sheet_ins != n_db_ins:
-        problems.append(f"insurance rows: xlsx {n_sheet_ins} != db {n_db_ins}")
 
     if problems:
         print(f"FAIL — {len(problems)} difference(s):")
