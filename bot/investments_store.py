@@ -260,7 +260,10 @@ def compute_totals(db_path: Path | str) -> list[dict[str, Any]]:
         minus_home_cells.append(total - home)
 
         as_of = _date.fromisoformat(_as_iso(r["as_of_date"]))
-        if prev_total is None or prev_total <= 0 or prev_date is None:
+        # Both totals must be positive: a negative base raised to a
+        # fractional exponent is a complex number, and round() rejects it.
+        # A leveraged property makes a negative round total reachable.
+        if prev_total is None or prev_total <= 0 or total <= 0 or prev_date is None:
             change_cells.append(None)
         else:
             days = (as_of - prev_date).days
@@ -315,7 +318,6 @@ def build_snapshot(
             "holdings": [], "insurance": [], "totals_rows": [],
         }
 
-    round_ids = [r["id"] for r in rounds]
     _, by_round = _round_cells(db_path)
 
     holdings_out: list[dict[str, Any]] = []

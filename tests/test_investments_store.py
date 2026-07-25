@@ -205,6 +205,23 @@ def test_annual_change_annualizes_by_days(tmp_path):
     assert totals["Annual Change"][1] == pytest.approx(100.0, abs=0.5)
 
 
+def test_annual_change_is_none_when_round_total_goes_negative(tmp_path):
+    """A leveraged property can push a round's total negative.
+
+    growth ** (365/days) on a negative base is a complex number, which
+    round() rejects with TypeError. compute_totals must not crash.
+    """
+    db = tmp_path / "t.db"
+    init_db(db)
+    h = store.upsert_holding(db, name="105 7th Ave", kind="property")
+    # A non-exact-year gap gives a fractional exponent (365/days != 1),
+    # which is what turns a negative base into a complex number.
+    _round_with(db, "A", "2025-07-25", [{"holding_id": h, "value_cents": 100000}])
+    _round_with(db, "B", "2026-08-01", [{"holding_id": h, "value_cents": -50000}])
+    totals = {t["label"]: t["cells"] for t in store.compute_totals(db)}
+    assert totals["Annual Change"][1] is None
+
+
 def test_target_and_delta_use_savings_target_row(tmp_path):
     db = tmp_path / "t.db"
     init_db(db)
