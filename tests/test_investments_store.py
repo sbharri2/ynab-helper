@@ -160,3 +160,162 @@ def test_upsert_holding_updates_when_id_given(tmp_path):
     assert rows[0]["name"] == "New Name"
     assert rows[0]["closed"] == 1
     assert store.list_holdings(db, include_closed=False) == []
+
+
+def _round_with(db, label, as_of, entries):
+    rid = store.create_round(db, label=label, as_of_date=as_of)
+    store.upsert_values(db, round_id=rid, values=entries)
+    return rid
+
+
+def test_minus_home_equity_subtracts_only_primary_residence(tmp_path):
+    db = tmp_path / "t.db"
+    init_db(db)
+    home = store.upsert_holding(db, name="117 Mayfield", kind="property")
+    rental = store.upsert_holding(db, name="105 7th Ave", kind="property")
+    cash = store.upsert_holding(db, name="Marcus", kind="cash")
+    with connect(db) as con:
+        con.execute(
+            "INSERT INTO property_detail (holding_id, is_primary_residence) "
+            "VALUES (?, 1)", (home,),
+        )
+        con.execute(
+            "INSERT INTO property_detail (holding_id, is_primary_residence) "
+            "VALUES (?, 0)", (rental,),
+        )
+    _round_with(db, "Jul 2026", "2026-07-25", [
+        {"holding_id": home, "value_cents": 24952292},
+        {"holding_id": rental, "value_cents": 6351669},
+        {"holding_id": cash, "value_cents": 2566800},
+    ])
+    totals = {t["label"]: t["cells"] for t in store.compute_totals(db)}
+    assert totals["Total"][0] == 24952292 + 6351669 + 2566800
+    # rental stays in; only the primary residence comes out
+    assert totals["Minus Home Equity"][0] == 6351669 + 2566800
+
+
+def test_annual_change_annualizes_by_days(tmp_path):
+    db = tmp_path / "t.db"
+    init_db(db)
+    h = store.upsert_holding(db, name="Fund", kind="brokerage")
+    _round_with(db, "A", "2025-07-25", [{"holding_id": h, "value_cents": 100000}])
+    _round_with(db, "B", "2026-07-25", [{"holding_id": h, "value_cents": 200000}])
+    totals = {t["label"]: t["cells"] for t in store.compute_totals(db)}
+    assert totals["Annual Change"][0] is None          # no prior round
+    assert totals["Annual Change"][1] == pytest.approx(100.0, abs=0.5)
+
+
+def test_target_and_delta_use_savings_target_row(tmp_path):
+    db = tmp_path / "t.db"
+    init_db(db)
+    h = store.upsert_holding(db, name="Fund", kind="brokerage")
+    _round_with(db, "Jul 2026", "2026-07-25", [
+        {"holding_id": h, "value_cents": 100000000},
+    ])
+    with connect(db) as con:
+        con.execute(
+            "INSERT INTO savings_target "
+            "(id, effective_year, age, combined_salary_cents, multiplier) "
+            "VALUES ('t1', 2026, 42, 29800000, 3.0)"
+        )
+    totals = {t["label"]: t["cells"] for t in store.compute_totals(db)}
+    assert totals["Target Savings"][0] == 89400000
+    assert totals["Delta"][0] == 100000000 - 89400000
+
+
+def test_target_steps_to_4x_at_45(tmp_path):
+    db = tmp_path / "t.db"
+    init_db(db)
+    h = store.upsert_holding(db, name="Fund", kind="brokerage")
+    _round_with(db, "Jul 2029", "2029-07-25", [
+        {"holding_id": h, "value_cents": 1},
+    ])
+    with connect(db) as con:
+        con.execute(
+            "INSERT INTO savings_target "
+            "(id, effective_year, age, combined_salary_cents, multiplier) "
+            "VALUES ('t1', 2026, 42, 29800000, 3.0)"
+        )
+        con.execute(
+            "INSERT INTO savings_target "
+            "(id, effective_year, age, combined_salary_cents, multiplier) "
+            "VALUES ('t2', 2029, 45, 29800000, 4.0)"
+        )
+    totals = {t["label"]: t["cells"] for t in store.compute_totals(db)}
+    assert totals["Target Savings"][0] == 119200000
+
+
+def test_build_snapshot_matches_typescript_shape(tmp_path):
+    db = tmp_path / "t.db"
+    init_db(db)
+    home = store.upsert_holding(
+        db, name="117 Mayfield", kind="property", account_type="Home Equity",
+        owner="joint", account_number="", notes="Zestimate",
+    )
+    fund = store.upsert_holding(
+        db, name="Roth IRA", kind="retirement", account_type="Roth IRA",
+        owner="steven", account_number="1234",
+    )
+    _round_with(db, "Feb 2026", "2026-02-15", [
+        {"holding_id": home, "value_cents": 100},
+        {"holding_id": fund, "value_cents": 200},
+    ])
+    _round_with(db, "Jul 2026", "2026-07-25", [
+        {"holding_id": home, "value_cents": 300},
+        {"holding_id": fund, "value_cents": 400},
+    ])
+    snap = store.build_snapshot(db)
+    assert set(snap) == {
+        "source_file", "as_of", "holdings", "insurance", "totals_rows",
+    }
+    assert snap["as_of"] == "2026-07-25"
+    assert snap["source_file"] == "database"
+    by_name = {h["name"]: h for h in snap["holdings"]}
+    assert set(by_name) == {"117 Mayfield", "Roth IRA"}
+    assert by_name["117 Mayfield"]["is_real_estate"] is True
+    assert by_name["Roth IRA"]["is_real_estate"] is False
+    assert by_name["Roth IRA"]["account_type"] == "Roth IRA"
+    # oldest -> newest, one cell per round, never compressed
+    assert [v["cents"] for v in by_name["Roth IRA"]["values"]] == [200, 400]
+    assert [v["snapshot_date"] for v in by_name["Roth IRA"]["values"]] == [
+        "2026-02-15", "2026-07-25",
+    ]
+    assert [v["label"] for v in by_name["Roth IRA"]["values"]] == ["Feb 2026", "Jul 2026"]
+    total = next(t for t in snap["totals_rows"] if t["label"] == "Total")
+    assert total["cells"] == [300, 700]
+
+
+def test_snapshot_emits_full_length_arrays_for_gap_holdings(tmp_path):
+    """A holding with no value in an early round still gets a cell.
+
+    The xlsx parser dropped empty cells, which compressed the arrays and
+    made InvestmentsOverview.buildSeries() depend on finding a complete
+    row. From the DB every array is round-aligned.
+    """
+    db = tmp_path / "t.db"
+    init_db(db)
+    old = store.upsert_holding(db, name="Old", kind="cash")
+    new = store.upsert_holding(db, name="New", kind="cash")
+    _round_with(db, "Feb 2026", "2026-02-15", [{"holding_id": old, "value_cents": 100}])
+    _round_with(db, "Jul 2026", "2026-07-25", [
+        {"holding_id": old, "value_cents": 150},
+        {"holding_id": new, "value_cents": 900},
+    ])
+    snap = store.build_snapshot(db)
+    by_name = {h["name"]: h for h in snap["holdings"]}
+    assert len(by_name["New"]["values"]) == 2
+    assert by_name["New"]["values"][0]["cents"] == 0
+    assert len(by_name["Old"]["values"]) == 2
+
+
+def test_build_snapshot_round_id_truncates_history(tmp_path):
+    db = tmp_path / "t.db"
+    init_db(db)
+    h = store.upsert_holding(db, name="Fund", kind="brokerage")
+    r1 = _round_with(db, "Feb 2026", "2026-02-15", [
+        {"holding_id": h, "value_cents": 100},
+    ])
+    _round_with(db, "Jul 2026", "2026-07-25", [{"holding_id": h, "value_cents": 200}])
+    snap = store.build_snapshot(db, round_id=r1)
+    assert snap["as_of"] == "2026-02-15"
+    assert [v["cents"] for v in snap["holdings"][0]["values"]] == [100]
