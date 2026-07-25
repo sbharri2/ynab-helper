@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -33,6 +34,42 @@ def _undated(holding: dict) -> bool:
     return any(not v.get("snapshot_date") for v in holding["values"])
 
 
+def _hkey(h: dict) -> tuple:
+    """A holding's real identity is not its name alone.
+
+    32 real rows import to only 29 distinct names -- e.g. "Schwab
+    (Transfered from TD AmeriTrade)" is both a Roth IRA ($393.60) and a
+    Stock Account ($25,606.62). Name-only keying let a merged-away
+    holding compare equal to its surviving twin and lost $25,606.62 in
+    the real cutover. account_type + owner disambiguate.
+    """
+    return (h["name"], h.get("account_type") or None, h.get("owner") or None)
+
+
+def _readable(k: tuple) -> str:
+    return f"{k[0]} ({k[1]}, {k[2]})"
+
+
+def _sort_key(k: tuple) -> tuple:
+    # Tuple elements can be None (undated columns, missing account_type),
+    # and sorting a set of mixed None/str tuples raises TypeError the
+    # moment two keys share their first field or more -- exactly the
+    # duplicate-name case this function exists to sort. Stringify first.
+    return tuple(str(x) for x in k)
+
+
+def _ikey(p: dict) -> tuple:
+    """Insurance has no identity to key on at all. "Life - Steven" appears
+    four times across providers, and two of those share provider AND
+    coverage, differing only in premium ($214.08 vs $151.44). Compare the
+    whole row as a multiset member instead of pretending a key exists.
+    """
+    return (
+        p.get("insurance_type"), p.get("provider") or "",
+        p.get("coverage") or "", p.get("annual_premium_cents"),
+    )
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--xlsx", type=Path, default=None)
@@ -48,29 +85,47 @@ def main() -> int:
     db = store.build_snapshot(args.db)
     problems: list[str] = []
 
-    sheet_h = {h["name"]: h for h in sheet["holdings"]}
-    db_h = {h["name"]: h for h in db["holdings"]}
+    # Identity is the (name, account_type, owner) triple, not name alone --
+    # see _hkey. Report duplicate keys on either side rather than silently
+    # collapsing them: if the sheet or DB ever carries two rows identical
+    # in all three fields, the dict comprehension below would hide one of
+    # them the same way plain name-keying did.
+    sheet_key_counts = Counter(_hkey(h) for h in sheet["holdings"])
+    db_key_counts = Counter(_hkey(h) for h in db["holdings"])
+    for k in sorted((k for k, n in sheet_key_counts.items() if n > 1), key=_sort_key):
+        problems.append(
+            f"xlsx has {sheet_key_counts[k]} holdings with identical "
+            f"(name, account_type, owner) {_readable(k)}"
+        )
+    for k in sorted((k for k, n in db_key_counts.items() if n > 1), key=_sort_key):
+        problems.append(
+            f"db has {db_key_counts[k]} holdings with identical "
+            f"(name, account_type, owner) {_readable(k)}"
+        )
 
-    for name in sorted(set(sheet_h) - set(db_h)):
-        problems.append(f"missing from DB: {name}")
-    for name in sorted(set(db_h) - set(sheet_h)):
-        problems.append(f"extra in DB (not in xlsx): {name}")
+    sheet_h = {_hkey(h): h for h in sheet["holdings"]}
+    db_h = {_hkey(h): h for h in db["holdings"]}
 
-    undated_names = {name for name, h in sheet_h.items() if _undated(h)}
-    for name in sorted(undated_names):
-        problems.append(f"{name}: xlsx has a value column with no parseable date")
+    for k in sorted(set(sheet_h) - set(db_h), key=_sort_key):
+        problems.append(f"missing from DB: {_readable(k)}")
+    for k in sorted(set(db_h) - set(sheet_h), key=_sort_key):
+        problems.append(f"extra in DB (not in xlsx): {_readable(k)}")
+
+    undated_keys = {k for k, h in sheet_h.items() if _undated(h)}
+    for k in sorted(undated_keys, key=_sort_key):
+        problems.append(f"{_readable(k)}: xlsx has a value column with no parseable date")
 
     # A holding with an undated column has an untrustworthy `None` key in
     # its date dict, which can't be compared against real ISO date strings
     # (sorted() would raise). It's already been flagged above, so skip its
     # per-date diff rather than let that surface as an unhandled crash.
-    for name in sorted((set(sheet_h) & set(db_h)) - undated_names):
-        want = _cells_by_date(sheet_h[name])
-        got = _cells_by_date(db_h[name])
+    for k in sorted((set(sheet_h) & set(db_h)) - undated_keys, key=_sort_key):
+        want = _cells_by_date(sheet_h[k])
+        got = _cells_by_date(db_h[k])
         for iso in sorted(set(want) | set(got)):
             if want.get(iso, 0) != got.get(iso, 0):
                 problems.append(
-                    f"{name} @ {iso}: xlsx {want.get(iso, 0)} != db {got.get(iso, 0)}"
+                    f"{_readable(k)} @ {iso}: xlsx {want.get(iso, 0)} != db {got.get(iso, 0)}"
                 )
 
     db_dates = (
@@ -124,32 +179,39 @@ def main() -> int:
     elif len(db_primary) == 1 and len(minus_home) == len(total_cells) == len(db_dates):
         # Both sides agree on WHO the primary residence is; sanity-check the
         # DB's own subtraction arithmetic against that holding's own value.
+        # db_h is keyed by the (name, account_type, owner) triple now, not
+        # by name alone -- a name match can hit more than one entry (the
+        # same duplicate-name problem holdings have generally), so that is
+        # reported rather than silently picking whichever one dict lookup
+        # would have returned.
         primary = db_primary[0]
-        primary_cells = _cells_by_date(db_h[primary]) if primary in db_h else {}
-        for i, iso in enumerate(db_dates):
-            subtracted = total_cells[i] - minus_home[i]
-            expected = primary_cells.get(iso, 0)
-            if subtracted != expected:
-                problems.append(
-                    f"Minus Home Equity @ {iso}: subtracted {subtracted}, but the "
-                    f"primary residence ({primary}) is {expected}"
-                )
+        primary_matches = [k for k in db_h if k[0] == primary]
+        if len(primary_matches) != 1:
+            problems.append(
+                f"primary residence name {primary!r} matches "
+                f"{len(primary_matches)} holdings in the DB, not 1: "
+                f"{sorted(_readable(k) for k in primary_matches)}"
+            )
+        else:
+            primary_cells = _cells_by_date(db_h[primary_matches[0]])
+            for i, iso in enumerate(db_dates):
+                subtracted = total_cells[i] - minus_home[i]
+                expected = primary_cells.get(iso, 0)
+                if subtracted != expected:
+                    problems.append(
+                        f"Minus Home Equity @ {iso}: subtracted {subtracted}, but the "
+                        f"primary residence ({primary}) is {expected}"
+                    )
 
-    sheet_ins = {p["insurance_type"]: p for p in sheet["insurance"]}
-    db_ins = {p["insurance_type"]: p for p in db["insurance"]}
-    if len(sheet_ins) != len(sheet["insurance"]):
-        problems.append(
-            "xlsx has duplicate insurance types; premiums can't be matched by type"
-        )
-    for t in sorted(set(sheet_ins) - set(db_ins)):
-        problems.append(f"insurance missing from DB: {t}")
-    for t in sorted(set(db_ins) - set(sheet_ins)):
-        problems.append(f"insurance extra in DB: {t}")
-    for t in sorted(set(sheet_ins) & set(db_ins)):
-        w = sheet_ins[t].get("annual_premium_cents")
-        g = db_ins[t].get("annual_premium_cents")
-        if w != g:
-            problems.append(f"insurance {t}: xlsx premium {w} != db {g}")
+    # Insurance has no identity to key on at all (see _ikey) -- 28 rows,
+    # 22 distinct types, and two rows sharing type+provider+coverage that
+    # differ only by premium. Compare whole-row multisets instead.
+    sheet_ins = Counter(_ikey(p) for p in sheet["insurance"])
+    db_ins = Counter(_ikey(p) for p in db["insurance"])
+    for tup, n in sorted((sheet_ins - db_ins).items(), key=lambda item: _sort_key(item[0])):
+        problems.append(f"insurance in xlsx but not DB (x{n}): {tup}")
+    for tup, n in sorted((db_ins - sheet_ins).items(), key=lambda item: _sort_key(item[0])):
+        problems.append(f"insurance in DB but not xlsx (x{n}): {tup}")
     n_db_ins = len(db["insurance"])
 
     if problems:
