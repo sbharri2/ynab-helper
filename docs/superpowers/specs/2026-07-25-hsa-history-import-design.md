@@ -248,6 +248,38 @@ exactly $0 of RTA movement.**
 By year: 2021 -$2,533 | 2022 -$9,322 | 2023 -$4,812 | 2024 -$15,425 |
 2025 -$17,842 | 2026 -$7,576 (partial).
 
+## OPEN ISSUE: YNAB full-sync reverts 118 of the re-filed rows
+
+Found while adding Dental/Ortho. A Mochi row re-filed at 18:18 was back in `Medical` by
+18:35. Cause: `bot/ynab_full_sync.py:242` writes YNAB's category onto local rows —
+**YNAB is authoritative for transaction categories** on any row carrying a
+`ynab_txn_id`. (`ynab_full_sync_run` last fired 2026-07-25 18:35:51, exactly matching the
+revert; it has run 241 times.)
+
+Note this does not contradict "the bot's budget is its own truth" — that concerns budget
+*assignments* in `month_category`, which the bot owns. Per-transaction categories are
+still mirrored from YNAB.
+
+Exposure across all rows matching a Pharmacy / Mental Health / Dental / Weight Loss rule:
+
+| | Rows | Durable? |
+| --- | ---: | --- |
+| Local-only (the imported HSA rows) | 140 | Yes — no `ynab_txn_id`, sync cannot touch them |
+| Carrying a `ynab_txn_id` | 118 | **No — will revert** (116 on Citi Double Cash) |
+
+So the HSA history itself is safe; the credit-card re-files are not. Options, needing
+Steven's call:
+
+1. **Make it durable in YNAB.** Create `Pharmacy`, `Mental Health` and `Dental/Ortho` in
+   YNAB by hand (the YNAB API has no create-category endpoint), map their
+   `ynab_category_id`, then push the 118 assignments via the existing
+   `ynab_client.set_category`.
+2. **Let local win in sync.** Guard `ynab_full_sync` so a locally-set category is not
+   overwritten. Aligns with the redesign direction of the bot replacing YNAB, but it is
+   a real change to sync semantics and needs its own testing.
+3. **Accept the drift.** Keep the 140 durable HSA rows; the card rows revert to Medical
+   on the next sync. Re-running this script re-applies the split at any time.
+
 ## Deployment
 
 - `bot/envelope.py` goes live only on the next restart of the `YNAB-Helper-Bot`

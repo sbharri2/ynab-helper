@@ -46,11 +46,13 @@ EXPECTED_FINAL_BALANCE_CENTS = 11217
 NEW_CATEGORIES = [
     ("Pharmacy", "Day to Day Expenses"),
     ("Mental Health", "Day to Day Expenses"),
+    ("Dental/Ortho", "Day to Day Expenses"),
 ]
 
 CAT_MEDICAL = "Medical"
 CAT_PHARMACY = "Pharmacy"
 CAT_MENTAL = "Mental Health"
+CAT_DENTAL = "Dental/Ortho"
 CAT_WEIGHT_LOSS = "Weight Loss Meds"
 CAT_HSA = "Health Equity HSA"
 
@@ -86,6 +88,13 @@ RULES: list[tuple[str, tuple[str, ...]]] = [
         "MD PSYCHIATRY",
         "DUKE BEHAV",
     )),
+    # Anchored on FULL provider names. A loose "SHINE" matches Sonshine Gymnastics,
+    # Booneshine Brewing and Sunshine Beverage; a loose "STEET" matches HarrisTeeter.
+    (CAT_DENTAL, (
+        "SHINE ORTHODONTICS",
+        "THOMAS C STEET",
+        "ZIMA DENTAL",
+    )),
     # Steven, 2026-07-25: "cvs is always medical... treat that way". This overrides the
     # recommendation to leave the 34 CVS rows sitting in Groceries (avg $31/txn) alone.
     # His call on his own spending.
@@ -113,6 +122,23 @@ PROTECTED_GROUPS = ("Reimbursables",)
 # Deliberately absent: URGENT VET - CARY and SWIFT CREEK ANIMAL HOS. Pet medical is not
 # family medical. B Young Physical Therapy IS here and goes to Medical, not Mental
 # Health -- PT is not psychotherapy.
+# One-off rows misfiled under Medical that are not medical at all. Matched on
+# (payee substring, exact date) so they can never sweep up a similar payee.
+#
+# Venmo rows in Medical are deliberately absent -- Steven: those are reimbursing family
+# members who fronted the cost of visits, so Medical is correct.
+MISFILED: tuple[tuple[str, str, str], ...] = (
+    # Professional licence. The other three identical $50/$55 NC Board charges and the
+    # $974 AIA dues are all already in Steven Reimbursables.
+    ("NC BOARD OF ARCHITECTURE", "2026-05-20", "Steven Reimbursables"),
+    # Kids' arts programme. The other UNCG CVPA charge (-$635) is in Childcare.
+    ("UNCG CVPA BOX OFFICE", "2025-07-09", "Childcare (YMCA or other)"),
+    # A craft vendor at MerleFest, not a clinic. That whole week is the Wilkesboro
+    # trip, and its neighbours (AdaArt Jewelry, Dalia Jade, Hometown Collaborative)
+    # are all filed as Gifts.
+    ("DANA MINETTE", "2026-04-25", "Gifts"),
+)
+
 RESCUE_FROM = "Emergency Savings"
 RESCUE_PAYEES = (
     "DUKE HEALTH MYCHART",
@@ -335,19 +361,19 @@ def main() -> None:
     for name, amts in sorted(by_cat.items(), key=lambda kv: sum(kv[1])):
         print(f"    {name:20} n={len(amts):>4}  ${sum(amts) / 100:>12,.2f}")
 
-    print("\n[4] re-file existing card transactions")
-    hsa_acct_filter = ""
-    if account_id:
-        hsa_acct_filter = "AND l.account_id != :aid"
+    print("\n[4] re-file transactions to match the classifier")
+    # Deliberately NOT excluding the HSA account. Its rows were filed by this same
+    # classifier at import, so re-running is a no-op -- but when a RULE changes (e.g.
+    # adding Dental/Ortho), the HSA rows need to move too or the split applies to the
+    # cards only. Keeps the script self-healing across rule edits.
     ledger = con.execute(
-        f"""SELECT l.id, l.payee, l.amount_cents, l.category_id, l.posted_date,
-                   c.name AS cat_name, g.name AS grp_name, a.name AS acct
-            FROM ledger_txn l
-            JOIN account a ON a.id = l.account_id
-            LEFT JOIN category c ON c.id = l.category_id
-            LEFT JOIN category_group g ON g.id = c.group_id
-            WHERE l.is_split = 0 {hsa_acct_filter}""",
-        {"aid": account_id} if account_id else {},
+        """SELECT l.id, l.payee, l.amount_cents, l.category_id, l.posted_date,
+                  c.name AS cat_name, g.name AS grp_name, a.name AS acct
+           FROM ledger_txn l
+           JOIN account a ON a.id = l.account_id
+           LEFT JOIN category c ON c.id = l.category_id
+           LEFT JOIN category_group g ON g.id = c.group_id
+           WHERE l.is_split = 0"""
     ).fetchall()
 
     moves: dict[tuple[str, str], list[int]] = {}
@@ -403,6 +429,34 @@ def main() -> None:
     print(f"  {rescued} rows -> {CAT_MEDICAL}  "
           f"(${rescued_total / 100:,.2f}); "
           f"{len(stranded) - rescued} non-medical rows left in {RESCUE_FROM}")
+
+    print("\n[6] one-off misfiled rows")
+    fixed = 0
+    for needle, when, target in MISFILED:
+        if target not in cats:
+            sys.exit(f"FATAL: category {target!r} not found")
+        hits = [
+            r for r in con.execute(
+                """SELECT l.id, l.payee, l.amount_cents, c.name AS cat_name
+                   FROM ledger_txn l
+                   LEFT JOIN category c ON c.id = l.category_id
+                   WHERE l.posted_date = ? AND l.is_split = 0""",
+                (when,),
+            ) if needle in norm(r["payee"] or "")
+        ]
+        for r in hits:
+            if r["cat_name"] == target:
+                continue
+            fixed += 1
+            print(f"    {when}  {r['amount_cents'] / 100:>9,.2f}  "
+                  f"{r['payee'][:30]:32} {r['cat_name']} -> {target}")
+            if args.apply:
+                con.execute(
+                    "UPDATE ledger_txn SET category_id = ?, "
+                    "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (cats[target], r["id"]),
+                )
+    print(f"  {fixed} rows corrected")
 
     if args.apply:
         con.commit()
