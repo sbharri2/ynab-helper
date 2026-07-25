@@ -4,7 +4,7 @@
 
 **Goal:** Move retirement/investment and insurance tracking out of the Google Sheet → xlsx → parse-on-read pipeline and into the SQLite DB, with in-app editing.
 
-**Architecture:** Eight new tables in `bot/storage.py`. Three new bot modules — `investments_store.py` (holdings, rounds, values, snapshot assembly), `investments_insurance.py` (policies, premiums, drift), `investments_import.py` (one-time xlsx → DB). `GET /investments/snapshot` keeps its exact JSON shape but is served from the DB, so the four existing Tauri pages need no changes; two new editor pages are added alongside them.
+**Architecture:** Seven new tables in `bot/storage.py`. Three new bot modules — `investments_store.py` (holdings, rounds, values, snapshot assembly), `investments_insurance.py` (policies, premiums, drift), `investments_import.py` (one-time xlsx → DB). `GET /investments/snapshot` keeps its exact JSON shape but is served from the DB, so the four existing Tauri pages need no changes; two new editor pages are added alongside them.
 
 **Tech Stack:** Python 3.12, SQLite (stdlib `sqlite3`), FastAPI + Pydantic, pytest, openpyxl (import only). UI: Tauri 2, React, TanStack Query, Tailwind.
 
@@ -864,7 +864,10 @@ def compute_totals(db_path: Path | str) -> list[dict[str, Any]]:
         minus_home_cells.append(total - home)
 
         as_of = _date.fromisoformat(_as_iso(r["as_of_date"]))
-        if prev_total is None or prev_total <= 0 or prev_date is None:
+        # Both totals must be positive: a negative base raised to a
+        # fractional exponent is a complex number, and round() rejects it.
+        # A leveraged property makes a negative round total reachable.
+        if prev_total is None or prev_total <= 0 or total <= 0 or prev_date is None:
             change_cells.append(None)
         else:
             days = (as_of - prev_date).days
@@ -1218,12 +1221,21 @@ def list_policies(
     """
     today = today or date.today()
     with connect(db_path) as con:
+        # created_at is a TIMESTAMP column, so PARSE_DECLTYPES hands back a
+        # datetime — not JSON-serializable. This dict goes out through a
+        # FastAPI route, so select the columns explicitly rather than *.
         policies = [dict(r) for r in con.execute(
-            "SELECT * FROM insurance_policy ORDER BY active DESC, sort_order, insurance_type"
+            "SELECT id, insurance_type, provider, policy_number, covers, "
+            "through_employer, coverage, deductible, premium_cents, "
+            "premium_frequency, paid_via, ledger_payee_norm, sales_contact, "
+            "renewal_date, comments, active, sort_order "
+            "FROM insurance_policy ORDER BY active DESC, sort_order, insurance_type"
         )]
         observations = [dict(r) for r in con.execute(
+            # `id` breaks same-day ties: without it, which of two
+            # observations sharing a date wins is unspecified SQL behavior.
             "SELECT policy_id, as_of_date, amount_cents, source "
-            "FROM insurance_premium_observed ORDER BY as_of_date"
+            "FROM insurance_premium_observed ORDER BY as_of_date, id"
         )]
 
     latest: dict[str, dict[str, Any]] = {}
@@ -1319,12 +1331,19 @@ Import is idempotent on round `as_of_date` and on holding `name`. An unparseable
 Create `tests/test_investments_import.py`:
 
 ```python
+from datetime import date
+
 import pytest
 from openpyxl import Workbook
 
 from bot.storage import init_db, connect
 from bot import investments_import as imp
 from bot import investments_store as store
+
+# NOTE: sqlite3 runs with detect_types=PARSE_DECLTYPES and storage.py:18-21
+# registers DATE converters, so DATE columns come back as datetime.date,
+# NOT str. Assertions against raw rows must use date(...) objects; only
+# build_snapshot's payload is normalized to ISO strings via _as_iso().
 
 
 def _make_xlsx(path, *, header_dates=("02-15-26", "07-25-26")):
@@ -1354,7 +1373,7 @@ def test_import_creates_rounds_holdings_values(tmp_path):
     assert result["holdings"] == 2
     assert result["values"] == 4
     rounds = store.list_rounds(db)
-    assert [r["as_of_date"] for r in rounds] == ["2026-07-25", "2026-02-15"]
+    assert [r["as_of_date"] for r in rounds] == [date(2026, 7, 25), date(2026, 2, 15)]
 
 
 def test_import_is_idempotent(tmp_path):
@@ -1364,12 +1383,60 @@ def test_import_is_idempotent(tmp_path):
     imp.import_xlsx(db, xlsx)
     second = imp.import_xlsx(db, xlsx)
     assert second["rounds"] == 0
+    assert second["values"] == 0            # additive only: nothing rewritten
+    assert second["skipped_values"] == 4
     assert len(second["skipped_rounds"]) == 2
     assert len(store.list_rounds(db)) == 2
     assert len(store.list_holdings(db)) == 2
     with connect(db) as con:
         n = con.execute("SELECT COUNT(*) FROM holding_value").fetchone()[0]
     assert n == 4
+
+
+def test_reimport_does_not_revert_a_hand_edited_value(tmp_path):
+    """The sheet is being retired; it must never overwrite operator input."""
+    db = tmp_path / "t.db"
+    init_db(db)
+    xlsx = _make_xlsx(tmp_path / "snap.xlsx")
+    imp.import_xlsx(db, xlsx)
+
+    holdings = {h["name"]: h for h in store.list_holdings(db)}
+    newest = store.list_rounds(db)[0]
+    store.upsert_values(db, round_id=newest["id"], values=[
+        {"holding_id": holdings["Marcus"]["id"], "value_cents": 9999900},
+    ])
+
+    imp.import_xlsx(db, xlsx)
+
+    with connect(db) as con:
+        row = con.execute(
+            "SELECT value_cents, source FROM holding_value "
+            "WHERE holding_id = ? AND round_id = ?",
+            (holdings["Marcus"]["id"], newest["id"]),
+        ).fetchone()
+    assert row["value_cents"] == 9999900
+    assert row["source"] == "manual"
+
+
+def test_bare_year_header_raises_instead_of_inventing_jan_1(tmp_path):
+    """parse_snapshot falls back to YYYY-01-01; the importer must refuse it."""
+    db = tmp_path / "t.db"
+    init_db(db)
+    xlsx = tmp_path / "bare.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Account", "Type", "Number", "Owner", "2026 Value", "Notes"])
+    ws.append(["Marcus", "Savings", "1234", "Joint", "$1.00", ""])
+    wb.save(xlsx)
+    with pytest.raises(ValueError, match="no parseable date"):
+        imp.import_xlsx(db, xlsx)
+
+
+def test_roth_ira_is_classified_roth_not_pretax(tmp_path):
+    """"ira" is a substring of "roth ira" — longest needle must win."""
+    assert imp._classify("Roth IRA") == ("retirement", "roth")
+    assert imp._classify("Simple IRA") == ("retirement", "pretax")
+    assert imp._classify("IRA") == ("retirement", "pretax")
 
 
 def test_property_rows_get_property_kind_and_detail(tmp_path):
@@ -1395,7 +1462,7 @@ def test_import_creates_policy_and_baseline_observation(tmp_path):
     assert policies[0]["premium_cents"] == 279800
     assert len(obs) == 1
     assert obs[0]["amount_cents"] == 279800
-    assert obs[0]["as_of_date"] == "2026-07-25"     # newest round's date
+    assert obs[0]["as_of_date"] == date(2026, 7, 25)   # newest round's date
 
 
 def test_unparseable_header_raises(tmp_path):
@@ -1444,6 +1511,7 @@ design exists to remove.
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -1453,6 +1521,9 @@ from bot import investments_store as store
 from bot.storage import connect
 
 log = logging.getLogger(__name__)
+
+# A column header must carry a real day/month/year, e.g. "(02-15-26)".
+_FULL_DATE_RE = re.compile(r"\d{1,2}\s*[-/]\s*\d{1,2}\s*[-/]\s*\d{2,4}")
 
 _KIND_BY_TYPE = {
     "401k": "retirement", "403b": "retirement", "ira": "retirement",
@@ -1472,13 +1543,18 @@ _TAX_BY_TYPE = {
 
 
 def _classify(account_type: str) -> tuple[str, str | None]:
-    """(kind, tax_treatment) from the sheet's free-text account type."""
+    """(kind, tax_treatment) from the sheet's free-text account type.
+
+    Longest needle wins. Plain dict order would let "ira" match inside
+    "roth ira" and tag a Roth as pretax — the kind of error that survives
+    review because `kind` comes out "retirement" either way.
+    """
     key = (account_type or "").strip().lower()
     if key in parser._REAL_ESTATE_TYPES:
         return "property", None
-    for needle, kind in _KIND_BY_TYPE.items():
+    for needle in sorted(_KIND_BY_TYPE, key=len, reverse=True):
         if needle in key:
-            return kind, _TAX_BY_TYPE.get(needle)
+            return _KIND_BY_TYPE[needle], _TAX_BY_TYPE.get(needle)
     return "other", None
 
 
@@ -1491,15 +1567,23 @@ def import_xlsx(
     snap = parser.parse_snapshot(path)
 
     # ── Column dates. Every distinct snapshot_date across all holdings. ──
+    #
+    # The parser is NOT trusted to have found a real date. Its
+    # _extract_date_from_label falls back to a bare 4-digit year and
+    # returns a fabricated "YYYY-01-01", which is truthy — so checking
+    # `snapshot_date is not None` would wave through exactly the invented
+    # date this import is supposed to refuse. Re-verify the label itself
+    # carries a full day/month/year.
     dates: dict[str, str] = {}      # iso date -> label
     for h in snap["holdings"]:
         for v in h["values"]:
-            if not v.get("snapshot_date"):
+            label = v.get("label") or ""
+            if not v.get("snapshot_date") or not _FULL_DATE_RE.search(label):
                 raise ValueError(
-                    f"no parseable date in column label {v.get('label')!r} — "
+                    f"no parseable date in column label {label!r} — "
                     "fix the header before importing"
                 )
-            dates[v["snapshot_date"]] = v["label"]
+            dates[v["snapshot_date"]] = label
     if not dates:
         raise ValueError("no parseable date columns found in the workbook")
 
@@ -1521,14 +1605,25 @@ def import_xlsx(
             )
             created_rounds += 1
 
-    # ── Holdings, keyed by name so re-import updates rather than duplicates ──
+    # ── Holdings, keyed by name so re-import can't duplicate them ──
+    #
+    # Import is ADDITIVE ONLY. A holding or value that already exists is
+    # left exactly as it is. Anything else means a re-run silently reverts
+    # hand-corrections back to the sheet's numbers — the sheet is the thing
+    # being retired, so it must never win over what the operator entered.
     with connect(db_path) as con:
         by_name = {
             r["name"]: r["id"] for r in con.execute("SELECT id, name FROM holding")
         }
+        existing_values = {
+            (r["holding_id"], r["round_id"]) for r in con.execute(
+                "SELECT holding_id, round_id FROM holding_value"
+            )
+        }
 
     created_holdings = 0
     written_values = 0
+    skipped_values = 0
     for order, h in enumerate(snap["holdings"]):
         kind, tax = _classify(h.get("account_type", ""))
         hid = by_name.get(h["name"])
@@ -1546,8 +1641,7 @@ def import_xlsx(
             hid = store.upsert_holding(db_path, **fields)
             by_name[h["name"]] = hid
             created_holdings += 1
-        else:
-            store.upsert_holding(db_path, id=hid, **fields)
+        # else: holding already exists — leave its metadata alone.
 
         if kind == "property":
             with connect(db_path) as con:
@@ -1561,6 +1655,9 @@ def import_xlsx(
         # by dropping empty cells, so list position means nothing here.
         for v in h["values"]:
             rid = round_by_date[v["snapshot_date"]]
+            if (hid, rid) in existing_values:
+                skipped_values += 1
+                continue
             store.upsert_values(
                 db_path, round_id=rid, source="xlsx_import",
                 values=[{
@@ -1569,6 +1666,7 @@ def import_xlsx(
                     "as_of_date": v["snapshot_date"],
                 }],
             )
+            existing_values.add((hid, rid))
             written_values += 1
 
     # ── Insurance: registry + one baseline observation at the newest date ──
@@ -1609,11 +1707,14 @@ def import_xlsx(
                 note=f"baseline imported from {path.name}",
             )
 
+    # Counts report CREATIONS only, so a supervising operator can read
+    # "0 / 0 / 0" as "this changed nothing" and trust it.
     result = {
         "source_file": str(path),
         "rounds": created_rounds,
         "holdings": created_holdings,
         "values": written_values,
+        "skipped_values": skipped_values,
         "policies": created_policies,
         "skipped_rounds": skipped,
     }

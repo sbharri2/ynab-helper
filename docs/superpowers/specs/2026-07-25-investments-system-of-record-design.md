@@ -61,7 +61,7 @@ Locked with the user before design:
 
 ## 1. Schema
 
-Eight tables in `bot/storage.py` — added to the `SCHEMA` string as
+Seven tables in `bot/storage.py` — added to the `SCHEMA` string as
 `CREATE TABLE IF NOT EXISTS`, following existing conventions: TEXT primary
 keys for domain entities, INTEGER AUTOINCREMENT for logs, all money in
 `*_cents`.
