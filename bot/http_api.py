@@ -200,6 +200,76 @@ class YnabPushBody(BaseModel):
     ledger_txn_id: int
 
 
+class InvestmentRoundBody(BaseModel):
+    label: str
+    as_of_date: str
+    seed_from_previous: bool = False
+
+
+class InvestmentValueItem(BaseModel):
+    holding_id: str
+    value_cents: int
+    as_of_date: str | None = None
+    market_value_cents: int | None = None
+    debt_cents: int | None = None
+    vested_cents: int | None = None
+    units: float | None = None
+    unit_price_cents: int | None = None
+    note: str | None = None
+
+
+class InvestmentValuesBody(BaseModel):
+    round_id: str
+    values: list[InvestmentValueItem]
+
+
+class InvestmentHoldingBody(BaseModel):
+    id: str | None = None
+    name: str | None = None
+    owner: str | None = None
+    kind: str | None = None
+    account_type: str | None = None
+    institution: str | None = None
+    account_number: str | None = None
+    tax_treatment: str | None = None
+    ledger_account_id: str | None = None
+    closed: bool | None = None
+    sort_order: int | None = None
+    notes: str | None = None
+
+
+class InsurancePolicyBody(BaseModel):
+    id: str | None = None
+    insurance_type: str | None = None
+    provider: str | None = None
+    policy_number: str | None = None
+    covers: str | None = None
+    through_employer: bool | None = None
+    coverage: str | None = None
+    deductible: str | None = None
+    premium_cents: int | None = None
+    premium_frequency: str | None = None
+    paid_via: str | None = None
+    ledger_payee_norm: str | None = None
+    sales_contact: str | None = None
+    renewal_date: str | None = None
+    comments: str | None = None
+    active: bool | None = None
+    sort_order: int | None = None
+
+
+class InsurancePremiumBody(BaseModel):
+    policy_id: str
+    as_of_date: str
+    amount_cents: int
+    source: str = "manual"
+    note: str | None = None
+
+
+class InvestmentImportBody(BaseModel):
+    xlsx_path: str | None = None
+
+
 def build_app(
     settings: Settings | None = None,
     *,
@@ -802,21 +872,136 @@ def build_app(
         return {"folder": str(inv.SNAPSHOTS_DIR), "files": inv.list_snapshots()}
 
     @app.get("/investments/snapshot", dependencies=[Depends(_require_token)])
-    def investments_snapshot() -> dict[str, Any]:
-        """Parsed snapshot from the most recent xlsx in the folder."""
-        from bot import investments as inv
-        latest = inv.find_latest_snapshot()
-        if not latest:
-            raise HTTPException(
-                404,
-                f"No xlsx files in {inv.SNAPSHOTS_DIR}. "
-                "Drop your exported sheet there.",
-            )
+    def investments_snapshot(round_id: str | None = None) -> dict[str, Any]:
+        """Snapshot assembled from the DB. Shape is pinned by types.ts."""
+        from bot import investments_store as istore
         try:
-            return inv.parse_snapshot(latest)
+            return istore.build_snapshot(db_path, round_id=round_id)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+
+    @app.get("/investments/rounds", dependencies=[Depends(_require_token)])
+    def investments_rounds() -> dict[str, Any]:
+        from bot import investments_store as istore
+        return {"rounds": istore.list_rounds(db_path)}
+
+    @app.get("/investments/holdings", dependencies=[Depends(_require_token)])
+    def investments_holdings(include_closed: bool = True) -> dict[str, Any]:
+        from bot import investments_store as istore
+        return {
+            "holdings": istore.list_holdings(
+                db_path, include_closed=include_closed,
+            ),
+        }
+
+    @app.get("/investments/insurance", dependencies=[Depends(_require_token)])
+    def investments_insurance_list() -> dict[str, Any]:
+        from bot import investments_insurance as iins
+        return {"policies": iins.list_policies(db_path)}
+
+    @app.post("/investments/round", dependencies=[Depends(_require_token)])
+    def investments_create_round(body: InvestmentRoundBody) -> dict[str, Any]:
+        from bot import investments_store as istore
+        try:
+            rid = istore.create_round(
+                db_path,
+                label=body.label,
+                as_of_date=body.as_of_date,
+                seed_from_previous=body.seed_from_previous,
+            )
         except Exception as e:  # noqa: BLE001
-            log.exception("snapshot parse failed: %s", e)
-            raise HTTPException(500, f"parse failed: {e}")
+            raise HTTPException(400, f"could not create round: {e}")
+        storage.audit(db_path, "ui_investments_round", {
+            "round_id": rid, "label": body.label, "as_of_date": body.as_of_date,
+            "seeded": body.seed_from_previous,
+        })
+        return {"ok": True, "round_id": rid}
+
+    @app.post("/investments/values", dependencies=[Depends(_require_token)])
+    def investments_save_values(body: InvestmentValuesBody) -> dict[str, Any]:
+        from bot import investments_store as istore
+        payload = [v.model_dump(exclude_none=True) for v in body.values]
+        try:
+            n = istore.upsert_values(
+                db_path, round_id=body.round_id, values=payload,
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        storage.audit(db_path, "ui_investments_values", {
+            "round_id": body.round_id, "count": n,
+        })
+        return {"ok": True, "written": n}
+
+    @app.post("/investments/holding", dependencies=[Depends(_require_token)])
+    def investments_save_holding(body: InvestmentHoldingBody) -> dict[str, Any]:
+        from bot import investments_store as istore
+        fields = body.model_dump(exclude_none=True)
+        hid = fields.pop("id", None)
+        if "closed" in fields:
+            fields["closed"] = int(fields["closed"])
+        if hid is None and not fields.get("name"):
+            raise HTTPException(400, "name required to create a holding")
+        try:
+            hid = istore.upsert_holding(db_path, id=hid, **fields)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        storage.audit(db_path, "ui_investments_holding", {
+            "holding_id": hid, "fields": sorted(fields),
+        })
+        return {"ok": True, "holding_id": hid}
+
+    @app.post("/investments/policy", dependencies=[Depends(_require_token)])
+    def investments_save_policy(body: InsurancePolicyBody) -> dict[str, Any]:
+        from bot import investments_insurance as iins
+        fields = body.model_dump(exclude_none=True)
+        pid = fields.pop("id", None)
+        for flag in ("active", "through_employer"):
+            if flag in fields:
+                fields[flag] = int(fields[flag])
+        if pid is None and not fields.get("insurance_type"):
+            raise HTTPException(400, "insurance_type required to create a policy")
+        try:
+            pid = iins.upsert_policy(db_path, id=pid, **fields)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        storage.audit(db_path, "ui_investments_policy", {
+            "policy_id": pid, "fields": sorted(fields),
+        })
+        return {"ok": True, "policy_id": pid}
+
+    @app.post("/investments/policy/premium", dependencies=[Depends(_require_token)])
+    def investments_record_premium(body: InsurancePremiumBody) -> dict[str, Any]:
+        from bot import investments_insurance as iins
+        try:
+            obs_id = iins.record_premium(
+                db_path,
+                policy_id=body.policy_id,
+                as_of_date=body.as_of_date,
+                amount_cents=body.amount_cents,
+                source=body.source,
+                note=body.note,
+            )
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(400, f"could not record premium: {e}")
+        storage.audit(db_path, "ui_investments_premium", {
+            "policy_id": body.policy_id, "amount_cents": body.amount_cents,
+            "source": body.source,
+        })
+        return {"ok": True, "observation_id": obs_id}
+
+    @app.post("/investments/import-xlsx", dependencies=[Depends(_require_token)])
+    def investments_import(body: InvestmentImportBody) -> dict[str, Any]:
+        """One-time migration. Idempotent on round date and holding name."""
+        from bot import investments_import as iimp
+        try:
+            result = iimp.import_xlsx(db_path, body.xlsx_path)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        except Exception as e:  # noqa: BLE001
+            log.exception("investments import failed: %s", e)
+            raise HTTPException(500, f"import failed: {e}")
+        storage.audit(db_path, "ui_investments_import", result)
+        return {"ok": True, **result}
 
     # ── Reconciler inspector (read-only diagnostics) ──────────────────────
 
