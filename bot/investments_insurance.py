@@ -98,12 +98,21 @@ def list_policies(
     """
     today = today or date.today()
     with connect(db_path) as con:
+        # created_at is a TIMESTAMP column, so PARSE_DECLTYPES hands back a
+        # datetime — not JSON-serializable. This dict goes out through a
+        # FastAPI route, so select the columns explicitly rather than *.
         policies = [dict(r) for r in con.execute(
-            "SELECT * FROM insurance_policy ORDER BY active DESC, sort_order, insurance_type"
+            "SELECT id, insurance_type, provider, policy_number, covers, "
+            "through_employer, coverage, deductible, premium_cents, "
+            "premium_frequency, paid_via, ledger_payee_norm, sales_contact, "
+            "renewal_date, comments, active, sort_order "
+            "FROM insurance_policy ORDER BY active DESC, sort_order, insurance_type"
         )]
+        # `id` breaks same-day ties: without it, which of two
+        # observations sharing a date wins is unspecified SQL behavior.
         observations = [dict(r) for r in con.execute(
-            "SELECT policy_id, as_of_date, amount_cents, source "
-            "FROM insurance_premium_observed ORDER BY as_of_date"
+            "SELECT policy_id, as_of_date, amount_cents, source, id "
+            "FROM insurance_premium_observed ORDER BY as_of_date, id"
         )]
 
     latest: dict[str, dict[str, Any]] = {}
