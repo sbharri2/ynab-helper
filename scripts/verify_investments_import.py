@@ -93,19 +93,46 @@ def main() -> int:
                     f"Total @ {iso}: xlsx sum {expected} != db {total_cells[i]}"
                 )
 
-    if len(minus_home) == len(total_cells) == len(db_dates):
+    #    The snapshot payload doesn't carry primary-residence identity, only
+    #    raw values — so ask the store directly via `is_primary_residence`.
+    #    BUT comparing DB total-arithmetic against DB's-own-flagged-holding
+    #    is tautological: compute_totals() (inside build_snapshot, used for
+    #    total_cells/minus_home) and store.list_holdings() both read the
+    #    SAME live property_detail row from the SAME args.db, so they can
+    #    never disagree with each other — verified empirically that a pure
+    #    single-flag swap (Mayfield -> Rental, nothing else touched) still
+    #    returns OK under a self-referential version of this check. Closing
+    #    the gap needs an INDEPENDENT expectation of who the primary
+    #    residence should be. Mirror the exact heuristic
+    #    bot/investments_import.py uses to set the flag in the first place
+    #    (name contains "mayfield") and check the DB's actual flag against
+    #    THAT, not against its own arithmetic.
+    _PRIMARY_NEEDLE = "mayfield"
+    xlsx_primary = sorted(
+        h["name"] for h in sheet["holdings"]
+        if _PRIMARY_NEEDLE in h["name"].lower()
+    )
+    db_primary = sorted(
+        h["name"] for h in store.list_holdings(args.db)
+        if h.get("is_primary_residence")
+    )
+    if xlsx_primary != db_primary:
+        problems.append(
+            f"primary residence mismatch: xlsx name match ({_PRIMARY_NEEDLE!r}) "
+            f"implies {xlsx_primary}, db has is_primary_residence flagged on {db_primary}"
+        )
+    elif len(db_primary) == 1 and len(minus_home) == len(total_cells) == len(db_dates):
+        # Both sides agree on WHO the primary residence is; sanity-check the
+        # DB's own subtraction arithmetic against that holding's own value.
+        primary = db_primary[0]
+        primary_cells = _cells_by_date(db_h[primary]) if primary in db_h else {}
         for i, iso in enumerate(db_dates):
             subtracted = total_cells[i] - minus_home[i]
-            if subtracted == 0:
-                continue
-            re_values = {
-                _cells_by_date(h).get(iso, 0)
-                for h in sheet["holdings"] if h.get("is_real_estate")
-            }
-            if subtracted not in re_values:
+            expected = primary_cells.get(iso, 0)
+            if subtracted != expected:
                 problems.append(
-                    f"Minus Home Equity @ {iso}: subtracted {subtracted}, which "
-                    f"matches no single real-estate holding {sorted(re_values)}"
+                    f"Minus Home Equity @ {iso}: subtracted {subtracted}, but the "
+                    f"primary residence ({primary}) is {expected}"
                 )
 
     sheet_ins = {p["insurance_type"]: p for p in sheet["insurance"]}

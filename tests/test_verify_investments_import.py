@@ -152,19 +152,12 @@ def test_missing_db_holding_exits_one(tmp_path, capsys, monkeypatch):
     assert "missing from DB: Marcus" in out
 
 
-def test_totals_row_wrong_property_subtracted_exits_one(tmp_path, capsys, monkeypatch):
+def test_totals_row_both_properties_flagged_exits_one(tmp_path, capsys, monkeypatch):
     """Both real-estate holdings get flagged primary -- the ~$63k-class
     error the review called out ("subtracting both properties ... looks
-    completely plausible"). "Minus Home Equity" then subtracts a sum that
-    matches no single real-estate holding's value, which is exactly what
-    the recomputed check is built to catch.
-
-    (A same-magnitude swap of the flag onto ONLY the rental is NOT
-    distinguishable from the correct case by this check: subtracting any
-    one real-estate holding's own value trivially "matches" that holding.
-    Catching that specific misattribution needs a primary-residence
-    identity in the snapshot payload, which neither parse_snapshot nor
-    build_snapshot expose today -- out of scope for this script.)
+    completely plausible"). The db's flagged-primary set (both properties)
+    no longer matches the xlsx's name-based expectation (only Mayfield),
+    so the identity cross-check catches it directly.
     """
     xlsx, db = _setup(tmp_path)
 
@@ -179,7 +172,86 @@ def test_totals_row_wrong_property_subtracted_exits_one(tmp_path, capsys, monkey
 
     out = capsys.readouterr().out
     assert rc == 1
-    assert "Minus Home Equity" in out
+    assert "primary residence mismatch" in out
+
+
+def test_totals_row_wrong_single_property_flagged_exits_one(tmp_path, capsys, monkeypatch):
+    """THE test that would have caught the February misreading: the flag
+    moves from the primary residence onto the OTHER real-estate holding --
+    one flag total, not two, and the two holdings have different values
+    ($249,522.92 vs $121,000.00 in round 2).
+
+    This exact mutation was proven to pass silently (rc == 0, false OK)
+    under two prior implementations, both empirically verified against
+    this actual fixture before being ruled out -- not assumed:
+
+    1. The original `re_values` heuristic (round 2 review): subtracted
+       amount ($121,000.00, the rental's own value) is trivially a member
+       of "some real-estate holding's value" once the rental is real
+       estate too, so `subtracted not in re_values` was False. rc == 0.
+
+    2. A self-referential `primary_names`-only version (this round's
+       initial fix, matching the reviewer's first-pass snippet literally):
+       `total_cells`/`minus_home` (from `build_snapshot(args.db)` ->
+       `compute_totals`) and `primary_names` (from
+       `store.list_holdings(args.db)`) both read the SAME live
+       `property_detail` row from the SAME db at call time, so a swapped
+       flag can never disagree with itself -- it only catches a count of
+       flagged rows != 1, not a wrong SINGLE row. rc == 0.
+
+    The version actually shipped adds an independent expectation: it
+    mirrors bot/investments_import.py's own heuristic for setting the flag
+    in the first place (holding name contains "mayfield") and checks the
+    db's actual flag against THAT, not against the db's own arithmetic.
+    """
+    xlsx, db = _setup(tmp_path)
+
+    with connect(db) as con:
+        con.execute(
+            "UPDATE property_detail SET is_primary_residence = 0 "
+            "WHERE holding_id = (SELECT id FROM holding WHERE name = '117 Mayfield Dr')"
+        )
+        con.execute(
+            "UPDATE property_detail SET is_primary_residence = 1 "
+            "WHERE holding_id = (SELECT id FROM holding WHERE name = '456 Rental Ave')"
+        )
+        con.commit()
+
+    rc = _run(monkeypatch, xlsx, db)
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert (
+        "primary residence mismatch: xlsx name match ('mayfield') implies "
+        "['117 Mayfield Dr'], db has is_primary_residence flagged on "
+        "['456 Rental Ave']"
+    ) in out
+
+
+def test_totals_row_zero_properties_flagged_exits_one(tmp_path, capsys, monkeypatch):
+    """No holding flagged primary at all: Minus Home Equity silently
+    equals Total. The old `re_values` check explicitly `continue`d past a
+    zero `subtracted` amount, treating "nothing was subtracted" as
+    automatically fine -- it is not; the xlsx's own name-based expectation
+    says exactly one holding (Mayfield) should be flagged.
+    """
+    xlsx, db = _setup(tmp_path)
+
+    with connect(db) as con:
+        con.execute(
+            "UPDATE property_detail SET is_primary_residence = 0 "
+            "WHERE holding_id = (SELECT id FROM holding WHERE name = '117 Mayfield Dr')"
+        )
+        con.commit()
+
+    rc = _run(monkeypatch, xlsx, db)
+
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert (
+        "primary residence mismatch: xlsx name match ('mayfield') implies "
+        "['117 Mayfield Dr'], db has is_primary_residence flagged on []"
+    ) in out
 
 
 def test_planted_db_value_for_a_blank_xlsx_cell_exits_one(tmp_path, capsys, monkeypatch):
