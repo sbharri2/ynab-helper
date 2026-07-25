@@ -4,14 +4,17 @@ Reuses ``bot/investments.py`` as the parser rather than reimplementing it,
 so the two paths can be diffed against each other at cutover
 (``scripts/verify_investments_import.py``).
 
-Idempotent on round ``as_of_date`` and holding ``name``: re-running adds
-nothing. An unparseable column header raises — this runs once, under
-supervision, and a silently invented date is the exact class of error this
-design exists to remove.
+Idempotent and additive-only on round ``as_of_date`` and holding ``name``:
+re-running adds nothing and never overwrites a value that already exists,
+so a hand-corrected number (``source='manual'``) can never be silently
+reverted to the sheet's number by a later re-run. An unparseable column
+header raises — this runs once, under supervision, and a silently invented
+date is the exact class of error this design exists to remove.
 """
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -38,15 +41,27 @@ _TAX_BY_TYPE = {
     "ira": "pretax", "simple ira": "pretax", "hsa": "hsa", "529": "529",
 }
 
+# A column header must carry a real day/month/year, e.g. "(02-15-26)".
+# `_extract_date_from_label` falls back to a fabricated "YYYY-01-01" when it
+# finds a bare 4-digit year with no full date — that fallback is truthy, so
+# the importer must re-verify the label itself rather than trust the
+# parser's answer.
+_FULL_DATE_RE = re.compile(r"\d{1,2}\s*[-/]\s*\d{1,2}\s*[-/]\s*\d{2,4}")
+
 
 def _classify(account_type: str) -> tuple[str, str | None]:
-    """(kind, tax_treatment) from the sheet's free-text account type."""
+    """(kind, tax_treatment) from the sheet's free-text account type.
+
+    Longest needle wins. Plain dict order would let "ira" match inside
+    "roth ira" and tag a Roth as pretax — the kind of error that survives
+    review because `kind` comes out "retirement" either way.
+    """
     key = (account_type or "").strip().lower()
     if key in parser._REAL_ESTATE_TYPES:
         return "property", None
-    for needle, kind in _KIND_BY_TYPE.items():
+    for needle in sorted(_KIND_BY_TYPE, key=len, reverse=True):
         if needle in key:
-            return kind, _TAX_BY_TYPE.get(needle)
+            return _KIND_BY_TYPE[needle], _TAX_BY_TYPE.get(needle)
     return "other", None
 
 
@@ -62,12 +77,13 @@ def import_xlsx(
     dates: dict[str, str] = {}      # iso date -> label
     for h in snap["holdings"]:
         for v in h["values"]:
-            if not v.get("snapshot_date"):
+            label = v.get("label") or ""
+            if not v.get("snapshot_date") or not _FULL_DATE_RE.search(label):
                 raise ValueError(
-                    f"no parseable date in column label {v.get('label')!r} — "
+                    f"no parseable date in column label {label!r} — "
                     "fix the header before importing"
                 )
-            dates[v["snapshot_date"]] = v["label"]
+            dates[v["snapshot_date"]] = label
     if not dates:
         raise ValueError("no parseable date columns found in the workbook")
 
@@ -90,13 +106,22 @@ def import_xlsx(
             created_rounds += 1
 
     # ── Holdings, keyed by name so re-import updates rather than duplicates ──
+    # ``existing_values`` makes the import additive-only: a hand-corrected
+    # value (source='manual') must never be silently reverted to the
+    # sheet's number by a later re-run.
     with connect(db_path) as con:
         by_name = {
             r["name"]: r["id"] for r in con.execute("SELECT id, name FROM holding")
         }
+        existing_values = {
+            (r["holding_id"], r["round_id"]) for r in con.execute(
+                "SELECT holding_id, round_id FROM holding_value"
+            )
+        }
 
     created_holdings = 0
     written_values = 0
+    skipped_values = 0
     for order, h in enumerate(snap["holdings"]):
         kind, tax = _classify(h.get("account_type", ""))
         hid = by_name.get(h["name"])
@@ -114,8 +139,9 @@ def import_xlsx(
             hid = store.upsert_holding(db_path, **fields)
             by_name[h["name"]] = hid
             created_holdings += 1
-        else:
-            store.upsert_holding(db_path, id=hid, **fields)
+        # else: the holding already exists — its metadata is left alone.
+        # Re-importing must not clobber anything the operator has since
+        # edited by hand.
 
         if kind == "property":
             with connect(db_path) as con:
@@ -129,6 +155,9 @@ def import_xlsx(
         # by dropping empty cells, so list position means nothing here.
         for v in h["values"]:
             rid = round_by_date[v["snapshot_date"]]
+            if (hid, rid) in existing_values:
+                skipped_values += 1
+                continue
             store.upsert_values(
                 db_path, round_id=rid, source="xlsx_import",
                 values=[{
@@ -137,6 +166,7 @@ def import_xlsx(
                     "as_of_date": v["snapshot_date"],
                 }],
             )
+            existing_values.add((hid, rid))
             written_values += 1
 
     # ── Insurance: registry + one baseline observation at the newest date ──
@@ -184,6 +214,7 @@ def import_xlsx(
         "values": written_values,
         "policies": created_policies,
         "skipped_rounds": skipped,
+        "skipped_values": skipped_values,
     }
     log.info("investments import: %s", result)
     return result

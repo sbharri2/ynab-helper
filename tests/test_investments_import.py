@@ -50,12 +50,67 @@ def test_import_is_idempotent(tmp_path):
     imp.import_xlsx(db, xlsx)
     second = imp.import_xlsx(db, xlsx)
     assert second["rounds"] == 0
+    assert second["values"] == 0
+    assert second["skipped_values"] == 4
     assert len(second["skipped_rounds"]) == 2
     assert len(store.list_rounds(db)) == 2
     assert len(store.list_holdings(db)) == 2
     with connect(db) as con:
         n = con.execute("SELECT COUNT(*) FROM holding_value").fetchone()[0]
     assert n == 4
+
+
+def test_reimport_does_not_revert_a_hand_edited_value(tmp_path):
+    db = tmp_path / "t.db"
+    init_db(db)
+    xlsx = _make_xlsx(tmp_path / "snap.xlsx")
+    imp.import_xlsx(db, xlsx)
+
+    rounds = {r["as_of_date"].isoformat(): r["id"] for r in store.list_rounds(db)}
+    holdings = {h["name"]: h["id"] for h in store.list_holdings(db)}
+    round_id = rounds["2026-07-25"]
+    holding_id = holdings["Marcus"]
+
+    # Operator hand-corrects the value in the UI — upsert_values stamps it
+    # with source='manual'.
+    store.upsert_values(
+        db, round_id=round_id, source="manual",
+        values=[{
+            "holding_id": holding_id,
+            "value_cents": 999900,
+            "as_of_date": "2026-07-25",
+        }],
+    )
+
+    imp.import_xlsx(db, xlsx)
+
+    with connect(db) as con:
+        row = con.execute(
+            "SELECT value_cents, source FROM holding_value "
+            "WHERE holding_id = ? AND round_id = ?",
+            (holding_id, round_id),
+        ).fetchone()
+    assert row["value_cents"] == 999900
+    assert row["source"] == "manual"
+
+
+def test_roth_ira_is_classified_roth_not_pretax():
+    assert imp._classify("Roth IRA") == ("retirement", "roth")
+    assert imp._classify("Simple IRA") == ("retirement", "pretax")
+    assert imp._classify("IRA") == ("retirement", "pretax")
+
+
+def test_bare_year_header_raises_instead_of_inventing_jan_1(tmp_path):
+    db = tmp_path / "t.db"
+    init_db(db)
+    xlsx = tmp_path / "bare_year.xlsx"
+    wb = Workbook()
+    ws = wb.active
+    ws.append(["Account", "Type", "Number", "Owner", "2026 Value", "Notes"])
+    ws.append(["Marcus", "Savings", "1234", "Joint", "$1.00", ""])
+    wb.save(xlsx)
+    with pytest.raises(ValueError, match="no parseable date"):
+        imp.import_xlsx(db, xlsx)
 
 
 def test_property_rows_get_property_kind_and_detail(tmp_path):
