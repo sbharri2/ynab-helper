@@ -339,6 +339,116 @@ CREATE TABLE IF NOT EXISTS trip (
 );
 CREATE INDEX IF NOT EXISTS idx_trip_dates ON trip(state, start_date, end_date);
 CREATE INDEX IF NOT EXISTS idx_trip_msg ON trip(tg_chat_id, confirm_message_id);
+
+-- ── Investments & insurance system of record (2026-07-25) ────────────────
+-- Replaces the Google Sheet -> xlsx -> parse-on-read pipeline. A `holding`
+-- is a periodically-observed number, NOT a budget account: it has no
+-- transactions and never enters envelope math. `ledger_account_id` links
+-- the two that exist in both worlds (Marcus, Coastal).
+
+CREATE TABLE IF NOT EXISTS holding (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  owner TEXT,
+  kind TEXT NOT NULL DEFAULT 'other'
+    CHECK (kind IN ('retirement','brokerage','crypto','cash','education','property','other')),
+  account_type TEXT,
+  institution TEXT,
+  account_number TEXT,
+  tax_treatment TEXT,
+  ledger_account_id TEXT REFERENCES account(id),
+  closed INTEGER NOT NULL DEFAULT 0,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  notes TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS snapshot_round (
+  id TEXT PRIMARY KEY,
+  label TEXT NOT NULL,
+  as_of_date DATE NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (as_of_date)
+);
+
+CREATE TABLE IF NOT EXISTS holding_value (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  holding_id TEXT NOT NULL REFERENCES holding(id),
+  round_id TEXT NOT NULL REFERENCES snapshot_round(id),
+  as_of_date DATE NOT NULL,
+  value_cents INTEGER NOT NULL,
+  market_value_cents INTEGER,
+  debt_cents INTEGER,
+  vested_cents INTEGER,
+  units REAL,
+  unit_price_cents INTEGER,
+  source TEXT NOT NULL DEFAULT 'manual'
+    CHECK (source IN ('manual','xlsx_import','ledger')),
+  is_seeded INTEGER NOT NULL DEFAULT 0,
+  note TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE (holding_id, round_id)
+);
+
+CREATE TABLE IF NOT EXISTS property_detail (
+  holding_id TEXT PRIMARY KEY REFERENCES holding(id),
+  address TEXT,
+  valuation_source TEXT,
+  purchase_date DATE,
+  is_primary_residence INTEGER NOT NULL DEFAULT 0,
+  listed_price_cents INTEGER,
+  escrow_cents INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS insurance_policy (
+  id TEXT PRIMARY KEY,
+  insurance_type TEXT NOT NULL,
+  provider TEXT,
+  policy_number TEXT,
+  covers TEXT,
+  through_employer INTEGER,
+  coverage TEXT,
+  deductible TEXT,
+  premium_cents INTEGER,
+  premium_frequency TEXT NOT NULL DEFAULT 'annual'
+    CHECK (premium_frequency IN ('annual','semiannual','quarterly','monthly')),
+  paid_via TEXT NOT NULL DEFAULT 'ledger'
+    CHECK (paid_via IN ('escrow','ledger','payroll')),
+  ledger_payee_norm TEXT,
+  sales_contact TEXT,
+  renewal_date TEXT,
+  comments TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  sort_order INTEGER NOT NULL DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Escrow-paid premiums (Amica home, Fortegra, Neptune) never appear as
+-- ledger payees — they're inside the mortgage payment. Hand-entered rows
+-- here are the only way that drift becomes visible.
+CREATE TABLE IF NOT EXISTS insurance_premium_observed (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  policy_id TEXT NOT NULL REFERENCES insurance_policy(id),
+  as_of_date DATE NOT NULL,
+  amount_cents INTEGER NOT NULL,
+  source TEXT NOT NULL DEFAULT 'manual'
+    CHECK (source IN ('escrow','ledger','manual')),
+  note TEXT,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS savings_target (
+  id TEXT PRIMARY KEY,
+  effective_year INTEGER NOT NULL UNIQUE,
+  age INTEGER,
+  combined_salary_cents INTEGER NOT NULL,
+  multiplier REAL NOT NULL,
+  note TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_holding_value_round ON holding_value(round_id);
+CREATE INDEX IF NOT EXISTS idx_premium_observed_policy
+  ON insurance_premium_observed(policy_id, as_of_date);
 """
 
 
