@@ -59,6 +59,15 @@ def _activity_for_month(con, month: str, category_id: str) -> int:
     # YNAB treats it. Without this, an off-budget account's categorized
     # transactions would pollute the envelopes. is_split = 0 keeps split
     # parents out (their children carry the category + amount).
+    #
+    # closed = 0 for the same reason (2026-07-25, HSA history import). A CLOSED
+    # on-budget account holds settled history whose cash is already gone. Its
+    # rows are kept categorized so medical/spending analytics can read them out
+    # of ledger_txn, but they must not move envelopes: q_ready_to_assign
+    # computes rta = cash_cents - available_cents and cash_cents itself filters
+    # closed = 0, so counting a closed account's spend as activity would lower
+    # available_cents and conjure RTA out of cash that no longer exists — the
+    # Marcus phantom-money shape in miniature.
     row = con.execute(
         """SELECT COALESCE(SUM(lt.amount_cents), 0) AS sum_cents
            FROM ledger_txn lt
@@ -66,6 +75,7 @@ def _activity_for_month(con, month: str, category_id: str) -> int:
            WHERE lt.category_id = ?
              AND strftime('%Y-%m', lt.posted_date) = ?
              AND a.on_budget = 1
+             AND a.closed = 0
              AND lt.is_split = 0""",
         (category_id, month),
     ).fetchone()

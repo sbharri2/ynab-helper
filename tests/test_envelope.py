@@ -171,3 +171,34 @@ def test_idempotent_recompute(tmp_path):
     r1 = recompute_month(db, "2026-05")
     r2 = recompute_month(db, "2026-05")
     assert r1 == r2
+
+
+def test_closed_account_spend_does_not_move_envelopes(tmp_path):
+    """A CLOSED on-budget account's categorized rows must not become activity.
+
+    Regression guard for the 2026-07-25 HSA history import. The closed HSA holds
+    five years of medical spend that stays categorized so spending analytics can
+    read it, but its cash is long gone: q_ready_to_assign computes
+    rta = cash_cents - available_cents and cash_cents filters closed = 0. Counting
+    a closed account's spend as activity would lower available_cents and conjure
+    Ready-to-Assign out of cash that no longer exists.
+    """
+    db = tmp_path / "t.db"
+    _seed(db)
+    with storage.connect(db) as con:
+        con.execute(
+            "INSERT INTO account (id, name, type, on_budget, closed) "
+            "VALUES (?, ?, ?, 1, 1)",
+            ("acct-closed", "HSA (closed)", "checking"),
+        )
+
+    # Same category, same month: one live charge, one from the closed account.
+    _add_txn(db, account="acct-1", category="cat-groc",
+             posted_date=date(2026, 5, 4), amount_cents=-2500)
+    _add_txn(db, account="acct-closed", category="cat-groc",
+             posted_date=date(2026, 5, 6), amount_cents=-30395)
+
+    results = recompute_month(db, "2026-05")
+
+    # Only the live account's charge counts.
+    assert results["cat-groc"] == -2500
