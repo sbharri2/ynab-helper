@@ -909,8 +909,13 @@ def build_app(
                 as_of_date=body.as_of_date,
                 seed_from_previous=body.seed_from_previous,
             )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(400, f"could not create round: {e}")
+            # A duplicate as_of_date is the operator's problem; anything
+            # else is ours, and reporting it as 400 with no log would hide it.
+            log.exception("create_round failed: %s", e)
+            raise HTTPException(500, f"could not create round: {e}")
         storage.audit(db_path, "ui_investments_round", {
             "round_id": rid, "label": body.label, "as_of_date": body.as_of_date,
             "seeded": body.seed_from_previous,
@@ -981,8 +986,11 @@ def build_app(
                 source=body.source,
                 note=body.note,
             )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(400, f"could not record premium: {e}")
+            log.exception("record_premium failed: %s", e)
+            raise HTTPException(500, f"could not record premium: {e}")
         storage.audit(db_path, "ui_investments_premium", {
             "policy_id": body.policy_id, "amount_cents": body.amount_cents,
             "source": body.source,

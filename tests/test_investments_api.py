@@ -1,5 +1,3 @@
-import json
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -51,11 +49,46 @@ def test_round_and_values_roundtrip(client):
     assert snap["holdings"][0]["values"][0]["cents"] == 2566800
 
 
+def test_duplicate_as_of_date_returns_500_not_400(client):
+    """A UNIQUE constraint violation is a server-side defect (or at least
+    not the same class of problem as a bad request body) — it must not be
+    silently reclassified as a 400 by a future change."""
+    client.post("/investments/round", json={
+        "label": "Jul 2026", "as_of_date": "2026-07-25"})
+    r = client.post("/investments/round", json={
+        "label": "Jul 2026 Again", "as_of_date": "2026-07-25"})
+    assert r.status_code == 500
+
+
 def test_values_rejects_unknown_round(client):
     r = client.post("/investments/values", json={
         "round_id": "nope", "values": [{"holding_id": "x", "value_cents": 1}],
     })
     assert r.status_code == 400
+
+
+def test_snapshot_round_id_truncates_to_that_round(client):
+    hid = store.upsert_holding(client.db, name="Marcus", kind="cash")
+    r1 = client.post("/investments/round", json={
+        "label": "Feb 2026", "as_of_date": "2026-02-15"})
+    rid1 = r1.json()["round_id"]
+    client.post("/investments/values", json={
+        "round_id": rid1,
+        "values": [{"holding_id": hid, "value_cents": 1000000}],
+    })
+
+    r2 = client.post("/investments/round", json={
+        "label": "Jul 2026", "as_of_date": "2026-07-25"})
+    rid2 = r2.json()["round_id"]
+    client.post("/investments/values", json={
+        "round_id": rid2,
+        "values": [{"holding_id": hid, "value_cents": 2566800}],
+    })
+
+    snap = client.get(f"/investments/snapshot?round_id={rid1}").json()
+    assert snap["as_of"] == "2026-02-15"
+    assert len(snap["holdings"][0]["values"]) == 1
+    assert snap["holdings"][0]["values"][0]["cents"] == 1000000
 
 
 def test_holding_create_then_update(client):
@@ -67,6 +100,17 @@ def test_holding_create_then_update(client):
     assert r.json()["holding_id"] == hid
     rows = client.get("/investments/holdings").json()["holdings"]
     assert rows[0]["closed"] == 1
+
+
+def test_holdings_include_closed_false_hides_closed(client):
+    open_id = store.upsert_holding(client.db, name="Marcus", kind="cash")
+    closed_id = store.upsert_holding(client.db, name="Old 401k", kind="retirement")
+    client.post("/investments/holding", json={"id": closed_id, "closed": True})
+
+    rows = client.get("/investments/holdings?include_closed=false").json()["holdings"]
+    ids = {r["id"] for r in rows}
+    assert open_id in ids
+    assert closed_id not in ids
 
 
 def test_policy_and_premium_routes(client):
