@@ -216,14 +216,17 @@ def ingest_signal(
                     "had_chosen_category": bool(matched_order.get("chosen_category")),
                 })
 
-        # Amazon auto-bucket (Steven's design): every Amazon charge files
-        # straight into a per-person spending bucket — 'Amazon - Steven' /
-        # 'Amazon - Allison' from whoever the matched order was addressed to,
-        # else 'Amazon - Unassigned'. No LLM guess, no confirm prompt, no
-        # hold lane. The item-level detail still rides along in the memo via
-        # _enrich_from_pending_order above. Unlike other charges this DOES
-        # write category_id onto the ledger row now (there's no user-confirm
-        # step to promote it later).
+        # Amazon auto-bucket (Steven's design): an Amazon charge BELOW the
+        # large-charge threshold (LARGE_AMAZON_DEFAULT_CENTS, spec
+        # 2026-07-25) files straight into a per-person spending bucket —
+        # 'Amazon - Steven' / 'Amazon - Allison' from whoever the matched
+        # order was addressed to, else 'Amazon - Unassigned'. No LLM guess,
+        # no confirm prompt, no hold lane. The item-level detail still rides
+        # along in the memo via _enrich_from_pending_order above. Unlike
+        # other charges this DOES write category_id onto the ledger row now
+        # (there's no user-confirm step to promote it later). Amazon charges
+        # AT OR ABOVE the threshold skip this block entirely (see
+        # is_large_amazon below) and go through the HOLD lane instead.
         ledger_category_id: str | None = None
         if is_amazon and not is_large_amazon:
             person = (matched_order or {}).get("assigned_to_user_id")
@@ -330,9 +333,13 @@ def ingest_signal(
     # surfaces it for confirm. ynab_txn_id is synthesized as "ledger:<id>"
     # so the row is uniquely keyed. _apply_choice detects that prefix and
     # skips the YNAB write (no YNAB id yet).
-    # Amazon charges auto-bucket (above) with no confirm step, so they never
-    # enter the prompt queue. The categorized ledger row still surfaces in the
-    # Sync-to-YNAB panel for a batch push whenever Steven wants.
+    # Small Amazon charges (below the large-charge threshold) auto-bucket
+    # (above) with no confirm step, so they never enter the prompt queue —
+    # the categorized ledger row still surfaces in the Sync-to-YNAB panel
+    # for a batch push whenever Steven wants. Large Amazon charges DO enter
+    # the prompt queue (via the `not is_amazon or is_large_amazon` gate
+    # below) and start life in the HOLD lane, not HOT — see the
+    # is_large_amazon block a few lines down.
     pending_txn_id: int | None = None
     if (action == "new" and signal_kind in _PROMPT_USER_KINDS
             and user_id and (not is_amazon or is_large_amazon)):
@@ -351,16 +358,20 @@ def ingest_signal(
                 # Wait for the order email so the question can carry item
                 # detail. queue_lane.promote_holds_to_hot() re-runs the
                 # matcher every 30 min; a 24h TTL asks anyway if no receipt.
-                from bot import queue_lane as _queue_lane
-                _queue_lane.set_lane(
-                    db_path, pending_txn_id, "hold",
-                    reason="large_amazon_awaiting_receipt",
-                )
-                storage.audit(db_path, "large_amazon_held", {
-                    "pending_txn_id": pending_txn_id,
-                    "ledger_txn_id": ledger_txn_id,
-                    "amount_cents": amount_cents, "payee": payee,
-                })
+                try:
+                    from bot import queue_lane as _queue_lane
+                    _queue_lane.set_lane(
+                        db_path, pending_txn_id, "hold",
+                        reason="large_amazon_awaiting_receipt",
+                    )
+                    storage.audit(db_path, "large_amazon_held", {
+                        "pending_txn_id": pending_txn_id,
+                        "ledger_txn_id": ledger_txn_id,
+                        "amount_cents": amount_cents, "payee": payee,
+                    })
+                except Exception as e:  # noqa: BLE001 — never block ingest
+                    log.warning("large_amazon hold-lane set failed for "
+                                "pending_txn %s: %s", pending_txn_id, e)
             # Lodging charges open a candidate trip window; the group
             # sweep asks for one-tap confirmation (suggestions-v2).
             if pending_txn_id:
@@ -417,7 +428,9 @@ def ingest_signal(
                         "payee": payee, "category_id": category_id,
                         "method": categorize_method,
                     })
-            # (Amazon no longer uses the HOLD lane — it auto-buckets above.
+            # (Small Amazon charges never reach here — they auto-bucket
+            # above and skip the prompt queue entirely. Large Amazon charges
+            # DO reach here and were already routed to HOLD a few lines up.
             # Non-Amazon generic payees like Venmo/PayPal go straight to HOT
             # since their enrichment already rode in on the parsed summary.)
         except sqlite3.IntegrityError:
