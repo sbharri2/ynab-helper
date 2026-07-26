@@ -243,7 +243,12 @@ def promote_holds_to_hot(db_path: Path | str, *, settings) -> int:
         # and (if the matching order is already user-categorized) adopt
         # that as the suggestion.
         new_summary = parsed.get("summary") or h["raw_summary"]
-        new_cat = matched.get("chosen_category")
+        # A confirmed user choice wins; otherwise carry the order's own
+        # suggestion through so the prompt offers a starting guess instead
+        # of a bare amount (order 83 carried a 0.6-confidence pick that
+        # never reached the user).
+        new_cat = matched.get("chosen_category") or matched.get(
+            "suggested_category")
         # If the matched order is owned by a different user (e.g. an Amazon
         # CC alert arrived through Steven's inbox but the matching order
         # confirmation came through Allison's), flip the pending_txn over

@@ -239,3 +239,26 @@ def test_non_amazon_hold_still_goes_cold(tmp_path):
 def test_amazon_14_day_ttl_is_gone(tmp_path):
     assert not hasattr(queue_lane, "AMAZON_HOLD_TTL_DAYS")
     assert queue_lane.LARGE_AMAZON_HOLD_TTL_HOURS == 24
+
+
+def test_promotion_adopts_order_suggestion(tmp_path):
+    db = _setup(tmp_path)
+    pt_id = _hold_row(db, amount_cents=-81509, hours_ago=1)
+    storage.insert_pending_order(
+        db,
+        user_id="steven", source="amazon", external_id="112-0031580-6551463",
+        email_id="order-sugg", order_date=date(2026, 7, 22), total_cents=81509,
+        raw_summary="1 item(s): 1 Electronics item", raw_payload={},
+    )
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_order SET suggested_category = 'cat-steven', "
+            "assigned_to_user_id = 'steven' WHERE email_id = 'order-sugg'"
+        )
+
+    promoted = queue_lane.promote_holds_to_hot(db, settings=None)
+
+    assert promoted == 1
+    row = _row(db, "pending_txn", pt_id)
+    assert row["queue_lane"] == "hot"
+    assert row["suggested_category"] == "cat-steven"
