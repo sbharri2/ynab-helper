@@ -37,7 +37,17 @@ _MAX_PINGS_PER_SWEEP = 4
 _SWEEP_INTERVAL_S = 180
 # Only ping items first seen within this window — older backlog belongs in
 # the desktop Inbox, not in everyone's pocket.
-_PING_MAX_AGE_HOURS = 36
+#
+# Widened 36 -> 72 (2026-07-26, replacing the COALESCE(lane_changed_at,
+# created_at) gate below): the hold TTL is 24h
+# (queue_lane.LARGE_AMAZON_HOLD_TTL_HOURS), the sweep that promotes runs
+# every 30 min, and quiet hours are 22:00-07:00, so a charge created at T
+# is promoted to HOT by ~T+24.5h and still has ~47h of window left on a
+# plain created_at gate — no need to key off a mutable timestamp to cover
+# that gap. 72h also gives slack for a bot-outage or an extra-long quiet
+# stretch without resorting to a lane-transition timestamp that isn't
+# unique to this feature (see the removed-gate note below).
+_PING_MAX_AGE_HOURS = 72
 
 
 def _in_quiet_hours(quiet: str, now: datetime | None = None) -> bool:
@@ -134,18 +144,26 @@ async def _sweep_once(app: Application, settings, group_id: int) -> None:
     if expired:
         storage.audit(db_path, "group_questions_expired", {"count": expired})
     await _post_trip_confirms(app, settings, group_id)
-    # The age gate keys off COALESCE(lane_changed_at, created_at), not bare
-    # created_at: a large-Amazon HOLD row can sit invisible to this sweep
-    # (queue_lane = 'hold', filtered above) for up to 24h, then get
-    # promoted to HOT well after its own created_at has aged out of the
-    # window. lane_changed_at is stamped on every HOLD->HOT transition
-    # (queue_lane.promote_holds_to_hot and queue_lane.abandon_stale_holds
-    # both set it), so this measures "how long has it been askable", not
-    # "how long has it existed" — a row that was invisible for a day isn't
-    # then denied a ping because the clock started before it could be
-    # pinged at all. Rows that were never lane-changed (the common case —
-    # created straight into HOT and left there) fall back to created_at,
-    # unchanged from before.
+    # The age gate keys off bare pt.created_at (immutable), not
+    # COALESCE(lane_changed_at, created_at). An earlier round used the
+    # COALESCE form so a TTL-promoted large-Amazon HOLD row (invisible to
+    # this sweep for up to 24h while queue_lane = 'hold') wouldn't age out
+    # of the window before it was ever eligible to be pinged. That
+    # introduced a regression: lane_changed_at is stamped on EVERY lane
+    # transition, including demote_hot_to_cold (bot/queue_lane.py), which
+    # belongs to the unrelated per-person DM push flow. A pending_txn that
+    # sat HOT for days and only just got demoted to COLD had its
+    # lane_changed_at refreshed to "now", satisfying the COALESCE window
+    # and surfacing a multi-day-old, already-ignored item into the shared
+    # household group as if brand new.
+    #
+    # created_at alone, with a wider window, closes the original gap
+    # without resurrecting anything: the hold TTL is 24h
+    # (queue_lane.LARGE_AMAZON_HOLD_TTL_HOURS), the sweep that promotes
+    # runs every 30 min, and quiet hours are 22:00-07:00, so a charge
+    # created at T is promoted at ~T+24.5h and still has ~47h of the 72h
+    # window left. No lane transition can move created_at, so nothing can
+    # make an already-aged-out row eligible again.
     with storage.connect(db_path) as con:
         rows = con.execute(
             """SELECT pt.id, pt.payee, pt.amount_cents, pt.txn_date,
@@ -155,8 +173,7 @@ async def _sweep_once(app: Application, settings, group_id: int) -> None:
                LEFT JOIN category c ON c.id = pt.suggested_category
                WHERE pt.status = 'pending'
                  AND pt.queue_lane <> 'hold'
-                 AND COALESCE(pt.lane_changed_at, pt.created_at)
-                     >= datetime('now', ?)
+                 AND pt.created_at >= datetime('now', ?)
                  AND NOT EXISTS (
                    SELECT 1 FROM question q
                    WHERE q.item_kind = 'txn' AND q.item_id = pt.id
@@ -425,7 +442,7 @@ async def handle_group_message(
         with storage.connect(db_path) as con:
             trow = con.execute("SELECT * FROM trip WHERE id = ?",
                                (trip_id,)).fetchone()
-        filed = _trips.apply_trip_to_pending(db_path, trow)
+        filed = _trips.apply_trip_to_pending(db_path, trow, settings=settings)
         extra = (f" Filed {len(filed)} open charge"
                  f"{'s' if len(filed) != 1 else ''} as Vacation already."
                  if filed else "")
@@ -519,7 +536,7 @@ async def _handle_question_reply(
             (msg.chat_id, replied_message_id),
         ).fetchone()
     if trip is not None:
-        await _handle_trip_reply(db_path, msg, user, dict(trip))
+        await _handle_trip_reply(db_path, msg, user, dict(trip), settings)
         return
     # Lettered-options messages anchor to chat_choice, not question.
     with storage.connect(db_path) as con:
@@ -576,7 +593,8 @@ _NEGATIVE_WORDS = {"no", "n", "nope", "nah", "dismiss", "not a trip",
                    "no trip"}
 
 
-async def _handle_trip_reply(db_path, msg, user: str, trip: dict) -> None:
+async def _handle_trip_reply(db_path, msg, user: str, trip: dict,
+                             settings=None) -> None:
     from bot import trips
     if trip["state"] != "candidate":
         await msg.reply_text("That trip's already settled. ✓")
@@ -584,7 +602,7 @@ async def _handle_trip_reply(db_path, msg, user: str, trip: dict) -> None:
     low = (msg.text or "").strip().lower().strip(".!")
     if _is_affirmative(low):
         trips.set_trip_state(db_path, trip["id"], "confirmed", by=user)
-        filed = trips.apply_trip_to_pending(db_path, trip)
+        filed = trips.apply_trip_to_pending(db_path, trip, settings=settings)
         extra = (f" Filed {len(filed)} charge"
                  f"{'s' if len(filed) != 1 else ''} from the window as "
                  f"Vacation already." if filed else "")

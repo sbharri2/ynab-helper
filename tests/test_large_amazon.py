@@ -429,21 +429,25 @@ def test_large_amazon_composition_hold_not_pinged_then_ttl_promotes(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 2026-07-26 follow-up review — Issue A: the sweep's age gate must key off
-# COALESCE(lane_changed_at, created_at), not bare created_at, or a
-# TTL-promoted hold whose created_at has aged out of the 36h ping window
-# gets promoted to HOT and then never pinged (permanent silence — worse
-# than the pre-Finding-1 blind ping).
+# 2026-07-26 follow-up review — Issue A (superseded, see the second
+# follow-up section below): the sweep's original 36h ping window was too
+# narrow for the TTL-promotion path — a HOLD row invisible for up to 24h
+# could get promoted to HOT after its own created_at had already aged past
+# 36h. That was fixed here first by widening the window to 72h (created_at
+# stays the sole, immutable age key — the COALESCE(lane_changed_at,
+# created_at) variant tried in between introduced a worse regression,
+# reverted in the section below).
 # ---------------------------------------------------------------------------
 
 
-def test_sweep_pings_hold_promoted_row_past_created_at_window(tmp_path):
-    """A row created 40h ago (outside the 36h ping window on created_at
-    alone) that only just got promoted out of HOLD (lane_changed_at =
-    now, simulating a bot-outage/quiet-hours stretch that delayed the
-    promotion well past its own created_at) must still be selected by the
-    sweep. Fails against a created_at-keyed gate; passes against
-    COALESCE(lane_changed_at, created_at)."""
+def test_sweep_pings_row_created_before_old_36h_limit_once_promoted(tmp_path):
+    """A row created 40h ago — outside the OLD 36h window but inside the
+    current 72h one — that was held then promoted out of HOLD (the
+    TTL-expiry path) must still be pinged. Under the created_at-only gate
+    this passes simply because 40h < 72h; it is no longer "pinged because
+    it was just promoted" (that reasoning belonged to the reverted
+    COALESCE gate) — it is pinged because the wider window comfortably
+    covers the 24h hold + promotion-sweep latency this feature needs."""
     from bot import group_chat
 
     db = _setup(tmp_path)
@@ -470,17 +474,17 @@ def test_sweep_pings_hold_promoted_row_past_created_at_window(tmp_path):
     asyncio.run(group_chat._sweep_once(app, settings, group_id))
 
     assert len(fake_bot.sent) == 1, (
-        "Issue A: a HOLD row promoted to HOT is still pingable even when "
-        "its created_at falls outside the 36h ping window — the sweep's "
-        "age gate must key off COALESCE(lane_changed_at, created_at)"
+        "a row created 40h ago (past the OLD 36h limit, inside the "
+        "current 72h window) that was held then promoted must still be "
+        "pinged"
     )
 
 
 def test_sweep_still_respects_age_window_for_never_promoted_rows(tmp_path):
-    """Sanity check the COALESCE fallback doesn't loosen the window for
-    the common case: a row that was NEVER lane-changed (lane_changed_at
-    stays NULL) and is genuinely old must still fall outside the window
-    and not be pinged."""
+    """Sanity check the wider 72h window doesn't loosen the gate into
+    infinity: a row that was NEVER lane-changed (lane_changed_at stays
+    NULL) and is genuinely old (past 72h) must still fall outside the
+    window and not be pinged."""
     from bot import group_chat
 
     db = _setup(tmp_path)
@@ -491,7 +495,7 @@ def test_sweep_still_respects_age_window_for_never_promoted_rows(tmp_path):
     )
     with storage.connect(db) as con:
         con.execute(
-            "UPDATE pending_txn SET created_at = datetime('now', '-40 hours') "
+            "UPDATE pending_txn SET created_at = datetime('now', '-80 hours') "
             "WHERE id = ?",
             (pt_id,),
         )
@@ -500,7 +504,8 @@ def test_sweep_still_respects_age_window_for_never_promoted_rows(tmp_path):
         ).fetchone()
     assert row["lane_changed_at"] is None, (
         "a row that was never lane-changed must have lane_changed_at NULL "
-        "so the COALESCE fallback is actually exercised by this test"
+        "so this test exercises the plain created_at path, not a stale "
+        "lane_changed_at"
     )
 
     group_id = 778
@@ -511,8 +516,8 @@ def test_sweep_still_respects_age_window_for_never_promoted_rows(tmp_path):
     asyncio.run(group_chat._sweep_once(app, settings, group_id))
 
     assert fake_bot.sent == [], (
-        "a genuinely old, never-promoted row must still fall outside the "
-        "36h window via the created_at fallback"
+        "a genuinely old (80h), never-promoted row must still fall "
+        "outside the 72h window"
     )
 
 
@@ -581,6 +586,56 @@ def test_apply_trip_to_pending_skips_promoted_large_amazon_charge(tmp_path):
     assert ledger["category_id"] is None
 
 
+# ---------------------------------------------------------------------------
+# 2026-07-26 second follow-up — the COALESCE(lane_changed_at, created_at)
+# gate above was itself a regression: lane_changed_at is stamped by EVERY
+# lane transition, including queue_lane.demote_hot_to_cold, which belongs
+# to the unrelated per-person DM push flow. A pending_txn that sat HOT for
+# days and only just got demoted to COLD had its lane_changed_at refreshed
+# to "now", satisfying the COALESCE window even though it was never
+# group-pinged and is genuinely stale. Fixed by reverting the gate to bare
+# created_at and widening _PING_MAX_AGE_HOURS 36 -> 72 to still cover the
+# original TTL-promotion gap.
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_does_not_resurrect_stale_row_after_unrelated_lane_demotion(
+        tmp_path):
+    """A pending_txn created ~5 days ago — long past any reasonable ping
+    window — that has just had lane_changed_at refreshed (simulating an
+    unrelated HOT->COLD demotion via queue_lane.demote_hot_to_cold) must
+    NOT be pinged. This pins the exact bug the COALESCE gate introduced:
+    fails against COALESCE(lane_changed_at, created_at), passes against
+    bare created_at."""
+    from bot import group_chat
+
+    db = _setup(tmp_path)
+    pt_id = storage.insert_pending_txn(
+        db, user_id="steven", ynab_txn_id="ledger:stale-1",
+        ynab_account_id=ACCT, payee="Some Store", amount_cents=-5000,
+        txn_date=date(2026, 7, 20), memo="",
+    )
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_txn SET created_at = datetime('now', '-120 hours'), "
+            "queue_lane = 'cold', lane_changed_at = ? WHERE id = ?",
+            (storage._utcnow(), pt_id),
+        )
+
+    group_id = 779
+    fake_bot = _FakeBot()
+    app = _FakeApp({"chat_to_bot": {group_id: fake_bot}})
+    settings = _FakeSettings(db)
+
+    asyncio.run(group_chat._sweep_once(app, settings, group_id))
+
+    assert fake_bot.sent == [], (
+        "a 5-day-old row that was never group-pinged must not surface "
+        "into the group just because an unrelated lane demotion touched "
+        "lane_changed_at"
+    )
+
+
 def test_apply_trip_to_pending_still_files_normal_charge(tmp_path):
     """Sanity check the new amount+payee guard doesn't overreach: a
     normal (non-Amazon, below-threshold) dining charge inside a confirmed
@@ -631,3 +686,78 @@ def test_apply_trip_to_pending_still_files_normal_charge(tmp_path):
     assert len(filed) == 1, "a normal below-threshold trip charge must still auto-file"
     ledger = _row(db, "ledger_txn", res["ledger_txn_id"])
     assert ledger["category_id"] == "cat-vacation"
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-26 third follow-up — apply_trip_to_pending's guard called
+# ingest._is_large_amazon_charge(amount, None), ignoring
+# settings.amazon.large_charge_cents entirely. If that threshold is ever
+# configured BELOW the hardcoded LARGE_AMAZON_DEFAULT_CENTS ($150), a
+# charge held under the real (lower) configured threshold would evade this
+# guard and could be auto-filed as Vacation — violating "nothing
+# auto-commits at or above the configured threshold." Fixed by threading a
+# keyword-only ``settings`` through to apply_trip_to_pending.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_trip_to_pending_honors_configured_lower_threshold(tmp_path):
+    """With large_charge_cents configured to $40 (below the $150 default),
+    a $50 Amazon charge — ordinary under the default, but large under the
+    configured value — must still be blocked from auto-filing here once
+    it's promoted (HOT, still pending). Built with a real ledger_txn (not
+    via _charge/ingest_signal, which would route a 'large-under-settings'
+    charge through live LLM categorization) so it reaches the same
+    trip_vacation_category machinery test_apply_trip_to_pending_skips_
+    promoted_large_amazon_charge relies on — this charge WOULD file as
+    Vacation without the guard (proven below by running the unguarded
+    default-settings path first)."""
+    from bot import trips
+    from bot.config import AmazonConfig, Settings
+
+    db = _setup(tmp_path)
+    with storage.connect(db) as con:
+        con.execute(
+            "INSERT INTO category (id, group_id, name, hidden, is_spending) "
+            "VALUES ('cat-vacation', 'g1', ?, 0, 1)",
+            (trips.VACATION_CATEGORY_NAME,),
+        )
+        cur = con.execute(
+            "INSERT INTO ledger_txn (account_id, posted_date, amount_cents, "
+            "payee, category_id, is_split, source_signal, dedupe_key) "
+            "VALUES (?, '2026-07-22', -5000, 'AMAZON MKTPLACE PMTS', NULL, "
+            "0, 'chase_alert', 'dedupe-lowthresh-1')",
+            (ACCT,),
+        )
+        ledger_id = cur.lastrowid
+    pt_id = storage.insert_pending_txn(
+        db, user_id="steven", ynab_txn_id=f"ledger:{ledger_id}",
+        ynab_account_id=ACCT, payee="AMAZON MKTPLACE PMTS",
+        amount_cents=-5000, txn_date=date(2026, 7, 22), memo="",
+    )
+    # Promoted out of HOLD the way abandon_stale_holds / promote_holds_to_hot
+    # would: queue_lane -> hot, still status='pending'.
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_txn SET queue_lane = 'hot' WHERE id = ?",
+            (pt_id,),
+        )
+
+    trip_id = trips.create_confirmed_manual(
+        db, start=date(2026, 7, 20), end=date(2026, 7, 25), by="steven")
+    with storage.connect(db) as con:
+        trip_row = con.execute(
+            "SELECT * FROM trip WHERE id = ?", (trip_id,)
+        ).fetchone()
+
+    low_settings = Settings.model_construct(
+        amazon=AmazonConfig(large_charge_cents=4000))
+    filed = trips.apply_trip_to_pending(db, trip_row, settings=low_settings)
+
+    assert filed == [], (
+        "a configured $40 threshold must guard a $50 promoted Amazon "
+        "charge even though $50 is under the hardcoded $150 default"
+    )
+    pt_after = _row(db, "pending_txn", pt_id)
+    assert pt_after["status"] == "pending"
+    assert pt_after["chosen_category"] is None
+    assert _row(db, "ledger_txn", ledger_id)["category_id"] is None

@@ -212,7 +212,8 @@ def trip_vacation_category(db_path: Path | str, *, payee: str, txn_date,
     return row["id"] if row else None
 
 
-def apply_trip_to_pending(db_path: Path | str, trip_row) -> list[dict]:
+def apply_trip_to_pending(db_path: Path | str, trip_row, *,
+                           settings=None) -> list[dict]:
     """Retro-file pending txns inside a just-confirmed window. Returns the
     filed items for the receipt message.
 
@@ -233,7 +234,14 @@ def apply_trip_to_pending(db_path: Path | str, trip_row) -> list[dict]:
     (Amount alone isn't enough either: ingest._is_large_amazon_charge only
     tests magnitude, so it has to be paired with ingest._is_amazon_payee —
     otherwise a legitimately large NON-Amazon vacation charge, e.g. a
-    $400 hotel night, would be wrongly blocked from auto-filing too.)"""
+    $400 hotel night, would be wrongly blocked from auto-filing too.)
+
+    ``settings`` is threaded through to _is_large_amazon_charge so a
+    configured settings.amazon.large_charge_cents is honored here the same
+    way ingest_signal and queue_lane.abandon_stale_holds already do —
+    without it this guard silently falls back to the hardcoded
+    LARGE_AMAZON_DEFAULT_CENTS, which would under-protect a threshold
+    configured lower than the default (2026-07-26)."""
     from bot import ingest as _ingest
     from bot.group_chat import resolve_open_questions_for_item
     filed: list[dict] = []
@@ -254,7 +262,8 @@ def apply_trip_to_pending(db_path: Path | str, trip_row) -> list[dict]:
         ).fetchall()]
     for pt in cands:
         if (_ingest._is_amazon_payee(pt["payee"] or "")
-                and _ingest._is_large_amazon_charge(pt["amount_cents"], None)):
+                and _ingest._is_large_amazon_charge(
+                    pt["amount_cents"], settings)):
             continue
         src = pt["source"]
         if src is None:
