@@ -25,6 +25,14 @@ against Allison's on the main Budget page.
 | `Allison Haircut and Perm and Color` | Monthly Bills | Personal Spending |
 | `Exercise` | Day to Day Expenses | Hobbies |
 | `Allison Nails` *(new)* | — | Personal Spending |
+| `Golf` → `Steven Golf` | Hobbies | Personal Spending |
+| `Sewing` → `Allison Sewing` | Hobbies | Personal Spending |
+
+Golf and Sewing are renamed on the way over. Owner is inferred from the
+category name, so a bare "Golf" would land in the Joint bucket rather
+than Steven's. Every other envelope in Personal Spending already carries
+its owner's name, so this follows the existing convention. This leaves
+**Hobbies holding `Exercise` alone**.
 
 "Personal Spending" (`689417f2-afcf-4a6c-a94a-265818711cac`) is the
 existing group holding the Amazon per-person buckets and the two Personal
