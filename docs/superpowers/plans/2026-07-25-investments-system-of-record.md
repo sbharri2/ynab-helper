@@ -1605,15 +1605,25 @@ def import_xlsx(
             )
             created_rounds += 1
 
-    # ── Holdings, keyed by name so re-import can't duplicate them ──
+    # ── Holdings, keyed by (name, account_type, owner) ──
+    #
+    # NOT by name alone. The real sheet has three names that each appear
+    # twice, distinguished only by type and owner: "Schwab (Transfered from
+    # TD AmeriTrade)" is both a Roth IRA and a Stock Account; "Treasury
+    # Direct - US Government" is Steven's and Allison's; "TD AmeriTrade" is
+    # both again. Keying by name merges each pair and drops the second —
+    # which silently lost $25,606.62 of Schwab stock from the current round.
     #
     # Import is ADDITIVE ONLY. A holding or value that already exists is
     # left exactly as it is. Anything else means a re-run silently reverts
     # hand-corrections back to the sheet's numbers — the sheet is the thing
     # being retired, so it must never win over what the operator entered.
     with connect(db_path) as con:
-        by_name = {
-            r["name"]: r["id"] for r in con.execute("SELECT id, name FROM holding")
+        by_key = {
+            (r["name"], r["account_type"], r["owner"]): r["id"]
+            for r in con.execute(
+                "SELECT id, name, account_type, owner FROM holding"
+            )
         }
         existing_values = {
             (r["holding_id"], r["round_id"]) for r in con.execute(
@@ -1626,7 +1636,6 @@ def import_xlsx(
     skipped_values = 0
     for order, h in enumerate(snap["holdings"]):
         kind, tax = _classify(h.get("account_type", ""))
-        hid = by_name.get(h["name"])
         fields = dict(
             name=h["name"],
             owner=h.get("owner") or None,
@@ -1637,9 +1646,11 @@ def import_xlsx(
             notes=h.get("notes") or None,
             sort_order=order,
         )
+        key = (fields["name"], fields["account_type"], fields["owner"])
+        hid = by_key.get(key)
         if hid is None:
             hid = store.upsert_holding(db_path, **fields)
-            by_name[h["name"]] = hid
+            by_key[key] = hid
             created_holdings += 1
         # else: holding already exists — leave its metadata alone.
 
@@ -1670,16 +1681,21 @@ def import_xlsx(
             written_values += 1
 
     # ── Insurance: registry + one baseline observation at the newest date ──
+    #
+    # Policies have NO stable identity in the sheet. "Life - Steven" appears
+    # four times across different providers, and two of those share a
+    # provider AND a coverage string while differing only in premium. So
+    # there is no composite key that separates them, and idempotency has to
+    # be all-or-nothing at the sheet level: if any policy already exists,
+    # this import has run before and the registry is left alone.
     newest_iso = max(dates)
     with connect(db_path) as con:
-        known = {
-            r["insurance_type"] for r in con.execute(
-                "SELECT insurance_type FROM insurance_policy"
-            )
-        }
+        already_imported = con.execute(
+            "SELECT COUNT(*) FROM insurance_policy"
+        ).fetchone()[0] > 0
     created_policies = 0
     for order, p in enumerate(snap["insurance"]):
-        if p["insurance_type"] in known:
+        if already_imported:
             continue
         pid = ins.upsert_policy(
             db_path,
@@ -2180,8 +2196,14 @@ def main() -> int:
     db = store.build_snapshot(args.db)
     problems: list[str] = []
 
-    sheet_h = {h["name"]: h for h in sheet["holdings"]}
-    db_h = {h["name"]: h for h in db["holdings"]}
+    # Identity is (name, account_type, owner). Name alone collides: three
+    # names appear twice in the real sheet, and keying by name would let a
+    # merged-away holding compare equal to its surviving twin.
+    def _hkey(h: dict) -> tuple:
+        return (h["name"], h.get("account_type") or None, h.get("owner") or None)
+
+    sheet_h = {_hkey(h): h for h in sheet["holdings"]}
+    db_h = {_hkey(h): h for h in db["holdings"]}
 
     # 0. An undated column can't be diffed at all — refuse to certify.
     for name in sorted(sheet_h):
@@ -2267,21 +2289,22 @@ def main() -> int:
     # 5. Insurance: types AND premiums, not just a row count. Premium drift
     #    is the defect this whole system exists to surface — a gate blind to
     #    it would certify the one thing that must not slip through.
-    sheet_ins = {p["insurance_type"]: p for p in sheet["insurance"]}
-    db_ins = {p["insurance_type"]: p for p in db["insurance"]}
-    if len(sheet_ins) != len(sheet["insurance"]):
-        problems.append(
-            "xlsx has duplicate insurance types; premiums can't be matched by type"
+    #    Policies have no unique key at all — two "Life - Steven" rows share
+    #    provider AND coverage and differ only in premium. So compare
+    #    MULTISETS of the whole tuple. That catches a dropped row, an added
+    #    row, and a changed premium, without pretending an identity exists.
+    def _ikey(p: dict) -> tuple:
+        return (
+            p.get("insurance_type"), p.get("provider") or "",
+            p.get("coverage") or "", p.get("annual_premium_cents"),
         )
-    for t in sorted(set(sheet_ins) - set(db_ins)):
-        problems.append(f"insurance missing from DB: {t}")
-    for t in sorted(set(db_ins) - set(sheet_ins)):
-        problems.append(f"insurance extra in DB: {t}")
-    for t in sorted(set(sheet_ins) & set(db_ins)):
-        w = sheet_ins[t].get("annual_premium_cents")
-        g = db_ins[t].get("annual_premium_cents")
-        if w != g:
-            problems.append(f"insurance {t}: xlsx premium {w} != db {g}")
+
+    sheet_ins = Counter(_ikey(p) for p in sheet["insurance"])
+    db_ins = Counter(_ikey(p) for p in db["insurance"])
+    for tup, n in sorted((sheet_ins - db_ins).items()):
+        problems.append(f"insurance in xlsx but not DB (x{n}): {tup}")
+    for tup, n in sorted((db_ins - sheet_ins).items()):
+        problems.append(f"insurance in DB but not xlsx (x{n}): {tup}")
     n_db_ins = len(db["insurance"])
 
     if problems:
@@ -2411,8 +2434,12 @@ export interface HoldingRow {
   closed: number;
   sort_order: number;
   notes: string | null;
+  // Joined from property_detail — all null for non-property holdings.
   address: string | null;
   is_primary_residence: number | null;
+  listed_price_cents: number | null;
+  escrow_cents: number | null;
+  valuation_source: string | null;
 }
 
 export interface HoldingValueInput {
@@ -2444,6 +2471,7 @@ export interface PolicyRow {
   renewal_date: string | null;
   comments: string | null;
   active: number;
+  sort_order: number;
   annual_premium_cents: number | null;
   observed_cents: number | null;
   observed_date: string | null;
@@ -2947,4 +2975,29 @@ git add -A && git commit -m "chore(investments): cutover to DB-backed system of 
 
 ## Rollback
 
-The xlsx files stay untouched in `G:\My Drive\ynabclone\investments\` and `bot/investments.py` stays importable, so rollback is `git revert` of the Task 6 route change plus a bot restart — the data is still where it was. No feature flag; the revert is simpler than the flag would be. The pre-import DB backup from Task 7 Step 2 covers the schema side.
+The xlsx files stay untouched in `G:\My Drive\ynabclone\investments\` and
+`bot/investments.py` stays importable, so the source data is still where it
+was. No feature flag; a revert is simpler than the flag would be.
+
+**Do NOT restore the pre-import DB backup.** An earlier draft of this
+section said the backup "covers the schema side." That is wrong and
+dangerous. A parallel session has been writing this same database
+throughout — HSA history, category changes, payee routing, plus a day of
+ordinary ledger activity. Restoring `ynab_helper.db.pre-investments-*`
+would destroy all of it. The backup exists as a last resort for
+catastrophic corruption, not as a rollback mechanism.
+
+The correct rollback, in order:
+
+1. **Revert the investments commits only.** They are clean of the parallel
+   session's work, so reverting them by SHA touches nothing else.
+2. **Clear the seven investment tables** rather than restoring a file:
+   `holding_value`, `property_detail`, `insurance_premium_observed`,
+   `insurance_policy`, `savings_target`, `snapshot_round`, `holding`.
+   Nothing outside `bot/investments_*.py` reads them, so this is contained.
+   Verify `ledger_txn` and `account` row counts are unchanged afterwards.
+3. **Restart the bot** so the reverted routes take effect.
+4. **Hold the `investments-editors` UI branch** — do not ship it. A
+   bot-only revert restores the xlsx-reading route but leaves the shipped
+   UI's `/investments/update` and `/investments/insurance/edit` pages
+   hard-404ing. The revert and the UI branch are a matched pair.
