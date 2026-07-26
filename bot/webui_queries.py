@@ -14,6 +14,13 @@ from typing import Any, Callable
 
 from bot import storage
 
+# The business checking account funds business expenses and is not family
+# money. Its cash and its envelope group leave the Ready-to-Assign identity
+# entirely, so family RTA reflects only family money (spec 2026-07-25).
+# Matched by NAME, not id, so a re-created account/group still resolves.
+BUSINESS_ACCOUNT_NAME_LIKE = "BUSINESS CHECKING%"
+BUSINESS_GROUP_NAME = "Business Fund"
+
 
 def q_categories(db_path: str, **_: Any) -> list[dict[str, Any]]:
     """Every visible category — port of commands.rs:109 (`Category[]`)."""
@@ -575,8 +582,8 @@ def q_ready_to_assign(db_path: str, month: str, **_: Any) -> dict[str, Any]:
             "FROM month_category mc "
             "JOIN category c ON c.id = mc.category_id "
             "JOIN category_group g ON g.id = c.group_id "
-            "WHERE mc.month = ? AND g.name != 'Internal Master Category'",
-            (month,),
+            "WHERE mc.month = ? AND g.name NOT IN ('Internal Master Category', ?)",
+            (month, BUSINESS_GROUP_NAME),
         ).fetchone()
         assigned_cents = assigned_row[0] if assigned_row[0] is not None else 0
 
@@ -584,7 +591,9 @@ def q_ready_to_assign(db_path: str, month: str, **_: Any) -> dict[str, Any]:
             "SELECT COALESCE(SUM(lt.amount_cents), 0) "
             "FROM ledger_txn lt "
             "JOIN account a ON a.id = lt.account_id "
-            "WHERE a.on_budget = 1 AND a.closed = 0 AND lt.is_split = 0"
+            "WHERE a.on_budget = 1 AND a.closed = 0 AND lt.is_split = 0 "
+            "  AND a.name NOT LIKE ?",
+            (BUSINESS_ACCOUNT_NAME_LIKE,),
         ).fetchone()
         cash_cents = cash_row[0] if cash_row[0] is not None else 0
 
@@ -593,8 +602,8 @@ def q_ready_to_assign(db_path: str, month: str, **_: Any) -> dict[str, Any]:
             "FROM month_category mc "
             "JOIN category c ON c.id = mc.category_id "
             "JOIN category_group g ON g.id = c.group_id "
-            "WHERE mc.month = ? AND g.name != 'Internal Master Category'",
-            (month,),
+            "WHERE mc.month = ? AND g.name NOT IN ('Internal Master Category', ?)",
+            (month, BUSINESS_GROUP_NAME),
         ).fetchone()
         available_cents = available_row[0] if available_row[0] is not None else 0
 

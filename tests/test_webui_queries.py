@@ -176,6 +176,44 @@ def test_rta_matches_identity(fixture_db):
         (p.get("actual_date") or p["expected_date"]) for p in rta["paychecks"])
 
 
+def test_ready_to_assign_excludes_business_account_and_group(tmp_path):
+    from bot import storage, webui_queries
+    db = tmp_path / "t.db"
+    storage.init_db(db)
+    with storage.connect(db) as con:
+        con.execute(
+            "INSERT INTO account (id, name, type, on_budget, closed, balance_cents) "
+            "VALUES ('a-fam', 'JOINT CHECKING', 'checking', 1, 0, 0)")
+        con.execute(
+            "INSERT INTO account (id, name, type, on_budget, closed, balance_cents) "
+            "VALUES ('a-biz', 'BUSINESS CHECKING - 9649', 'checking', 1, 0, 0)")
+        con.execute("INSERT INTO category_group (id, name) VALUES ('g-fam', 'Everyday')")
+        con.execute("INSERT INTO category_group (id, name) VALUES ('g-biz', 'Business Fund')")
+        con.execute("INSERT INTO category (id, group_id, name) VALUES ('c-fam', 'g-fam', 'Groceries')")
+        con.execute("INSERT INTO category (id, group_id, name) VALUES ('c-biz', 'g-biz', 'Business Checking')")
+        # $100 family cash, $50 business cash
+        con.execute(
+            "INSERT INTO ledger_txn (account_id, posted_date, amount_cents, payee, is_split) "
+            "VALUES ('a-fam', '2026-07-01', 10000, 'Paycheck', 0)")
+        con.execute(
+            "INSERT INTO ledger_txn (account_id, posted_date, amount_cents, payee, is_split) "
+            "VALUES ('a-biz', '2026-07-01', 5000, 'Rent received', 0)")
+        # $30 assigned to a family envelope, $40 to the business one
+        con.execute(
+            "INSERT INTO month_category (month, category_id, budgeted_cents, "
+            "activity_cents, available_cents) VALUES ('2026-07', 'c-fam', 3000, 0, 3000)")
+        con.execute(
+            "INSERT INTO month_category (month, category_id, budgeted_cents, "
+            "activity_cents, available_cents) VALUES ('2026-07', 'c-biz', 4000, 0, 4000)")
+
+    res = webui_queries.q_ready_to_assign(str(db), "2026-07")
+
+    assert res["cash_cents"] == 10000, "business cash must not count as family cash"
+    assert res["available_cents"] == 3000, "Business Fund group must leave the identity"
+    assert res["assigned_cents"] == 3000
+    assert res["ready_to_assign_cents"] == 10000 - 3000
+
+
 def test_q_seasonal_funds_stub(fixture_db):
     from bot.webui_queries import REGISTRY
     assert REGISTRY["q_seasonal_funds"](fixture_db) == []
