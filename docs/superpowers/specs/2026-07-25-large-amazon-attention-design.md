@@ -109,12 +109,15 @@ charge. It must skip charges at or above the threshold.
 
 Clear `category_id` on ledger rows **24938** ($815.09, `Amazon - Steven`) and
 **24779** ($278.82, `Amazon - Unassigned`), enqueue both as COLD `pending_txn`
-rows so they surface in the Inbox, then call `envelope.recompute_category()` for
-`Amazon - Steven` and `Amazon - Unassigned` in `2026-07`.
+rows so they surface in the Inbox, then call
+`envelope.apply_activity_delta(db, '2026-07', [amazon_steven, amazon_unassigned])`.
 
-Deliberately **not** `recompute_month` — that call rebuilds `available` from the
-identity and trampled the anchor writes on 2026-07-25 (`envelope.py:301`), and
-bulk month recomputes are barred by standing rule.
+`apply_activity_delta` (`envelope.py:282`) is documented as the
+anchor-preserving replacement for chain recompute after a recategorization,
+which is exactly this case. Deliberately **not** `recompute_month` — that call
+rebuilds `available` from the identity and trampled the anchor writes on
+2026-07-25 (`envelope.py:301`), and bulk month recomputes are barred by
+standing rule.
 
 ## Consequences
 
