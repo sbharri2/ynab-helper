@@ -82,7 +82,13 @@ def main() -> int:
         print("nothing to raise.")
         return 0
 
-    if not args.allow_unexpected_count and len(targets) != args.expect:
+    # A dry run performs no writes, so the --expect guard buys nothing
+    # there — worse, gating it in dry-run mode broke its own advice: the
+    # message told you to "re-run with --dry-run to inspect the set", but
+    # the guard fired in dry-run too, so that advice could never work.
+    # Only gate real (write) runs.
+    if (not args.dry_run and not args.allow_unexpected_count
+            and len(targets) != args.expect):
         print(f"ABORT: expected exactly {args.expect} matching charge(s), "
               f"found {len(targets)}. Refusing to touch the database.\n"
               f"Re-run with --dry-run to inspect the actual set, or pass "
