@@ -915,6 +915,26 @@ _AMAZON_BUCKET_NAMES = {
 }
 
 
+# Amazon charges at or above this magnitude skip the auto-bucket entirely
+# (spec 2026-07-25). Overridable via settings.amazon.large_charge_cents.
+LARGE_AMAZON_DEFAULT_CENTS = 15000
+
+
+def _is_large_amazon_charge(amount_cents: int, settings: Settings | None) -> bool:
+    """True for an Amazon OUTFLOW at or above the large-charge threshold.
+
+    Signed on purpose: a refund (positive amount) is never "large" no matter
+    its size, because there is nothing to categorize — the original charge
+    already carries the category.
+    """
+    threshold = LARGE_AMAZON_DEFAULT_CENTS
+    if settings is not None:
+        threshold = getattr(
+            getattr(settings, "amazon", None), "large_charge_cents", threshold
+        )
+    return amount_cents <= -abs(threshold)
+
+
 def _amazon_bucket_category(db_path: Path | str, person: str | None) -> str | None:
     """Resolve the per-person Amazon spending bucket category id.
 

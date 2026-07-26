@@ -72,6 +72,11 @@ ollama:
   model: qwen3-coder:30b
   temperature: 0.3
 
+amazon:
+  # Charges at or above this many cents skip the per-person auto-bucket and
+  # get asked about instead (~6 a year at 15000).
+  large_charge_cents: 15000
+
 telegram:
   quiet_hours: "22:00-07:00"
   daily_digest_time: "09:00"

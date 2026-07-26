@@ -72,6 +72,12 @@ class OllamaConfig(BaseModel):
     temperature: float = 0.3
 
 
+class AmazonConfig(BaseModel):
+    # Charges at or above this magnitude skip the per-person auto-bucket and
+    # go through the confirm queue instead. ~6 charges a year at $150.
+    large_charge_cents: int = 15000
+
+
 class TelegramConfig(BaseModel):
     quiet_hours: str = "22:00-07:00"
     daily_digest_time: str = "09:00"
@@ -99,6 +105,7 @@ class Settings(BaseModel):
     observed_sources: list[ObservedSource] = []  # Phase 0: sampling sidecar
     ynab: YnabConfig
     ollama: OllamaConfig
+    amazon: AmazonConfig = AmazonConfig()
     telegram: TelegramConfig
     paths: Paths
     ynab_token: str = Field(default="", repr=False)
