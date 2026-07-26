@@ -9,6 +9,23 @@ categories) not recompute_month — the latter rebuilds `available` from the
 identity and trampled same-month anchor writes on 2026-07-25 (see
 bot/envelope.py:301).
 
+Each row's pending_txn insert, ledger mutation, audit entry, AND its
+month_category refresh happen together, one row at a time — the refresh is
+NOT batched until after the whole loop, and the pending_txn is created
+BEFORE ledger_txn.category_id is cleared. This ordering matters: clearing
+category_id is what makes a row invisible to this script's own SELECT (it
+joins on category), so it is deliberately the LAST write for a given row.
+If a failure (e.g. a concurrent bot holding a lock) hits anywhere before
+that point, the row is untouched and a plain re-run selects it again
+normally. If it hits after, the row is already fully consistent
+(pending_txn in place, uncategorized, refreshed) — never stranded.
+
+A `--expect` guard (default 2, the known target count for this repair)
+aborts before any write if the matched row count differs from what's
+expected, so a later widened `--since` can't silently sweep and re-open
+unintended historical charges. Pass --allow-unexpected-count to knowingly
+run a wider sweep.
+
 Usage:
     .venv/Scripts/python.exe scripts/raise_large_amazon_charges.py --dry-run
     .venv/Scripts/python.exe scripts/raise_large_amazon_charges.py
@@ -27,6 +44,14 @@ def main() -> int:
     ap.add_argument("--since", default="2026-06-01",
                     help="only touch charges posted on/after this date")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--expect", type=int, default=2,
+                    help="required number of matching charges; abort "
+                         "before touching the database if the actual "
+                         "count differs (default 2, the known target set "
+                         "for this repair). See --allow-unexpected-count "
+                         "to bypass for a deliberate wider sweep.")
+    ap.add_argument("--allow-unexpected-count", action="store_true",
+                    help="bypass the --expect guard (deliberate wider sweep)")
     args = ap.parse_args()
 
     from dotenv import load_dotenv
@@ -57,6 +82,14 @@ def main() -> int:
         print("nothing to raise.")
         return 0
 
+    if not args.allow_unexpected_count and len(targets) != args.expect:
+        print(f"ABORT: expected exactly {args.expect} matching charge(s), "
+              f"found {len(targets)}. Refusing to touch the database.\n"
+              f"Re-run with --dry-run to inspect the actual set, or pass "
+              f"--allow-unexpected-count for a deliberate wider sweep.",
+              file=sys.stderr)
+        return 1
+
     touched_categories: set[tuple[str, str]] = set()
     for r in targets:
         month = str(r["posted_date"])[:7]
@@ -67,12 +100,12 @@ def main() -> int:
         if args.dry_run:
             continue
 
-        with storage.connect(db) as con:
-            con.execute(
-                "UPDATE ledger_txn SET category_id = NULL, "
-                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                (r["id"],),
-            )
+        # Order matters for recoverability: create the pending_txn (the
+        # Inbox entry) BEFORE clearing ledger_txn.category_id (the step
+        # that removes this row from the SELECT's join and makes it
+        # un-recoverable by a plain re-run). If insert_pending_txn or the
+        # queue_lane update fails, the ledger row is untouched — still
+        # categorized, still selected again next run.
         pt_id = storage.insert_pending_txn(
             db,
             user_id="steven",
@@ -83,28 +116,43 @@ def main() -> int:
             txn_date=r["posted_date"],
             memo=f"raised for categorization (was {r['cat_name']})",
         )
+        if pt_id is None:
+            # insert_pending_txn returns None if ynab_txn_id already
+            # exists — a prior partial run got this far. Look the row up
+            # so the queue_lane fix-up below still applies idempotently.
+            with storage.connect(db) as con:
+                existing = con.execute(
+                    "SELECT id FROM pending_txn WHERE ynab_txn_id = ?",
+                    (f"ledger:{r['id']}",),
+                ).fetchone()
+            pt_id = existing["id"] if existing else None
         if pt_id:
             with storage.connect(db) as con:
                 con.execute(
                     "UPDATE pending_txn SET queue_lane = 'cold' WHERE id = ?",
                     (pt_id,),
                 )
+
+        with storage.connect(db) as con:
+            con.execute(
+                "UPDATE ledger_txn SET category_id = NULL, "
+                "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (r["id"],),
+            )
         storage.audit(db, "large_amazon_raised", {
             "ledger_txn_id": r["id"], "pending_txn_id": pt_id,
             "was_category": r["cat_name"], "amount_cents": r["amount_cents"],
         })
+        # Refresh THIS row's category right away — not batched until after
+        # the loop — so a failure on a later row can never strand an
+        # already-mutated row with a stale month_category cache.
+        envelope.apply_activity_delta(db, month, [r["category_id"]])
+        print(f"  refreshed {month}: {r['cat_name']}")
 
     if args.dry_run:
         print(f"\n[dry-run] would raise {len(targets)} charge(s); "
               f"would refresh {len(touched_categories)} month/category pair(s).")
         return 0
-
-    by_month: dict[str, list[str]] = {}
-    for month, category_id in touched_categories:
-        by_month.setdefault(month, []).append(category_id)
-    for month, category_ids in sorted(by_month.items()):
-        envelope.apply_activity_delta(db, month, category_ids)
-        print(f"  refreshed {month}: {len(category_ids)} categor(ies)")
 
     print(f"\nraised {len(targets)} charge(s).")
     return 0
