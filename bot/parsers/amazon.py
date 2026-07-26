@@ -32,6 +32,69 @@ def extract_order_id(html: str) -> str | None:
     return m.group(0) if m else None
 
 
+def _order_id_positions(text: str) -> list[tuple[str, int]]:
+    """First-occurrence offset of each DISTINCT order id, in document order.
+
+    Deduped because Amazon repeats the order number in tracking links and
+    "view or edit order" URLs — a repeat is not a second order.
+    """
+    seen: dict[str, int] = {}
+    for m in ORDER_ID_RE.finditer(text):
+        seen.setdefault(m.group(0), m.start())
+    return list(seen.items())
+
+
+def extract_additional_orders(text: str) -> list[dict]:
+    """Orders 2..N of a multi-order confirmation email.
+
+    Amazon groups one checkout into several order numbers and sends a
+    single "Ordered:" email with a block per order:
+
+        Order # / <id> / <items> / Grand Total: / $<amount>
+
+    Each block is delimited by the next order id, so we slice on those
+    offsets and re-run the single-order extractors per slice. The FIRST
+    order is deliberately not returned here — `parse()` keeps reading it
+    from the whole body exactly as before, so single-order emails and the
+    primary fields of multi-order emails are bit-for-bit unchanged.
+
+    Observed live 2026-07-04: a $278.82 order rode along with a $139.41
+    one and was silently dropped, leaving an unmatchable card charge.
+    """
+    positions = _order_id_positions(text)
+    if len(positions) < 2:
+        return []
+
+    extras: list[dict] = []
+    for idx in range(1, len(positions)):
+        order_id, start = positions[idx]
+        end = positions[idx + 1][1] if idx + 1 < len(positions) else len(text)
+        segment = text[start:end]
+
+        total_cents = extract_total_cents(segment)
+        items = extract_items(segment)
+        if items == ["(could not parse items)"]:
+            items = []
+        # A block with neither a total nor items isn't an order — it's a
+        # stray id in boilerplate. Dropping it keeps phantom rows out of
+        # the queue.
+        if total_cents is None and not items:
+            continue
+
+        extras.append({
+            "order_id": order_id,
+            "total_cents": total_cents,
+            "items": items,
+            "summary": _summarize(items),
+        })
+    return extras
+
+
+def _summarize(items: list[str]) -> str:
+    return (f"{len(items)} item(s): " + ", ".join(items[:3])
+            + (f" (+{len(items) - 3} more)" if len(items) > 3 else ""))
+
+
 def extract_total_cents(body: str) -> int | None:
     """Prefer 'Grand Total: X.XX USD' (current Amazon template),
     fall back to 'Order Total: $X.XX' (older), then any 'Total:'.
@@ -277,8 +340,11 @@ def parse(body: str, *, subject: str = "", date_header: str = "",
         "total_cents": total_cents,
         "order_date": order_date,
         "items": items,
-        "summary": f"{len(items)} item(s): " + ", ".join(items[:3])
-                    + (f" (+{len(items)-3} more)" if len(items) > 3 else ""),
+        "summary": _summarize(items),
+        # Orders 2..N when Amazon packs several into one email. Always
+        # present (empty for the common single-order case) so callers can
+        # fan out unconditionally.
+        "additional_orders": extract_additional_orders(text),
         "parse_status": status,
         "missing_fields": missing,
     }

@@ -298,6 +298,44 @@ def poll_once(settings: Settings) -> int:
                     except Exception as e:  # noqa: BLE001
                         log.warning("amazon retro-bucket failed: %s", e)
 
+                # Multi-order confirmation: Amazon packs one checkout into
+                # several order numbers and sends a single "Ordered:" email.
+                # Each extra order needs its own pending_order row, keyed by
+                # a synthesized email_id — insert_pending_order is idempotent
+                # on email_id alone, so reusing the parent's would silently
+                # collapse them into the first order. That is how a real
+                # $278.82 order vanished on 2026-07-04, leaving a card charge
+                # nothing could match.
+                for extra in (parsed.get("additional_orders") or []):
+                    extra_order_id = extra.get("order_id")
+                    if not extra_order_id:
+                        continue
+                    try:
+                        extra_row_id = storage.insert_pending_order(
+                            settings.paths.database,
+                            user_id=account.user_id,
+                            source=parsed["source"],
+                            external_id=extra_order_id,
+                            email_id=f"{m['id']}#{extra_order_id}",
+                            order_date=parsed.get("order_date") or date.today(),
+                            total_cents=extra.get("total_cents") or 0,
+                            raw_summary=extra.get("summary", ""),
+                            raw_payload=extra,
+                            assigned_to_user_id=_person_from_recipient(
+                                headers, account.user_id),
+                        )
+                        new_count += 1
+                    except sqlite3.IntegrityError:
+                        continue
+                    if extra_row_id:
+                        from bot import ingest
+                        try:
+                            ingest.retro_bucket_amazon_order(
+                                settings.paths.database, order_id=extra_row_id,
+                            )
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("amazon retro-bucket (extra) failed: %s", e)
+
                 # Venmo INFLOWS ("Jane paid you $20", charged_by) should
                 # never run through the LLM — they're not spending. The
                 # LLM was guessing Dining/Groceries because every option

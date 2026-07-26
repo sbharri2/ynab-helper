@@ -80,3 +80,95 @@ def test_parse_falls_back_to_today_when_no_date_header():
     body = _load("auto-confirm-amazon-com")
     result = amazon.parse(body)
     assert result["order_date"] == date.today()
+
+
+# --- Multi-order confirmation emails -------------------------------------
+# Amazon groups one checkout into several order numbers and sends ONE
+# "Ordered:" email listing each order in its own block:
+#
+#     Order # / <id> / <items> / Grand Total: / $<amount>   (repeated)
+#
+# The parser used to read only the first id + first total, silently
+# dropping the rest. Observed live 2026-07-04: a $278.82 order rode along
+# with a $139.41 one and never reached the ledger.
+
+_TWO_ORDER_BODY = """Ordered: "Widget A..." and 2 more items
+Your Orders
+Thanks for your order!
+Arriving July 8 - July 9
+Steven - APEX, NC
+Order #
+112-4520723-6491412
+View or edit order
+Widget A Deluxe Edition
+Quantity: 1
+$
+129
+99
+Grand Total:
+$139.41
+Arriving Monday
+Steven - APEX, NC
+Order #
+112-0628151-8215415
+View or edit order
+Widget B Standard Bounce
+Quantity: 1
+$
+129
+99
+Widget C Standard Bounce
+Quantity: 1
+$
+129
+99
+Grand Total:
+$278.82
+"""
+
+
+def test_multi_order_email_keeps_first_order_as_primary():
+    """Backwards compatibility: the primary fields must not shift."""
+    parsed = amazon.parse(_TWO_ORDER_BODY, subject='Ordered: "Widget A..."')
+    assert parsed["order_id"] == "112-4520723-6491412"
+    assert parsed["total_cents"] == 13941
+
+
+def test_multi_order_email_returns_the_second_order():
+    parsed = amazon.parse(_TWO_ORDER_BODY, subject='Ordered: "Widget A..."')
+    extra = parsed.get("additional_orders") or []
+    assert len(extra) == 1, f"expected 1 additional order, got {len(extra)}"
+    assert extra[0]["order_id"] == "112-0628151-8215415"
+    assert extra[0]["total_cents"] == 27882
+
+
+def test_multi_order_extra_orders_carry_their_own_items():
+    parsed = amazon.parse(_TWO_ORDER_BODY, subject='Ordered: "Widget A..."')
+    extra = parsed["additional_orders"][0]
+    joined = " ".join(extra["items"])
+    assert "Widget B" in joined
+    assert "Widget C" in joined
+    # The first order's item must NOT leak into the second order's block
+    assert "Widget A" not in joined
+    assert extra["summary"]
+
+
+def test_single_order_email_has_no_additional_orders():
+    """A normal one-order email must be completely unchanged."""
+    body = _load("auto-confirm-amazon-com")
+    parsed = amazon.parse(body)
+    assert parsed.get("additional_orders") == []
+    assert parsed["total_cents"] == 3216
+
+
+def test_repeated_order_id_does_not_create_a_phantom_order():
+    """Tracking links repeat the order number; that is not a second order."""
+    body = (
+        "Order #\n112-1111111-2222222\nWidget\nQuantity: 1\n"
+        "Grand Total:\n$10.00\n"
+        "https://www.amazon.com/progress-tracker/package?orderId=112-1111111-2222222\n"
+    )
+    parsed = amazon.parse(body)
+    assert parsed["order_id"] == "112-1111111-2222222"
+    assert parsed["total_cents"] == 1000
+    assert parsed.get("additional_orders") == []
