@@ -41,9 +41,11 @@ RULES: list[tuple[str, tuple[str, ...]]] = [
         "nightnationrun", "donatelife", "bull moon", "livebold",
         "city of oaks", "runforlove", "beattheheat", "apex chamber",
         "ceg", "viking", "united mono", "catchi", "registration",
+        # TRC is a running club, not a racquet club (Steven, 2026-07-25).
+        "trc",
     )),
     ("TENNIS", (
-        "usta", "tennis", "wwta", "sunsettennis", "enocta", "trc",
+        "usta", "tennis", "wwta", "sunsettennis", "enocta",
         "cary parks", "parks, rec", "parks rec", "holly springs",
         "act*parks", "venmo", "paypal", "zelle",
     )),
