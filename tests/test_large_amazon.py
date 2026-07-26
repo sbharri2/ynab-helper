@@ -2,6 +2,7 @@
 
 Spec: docs/superpowers/specs/2026-07-25-large-amazon-attention-design.md
 """
+import asyncio
 import sqlite3
 from datetime import date
 
@@ -49,15 +50,16 @@ def _setup(tmp_path):
         con.execute(
             "INSERT INTO category_group (id, name) VALUES ('g1', 'Personal Spending')"
         )
-        for cid, name in [
-            ("cat-steven", "Amazon - Steven"),
-            ("cat-allison", "Amazon - Allison"),
-            ("cat-unassigned", "Amazon - Unassigned"),
+        for cid, name, is_spending in [
+            ("cat-steven", "Amazon - Steven", 0),
+            ("cat-allison", "Amazon - Allison", 0),
+            ("cat-unassigned", "Amazon - Unassigned", 0),
+            ("cat-electronics", "Electronics", 1),
         ]:
             con.execute(
                 "INSERT INTO category (id, group_id, name, hidden, is_spending) "
-                "VALUES (?, 'g1', ?, 0, 0)",
-                (cid, name),
+                "VALUES (?, 'g1', ?, 0, ?)",
+                (cid, name, is_spending),
             )
     return db
 
@@ -242,6 +244,8 @@ def test_amazon_14_day_ttl_is_gone(tmp_path):
 
 
 def test_promotion_adopts_order_suggestion(tmp_path):
+    """A non-bucket suggestion (a real budget category the categorizer
+    picked for the order) rides through onto the promoted pending_txn."""
     db = _setup(tmp_path)
     pt_id = _hold_row(db, amount_cents=-81509, hours_ago=1)
     storage.insert_pending_order(
@@ -252,7 +256,7 @@ def test_promotion_adopts_order_suggestion(tmp_path):
     )
     with storage.connect(db) as con:
         con.execute(
-            "UPDATE pending_order SET suggested_category = 'cat-steven', "
+            "UPDATE pending_order SET suggested_category = 'cat-electronics', "
             "assigned_to_user_id = 'steven' WHERE email_id = 'order-sugg'"
         )
 
@@ -261,4 +265,164 @@ def test_promotion_adopts_order_suggestion(tmp_path):
     assert promoted == 1
     row = _row(db, "pending_txn", pt_id)
     assert row["queue_lane"] == "hot"
+    assert row["suggested_category"] == "cat-electronics"
+
+
+def test_promotion_does_not_adopt_amazon_bucket_suggestion(tmp_path):
+    """A bare suggested_category pointing at an Amazon bucket must NOT be
+    adopted — that would offer a one-tap path straight back into the
+    holding pen this feature exists to escape (Finding 4). Enrichment
+    still promotes the row to HOT (the item detail is still useful even
+    without a category guess); only the bucket suggestion is dropped."""
+    db = _setup(tmp_path)
+    pt_id = _hold_row(db, amount_cents=-81509, hours_ago=1)
+    storage.insert_pending_order(
+        db,
+        user_id="steven", source="amazon", external_id="112-0031580-6551464",
+        email_id="order-bucket-sugg", order_date=date(2026, 7, 22),
+        total_cents=81509,
+        raw_summary="1 item(s): 1 Electronics item", raw_payload={},
+    )
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_order SET suggested_category = 'cat-steven', "
+            "assigned_to_user_id = 'steven' WHERE email_id = 'order-bucket-sugg'"
+        )
+
+    promoted = queue_lane.promote_holds_to_hot(db, settings=None)
+
+    assert promoted == 1
+    row = _row(db, "pending_txn", pt_id)
+    assert row["queue_lane"] == "hot"
+    assert row["suggested_category"] is None
+
+
+def test_promotion_keeps_confirmed_bucket_choice(tmp_path):
+    """A CONFIRMED chosen_category must still win even when it's an Amazon
+    bucket — a human choosing the bucket is a legitimate decision, not the
+    blind-fallback path Finding 4 closes."""
+    db = _setup(tmp_path)
+    pt_id = _hold_row(db, amount_cents=-81509, hours_ago=1)
+    storage.insert_pending_order(
+        db,
+        user_id="steven", source="amazon", external_id="112-0031580-6551465",
+        email_id="order-bucket-chosen", order_date=date(2026, 7, 22),
+        total_cents=81509,
+        raw_summary="1 item(s): 1 Electronics item", raw_payload={},
+    )
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_order SET chosen_category = 'cat-steven', "
+            "assigned_to_user_id = 'steven' WHERE email_id = 'order-bucket-chosen'"
+        )
+
+    promoted = queue_lane.promote_holds_to_hot(db, settings=None)
+
+    assert promoted == 1
+    row = _row(db, "pending_txn", pt_id)
+    assert row["queue_lane"] == "hot"
     assert row["suggested_category"] == "cat-steven"
+
+
+# ---------------------------------------------------------------------------
+# Finding 5 — composition test spanning ingest -> hold -> group sweep ->
+# TTL expiry -> eligible. Every other test in this file exercises one
+# function in isolation; this one calls the real group_chat._sweep_once
+# so it fails if someone removes the `queue_lane <> 'hold'` filter Finding 1
+# added, not just a re-implementation of that predicate.
+# ---------------------------------------------------------------------------
+
+
+class _FakeMessage:
+    def __init__(self, message_id):
+        self.message_id = message_id
+
+
+class _FakeBot:
+    def __init__(self):
+        self.sent: list[tuple[int, str]] = []
+        self._next_id = 9000
+
+    async def send_message(self, chat_id, text):
+        self._next_id += 1
+        self.sent.append((chat_id, text))
+        return _FakeMessage(self._next_id)
+
+
+class _FakePaths:
+    def __init__(self, database):
+        self.database = database
+
+
+class _FakeSettings:
+    def __init__(self, database):
+        self.paths = _FakePaths(database)
+
+
+class _FakeApp:
+    def __init__(self, bot_data):
+        self.bot_data = bot_data
+
+
+def test_large_amazon_composition_hold_not_pinged_then_ttl_promotes(tmp_path):
+    """Full lifecycle: a large Amazon charge is ingested, lands in HOLD,
+    and is invisible to the group sweep's ping query — the same query
+    Finding 1 fixed by adding `queue_lane <> 'hold'`. Once its TTL expires
+    (simulated by aging lane_changed_at and running abandon_stale_holds,
+    the real 24h path), it becomes eligible and the next sweep pings it."""
+    from bot import group_chat, queue_lane
+
+    db = _setup(tmp_path)
+    res = _charge(db, amount_cents=-81509, email_id="composition-1")
+    with storage.connect(db) as con:
+        pt = con.execute("SELECT * FROM pending_txn").fetchone()
+    assert pt["queue_lane"] == "hold"
+    assert pt["status"] == "pending"
+
+    group_id = 555
+    fake_bot = _FakeBot()
+    app = _FakeApp({"chat_to_bot": {group_id: fake_bot}})
+    settings = _FakeSettings(db)
+
+    # Sweep #1: still HOLD — must not be pinged.
+    asyncio.run(group_chat._sweep_once(app, settings, group_id))
+    assert fake_bot.sent == [], (
+        "a held large-Amazon charge must not be pinged before its receipt "
+        "arrives or its TTL expires — this is the exact bypass Finding 1 "
+        "closed"
+    )
+    with storage.connect(db) as con:
+        q_count = con.execute(
+            "SELECT COUNT(*) FROM question WHERE item_kind='txn' AND item_id=?",
+            (pt["id"],),
+        ).fetchone()[0]
+    assert q_count == 0, "no question row should exist for a still-held item"
+
+    # Age the row past the 24h HOLD TTL and run the real expiry sweep.
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_txn SET lane_changed_at = "
+            "datetime('now', '-25 hours') WHERE id = ?",
+            (pt["id"],),
+        )
+    queue_lane.abandon_stale_holds(db)
+    with storage.connect(db) as con:
+        pt2 = con.execute(
+            "SELECT * FROM pending_txn WHERE id = ?", (pt["id"],)
+        ).fetchone()
+    assert pt2["queue_lane"] == "hot", (
+        "TTL-expired large Amazon holds must promote to HOT so they get "
+        "asked anyway"
+    )
+
+    # Sweep #2: now HOT and eligible — must be pinged.
+    asyncio.run(group_chat._sweep_once(app, settings, group_id))
+    assert len(fake_bot.sent) == 1, (
+        "once promoted out of HOLD, the sweep must ping the item"
+    )
+    with storage.connect(db) as con:
+        q_count2 = con.execute(
+            "SELECT COUNT(*) FROM question WHERE item_kind='txn' AND item_id=?",
+            (pt["id"],),
+        ).fetchone()[0]
+    assert q_count2 == 1

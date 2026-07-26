@@ -212,6 +212,26 @@ def abandon_stale_holds(db_path: Path | str, *, settings=None) -> int:
     return total
 
 
+def _is_amazon_bucket_category(db_path: Path | str, category_id: str | None) -> bool:
+    """True when ``category_id`` is one of the per-person Amazon spending
+    buckets ('Amazon - Steven' / 'Amazon - Allison' / 'Amazon - Unassigned').
+
+    Matched by name prefix — the same signal ``ingest._amazon_bucket_category``
+    uses to resolve these rows and ``scripts/raise_large_amazon_charges.py``
+    uses to find them (``c.name LIKE 'Amazon - %'``). Deliberately narrower
+    than ``is_spending = 0``: that flag also covers unrelated non-spending
+    categories (Credit Card Payments, scheduled bills) that are not the
+    holding pen this feature exists to keep large charges out of.
+    """
+    if not category_id:
+        return False
+    with storage.connect(db_path) as con:
+        row = con.execute(
+            "SELECT name FROM category WHERE id = ?", (category_id,),
+        ).fetchone()
+    return bool(row and row["name"] and row["name"].startswith("Amazon - "))
+
+
 def promote_holds_to_hot(db_path: Path | str, *, settings) -> int:
     """Re-run the matcher on every HOLD row. If we now find a matching
     pending_order, enrich raw_summary, set suggested_category from the
@@ -246,9 +266,15 @@ def promote_holds_to_hot(db_path: Path | str, *, settings) -> int:
         # A confirmed user choice wins; otherwise carry the order's own
         # suggestion through so the prompt offers a starting guess instead
         # of a bare amount (order 83 carried a 0.6-confidence pick that
-        # never reached the user).
-        new_cat = matched.get("chosen_category") or matched.get(
-            "suggested_category")
+        # never reached the user). The bare suggestion, unlike a confirmed
+        # choice, must not point back into an Amazon bucket — that would
+        # be a one-tap path straight back into the holding pen this whole
+        # feature exists to escape (spec 2026-07-25 Consequences).
+        new_cat = matched.get("chosen_category")
+        if not new_cat:
+            suggested = matched.get("suggested_category")
+            if suggested and not _is_amazon_bucket_category(db_path, suggested):
+                new_cat = suggested
         # If the matched order is owned by a different user (e.g. an Amazon
         # CC alert arrived through Steven's inbox but the matching order
         # confirmation came through Allison's), flip the pending_txn over
