@@ -212,6 +212,12 @@ def test_ready_to_assign_excludes_business_account_and_group(tmp_path):
     assert res["available_cents"] == 3000, "Business Fund group must leave the identity"
     assert res["assigned_cents"] == 3000
     assert res["ready_to_assign_cents"] == 10000 - 3000
+    # Neither payee here repeats >=3 times, so q_income_sources detects no
+    # source and both inflows fall through to misc — the business one must
+    # not leak into the family's misc/net totals via actual_rows.
+    assert res["actual_misc_cents"] == 10000, \
+        "business inflow must not count as family misc income"
+    assert res["monthly_net_cents"] == 10000 - 3000
 
 
 def test_q_seasonal_funds_stub(fixture_db):

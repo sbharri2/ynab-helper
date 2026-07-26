@@ -551,7 +551,9 @@ def q_ready_to_assign(db_path: str, month: str, **_: Any) -> dict[str, Any]:
     month, matches actual inflows within +/-3 days, surfaces unmatched
     in-month actuals for a known source as "received" rows (2026-07-24
     fix), sums misc/assigned, and computes the cash-anchored RTA plus the
-    in-flight transfer-leg detector."""
+    in-flight transfer-leg detector. Business-account inflows are excluded
+    throughout (spec 2026-07-25), so a business deposit never becomes
+    family misc income."""
     sources = q_income_sources(db_path)
     today = _dt.date.today()
     month_start = _dt.datetime.strptime(f"{month}-01", "%Y-%m-%d").date()
@@ -573,8 +575,9 @@ def q_ready_to_assign(db_path: str, month: str, **_: Any) -> dict[str, Any]:
             "  AND parent_txn_id IS NULL "
             "  AND (payee IS NULL OR payee NOT LIKE 'Transfer :%') "
             "  AND transfer_account_id IS NULL "
-            "  AND account_id IN (SELECT id FROM account WHERE on_budget = 1)",
-            (month_start_s, month_end_s),
+            "  AND account_id IN (SELECT id FROM account "
+            "                     WHERE on_budget = 1 AND name NOT LIKE ?)",
+            (month_start_s, month_end_s, BUSINESS_ACCOUNT_NAME_LIKE),
         ).fetchall()
 
         assigned_row = con.execute(
@@ -736,6 +739,7 @@ def q_ready_to_assign(db_path: str, month: str, **_: Any) -> dict[str, Any]:
 
     # Cash-anchored RTA: on-budget cash minus everything sitting in this
     # month's envelopes (Steven, 2026-07-11 — every month rolls over).
+    # Both sides exclude the business account/group (spec 2026-07-25).
     rta = cash_cents - available_cents
 
     return {
