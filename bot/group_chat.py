@@ -137,10 +137,12 @@ async def _sweep_once(app: Application, settings, group_id: int) -> None:
     with storage.connect(db_path) as con:
         rows = con.execute(
             """SELECT pt.id, pt.payee, pt.amount_cents, pt.txn_date,
-                      pt.suggested_category, c.name AS suggested_name
+                      pt.suggested_category, pt.raw_summary,
+                      c.name AS suggested_name
                FROM pending_txn pt
                LEFT JOIN category c ON c.id = pt.suggested_category
                WHERE pt.status = 'pending'
+                 AND pt.queue_lane <> 'hold'
                  AND pt.created_at >= datetime('now', ?)
                  AND NOT EXISTS (
                    SELECT 1 FROM question q
@@ -218,17 +220,26 @@ async def _post_trip_confirms(app: Application, settings, group_id: int) -> None
 
 def _ping_text(r) -> str:
     """One instant-ping message. r needs payee/amount_cents/txn_date and
-    suggested_name (None when no suggestion)."""
+    suggested_name (None when no suggestion). If r also carries a
+    non-empty raw_summary (e.g. a HOLD row's item text, filled in by
+    queue_lane.promote_holds_to_hot when the order email matches), that
+    detail rides along in the ping — the whole point of waiting for the
+    receipt is that the question isn't blind."""
+    try:
+        raw_summary = r["raw_summary"]
+    except (KeyError, IndexError):
+        raw_summary = None
+    detail = f"\n{raw_summary}" if raw_summary else ""
     head = (f"🆕 {_fmt_money(r['amount_cents'])} {r['payee']} "
             f"({r['txn_date']})")
     if r["suggested_name"]:
         return (
-            f"{head} — suggest {r['suggested_name']}\n"
+            f"{head}{detail} — suggest {r['suggested_name']}\n"
             f"Reply “y” to accept, or another category — "
             f"or ignore it, it's in the Inbox."
         )
     return (
-        f"{head}\n"
+        f"{head}{detail}\n"
         f"Reply to this message with a category to file it — "
         f"or ignore it, it's in the Inbox."
     )

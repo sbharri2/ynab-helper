@@ -214,7 +214,12 @@ def trip_vacation_category(db_path: Path | str, *, payee: str, txn_date,
 
 def apply_trip_to_pending(db_path: Path | str, trip_row) -> list[dict]:
     """Retro-file pending txns inside a just-confirmed window. Returns the
-    filed items for the receipt message."""
+    filed items for the receipt message.
+
+    HOLD-lane rows (spec 2026-07-25: large Amazon charges awaiting their
+    order email) are excluded — nothing auto-commits a category at/above
+    the large-charge threshold, and a trip rule is not an exception. They
+    stay in HOLD and get asked normally once promoted or expired."""
     from bot.group_chat import resolve_open_questions_for_item
     filed: list[dict] = []
     with storage.connect(db_path) as con:
@@ -228,6 +233,7 @@ def apply_trip_to_pending(db_path: Path | str, trip_row) -> list[dict]:
                 AND pt.ynab_txn_id LIKE 'ledger:%'
                LEFT JOIN category c ON c.id = pt.suggested_category
                WHERE pt.status = 'pending'
+                 AND pt.queue_lane <> 'hold'
                  AND pt.txn_date BETWEEN ? AND ?""",
             (trip_row["start_date"], trip_row["end_date"]),
         ).fetchall()]
