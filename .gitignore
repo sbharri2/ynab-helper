@@ -59,6 +59,9 @@ ui_api_token.txt
 ui_api_tokens.json
 *.bak
 *.pre-move-bak
+# Pre-migration DB snapshots (ynab_helper.db.pre-<change>-<date>). Kept on
+# disk as rollback points, never committed — they're ~31 MB each.
+ynab_helper.db.pre-*
 
 # Local agent / editor config
 .claude/
