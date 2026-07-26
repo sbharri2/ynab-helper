@@ -10,6 +10,8 @@ from datetime import date
 
 import pytest
 
+from fastapi.testclient import TestClient
+
 from bot import storage
 from bot.envelope import (
     assign_to_category,
@@ -17,6 +19,7 @@ from bot.envelope import (
     recompute_month,
     roll_forward,
 )
+from bot.http_api import build_app
 
 
 def _seed(db_path):
@@ -202,3 +205,119 @@ def test_closed_account_spend_does_not_move_envelopes(tmp_path):
 
     # Only the live account's charge counts.
     assert results["cat-groc"] == -2500
+
+
+# ── /envelope/return_to_rta (HTTP layer) ────────────────────────────────
+#
+# Regression coverage for the 2026-07-25 "Piano Lessons" bug: the move
+# dialog's Ready-to-Assign leg used to call /budget/set with an absolute
+# recomputed value, which /budget/set rejects once carryover drives the
+# result negative (budgeted 0, available 15000, returning 149 -> -14900).
+# /envelope/return_to_rta names that operation explicitly instead.
+
+
+def _client(tmp_path):
+    db = tmp_path / "t.db"
+    _seed(db)
+    token_dir = tmp_path / "tokens"
+    token_dir.mkdir()
+    (token_dir / "ui_api_token.txt").write_text("testtoken", encoding="utf-8")
+    app = build_app(db_path=db, token_dir=token_dir, webui_dir=tmp_path / "webui")
+    c = TestClient(app)
+    c.headers.update({"X-API-Token": "testtoken"})
+    c.db = db
+    return c
+
+
+def _seed_carryover(db_path, *, month, budgeted_cents, available_cents):
+    """Piano-Lessons-shaped state: money sitting in `available_cents` that
+    isn't backed by this month's `budgeted_cents` (i.e. carryover)."""
+    with storage.connect(db_path) as con:
+        con.execute(
+            """INSERT INTO month_category
+               (month, category_id, budgeted_cents, activity_cents, available_cents)
+               VALUES (?, ?, ?, 0, ?)""",
+            (month, "cat-groc", budgeted_cents, available_cents),
+        )
+
+
+def test_return_to_rta_happy_path_drives_budgeted_negative(tmp_path):
+    c = _client(tmp_path)
+    _seed_carryover(c.db, month="2026-07", budgeted_cents=0, available_cents=15000)
+
+    r = c.post("/envelope/return_to_rta", json={
+        "month": "2026-07", "category_id": "cat-groc", "cents": 14900,
+    })
+
+    assert r.status_code == 200
+    result = r.json()["result"]
+    assert result["budgeted_cents"] == -14900
+    assert result["available_cents"] == 100
+
+    with storage.connect(c.db) as con:
+        row = con.execute(
+            "SELECT budgeted_cents, available_cents FROM month_category "
+            "WHERE month = ? AND category_id = ?",
+            ("2026-07", "cat-groc"),
+        ).fetchone()
+    assert row["budgeted_cents"] == -14900
+    assert row["available_cents"] == 100
+
+
+def test_return_to_rta_rejects_cents_exceeding_available(tmp_path):
+    c = _client(tmp_path)
+    _seed_carryover(c.db, month="2026-07", budgeted_cents=0, available_cents=15000)
+
+    r = c.post("/envelope/return_to_rta", json={
+        "month": "2026-07", "category_id": "cat-groc", "cents": 15100,
+    })
+
+    assert r.status_code == 400
+    assert "15100" in r.text
+    assert "15000" in r.text
+
+    # Nothing was written.
+    with storage.connect(c.db) as con:
+        row = con.execute(
+            "SELECT budgeted_cents, available_cents FROM month_category "
+            "WHERE month = ? AND category_id = ?",
+            ("2026-07", "cat-groc"),
+        ).fetchone()
+    assert row["budgeted_cents"] == 0
+    assert row["available_cents"] == 15000
+
+
+@pytest.mark.parametrize("cents", [0, -100])
+def test_return_to_rta_rejects_non_positive_cents(tmp_path, cents):
+    c = _client(tmp_path)
+    _seed_carryover(c.db, month="2026-07", budgeted_cents=0, available_cents=15000)
+
+    r = c.post("/envelope/return_to_rta", json={
+        "month": "2026-07", "category_id": "cat-groc", "cents": cents,
+    })
+
+    assert r.status_code == 400
+
+
+def test_return_to_rta_rejects_bad_month(tmp_path):
+    c = _client(tmp_path)
+    _seed_carryover(c.db, month="2026-07", budgeted_cents=0, available_cents=15000)
+
+    r = c.post("/envelope/return_to_rta", json={
+        "month": "2026/07", "category_id": "cat-groc", "cents": 100,
+    })
+
+    assert r.status_code == 400
+
+
+def test_return_to_rta_with_no_carryover_row_rejects_any_positive_cents(tmp_path):
+    """No month_category row at all means available_cents is implicitly 0
+    (nothing has ever been assigned or carried into this category-month) —
+    returning anything must 400, not treat missing-row as unlimited."""
+    c = _client(tmp_path)
+
+    r = c.post("/envelope/return_to_rta", json={
+        "month": "2026-07", "category_id": "cat-groc", "cents": 100,
+    })
+
+    assert r.status_code == 400

@@ -205,6 +205,12 @@ class TopUpMonthBody(BaseModel):
     dry_run: bool = True      # preview by default; apply needs explicit False
 
 
+class ReturnToRtaBody(BaseModel):
+    month: str                # "YYYY-MM"
+    category_id: str
+    cents: int                # positive — amount to return to Ready to Assign
+
+
 class MarkTransferBody(BaseModel):
     ledger_txn_id: int
     # Optional: force the counterparty account (needed for one-sided
@@ -877,6 +883,59 @@ def build_app(
         storage.audit(db_path, "ui_envelope_move", {
             "month": body.month, "from": body.from_category_id,
             "to": body.to_category_id, "cents": body.cents,
+        })
+        return {"ok": True, "result": result}
+
+    @app.post("/envelope/return_to_rta", dependencies=[Depends(_require_token)])
+    def envelope_return_to_rta(body: ReturnToRtaBody) -> dict[str, Any]:
+        """Return `cents` of budgeted money from one category back to
+        Ready to Assign for `month`.
+
+        This route takes no destination because Ready to Assign is
+        implicit in this ledger — there is no RTA category row; RTA is
+        just (total inflows − sum of all budgeted), so reducing this
+        category's budgeted_cents by `cents` IS the whole operation.
+
+        It exists as a named counterpart to /budget/set's negative-value
+        guard (added after the 2026-07-23 incident where a client path
+        wrote several negative assignments). That guard is correct for
+        "set this category's assignment to X" — but "return carryover to
+        Ready to Assign" legitimately drives this month's budgeted_cents
+        negative (e.g. $150 available, all carryover, $0 budgeted this
+        month: returning $149 makes budgeted -$149). /envelope/move
+        already permits exactly that shape between two ordinary
+        categories via the additive `_delta_write`, which has no negative
+        guard — this route names that same operation for the RTA case
+        instead of loosening /budget/set's guard or adding a general
+        allow-negative flag.
+        """
+        import re as _re
+        if body.cents <= 0:
+            raise HTTPException(400, "cents must be positive")
+        if not _re.fullmatch(r"\d{4}-\d{2}", body.month):
+            raise HTTPException(400, "month must be YYYY-MM")
+        with storage.connect(db_path) as con:
+            existing = con.execute(
+                "SELECT available_cents FROM month_category "
+                "WHERE month = ? AND category_id = ?",
+                (body.month, body.category_id),
+            ).fetchone()
+        available = int(existing["available_cents"]) if existing else 0
+        if body.cents > available:
+            raise HTTPException(
+                400,
+                f"cents ({body.cents}) exceeds available_cents "
+                f"({available}) for this category-month — you can only "
+                f"return what is actually sitting in the envelope",
+            )
+        result = envelope.assign_to_category(
+            db_path, body.month, body.category_id, -body.cents,
+        )
+        storage.audit(db_path, "ui_envelope_return_to_rta", {
+            "month": body.month, "category_id": body.category_id,
+            "cents": body.cents,
+            "budgeted_cents": result["budgeted_cents"],
+            "available_cents": result["available_cents"],
         })
         return {"ok": True, "result": result}
 
