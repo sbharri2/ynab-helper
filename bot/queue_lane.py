@@ -18,8 +18,9 @@ Transitions
     [HOT] ──── 2h with no user reply ────▶ [COLD]
                                             ▲
     [HOLD] ─── enrichment succeeds ──▶ [HOT]
-       │                                    │
-       └────── 24h still unenriched ────────┘
+       │                                    ▲
+       ├── 24h, large Amazon ───────────────┘
+       └── 24h, everything else ────────────▶ [COLD]
 
 Lane changes are timestamped in ``pending_txn.lane_changed_at`` so TTL
 math doesn't need a separate event log.
@@ -31,9 +32,10 @@ Public surface:
     demote_hot_to_cold(db_path)
         — sweep helper: every HOT row whose lane_changed_at is >2h old
           drops to COLD without a notification.
-    abandon_stale_holds(db_path)
+    abandon_stale_holds(db_path, *, settings)
         — sweep helper: HOLD rows older than 24h give up waiting for
-          their order email and drop to COLD.
+          their order email. Large Amazon rows promote to HOT so the
+          user gets asked anyway; everything else drops to COLD.
 """
 from __future__ import annotations
 
