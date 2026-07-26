@@ -181,6 +181,18 @@ def test_roth_ira_is_classified_roth_not_pretax():
     assert imp._classify("IRA") == ("retirement", "pretax")
 
 
+def test_custodial_is_not_misclassified_as_brokerage_via_tod():
+    """"tod" (-> brokerage) matches as a substring inside "custodial", so
+    without an explicit "custodial" needle a custodial/UTMA account was
+    silently tagged brokerage instead of education. Longest-needle-wins
+    resolves the collision once "custodial" is itself a needle."""
+    assert imp._classify("Custodial Account") == ("education", None)
+    assert imp._classify("Custodial (UTMA)") == ("education", None)
+    # The genuine TOD (transfer-on-death) brokerage classification must
+    # still work for account types that don't also say "custodial".
+    assert imp._classify("Brokerage TOD") == ("brokerage", None)
+
+
 def test_bare_year_header_raises_instead_of_inventing_jan_1(tmp_path):
     db = tmp_path / "t.db"
     init_db(db)

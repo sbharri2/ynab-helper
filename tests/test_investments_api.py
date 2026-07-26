@@ -149,3 +149,164 @@ def test_mutations_write_audit_rows(client):
     con = sqlite3.connect(client.db)
     events = {r[0] for r in con.execute("SELECT event FROM audit_log")}
     assert "ui_investments_round" in events
+
+
+def test_values_route_partial_save_preserves_components(client):
+    """End-to-end for the every-Save-nulls-everything bug: a plain "value"
+    save (breakout panel collapsed, only value_cents on the wire) must not
+    erase a previously-recorded market_value_cents/debt_cents."""
+    hid = store.upsert_holding(client.db, name="117 Mayfield", kind="property")
+    r = client.post("/investments/round", json={
+        "label": "Jul 2026", "as_of_date": "2026-07-25"})
+    rid = r.json()["round_id"]
+    client.post("/investments/values", json={
+        "round_id": rid,
+        "values": [{
+            "holding_id": hid, "value_cents": 24952292,
+            "market_value_cents": 48240000, "debt_cents": 23287708,
+        }],
+    })
+    r = client.post("/investments/values", json={
+        "round_id": rid,
+        "values": [{"holding_id": hid, "value_cents": 24952292}],
+    })
+    assert r.status_code == 200
+
+    from bot.storage import connect
+    with connect(client.db) as con:
+        row = dict(con.execute(
+            "SELECT * FROM holding_value WHERE holding_id = ? AND round_id = ?",
+            (hid, rid),
+        ).fetchone())
+    assert row["market_value_cents"] == 48240000
+    assert row["debt_cents"] == 23287708
+
+
+def test_values_route_audits_before_after_pairs(client):
+    hid = store.upsert_holding(client.db, name="Marcus", kind="cash")
+    r = client.post("/investments/round", json={
+        "label": "Jul 2026", "as_of_date": "2026-07-25"})
+    rid = r.json()["round_id"]
+    client.post("/investments/values", json={
+        "round_id": rid,
+        "values": [{"holding_id": hid, "value_cents": 1000}],
+    })
+    client.post("/investments/values", json={
+        "round_id": rid,
+        "values": [{"holding_id": hid, "value_cents": 2000}],
+    })
+    import json as _json
+    import sqlite3
+    con = sqlite3.connect(client.db)
+    con.row_factory = sqlite3.Row
+    rows = con.execute(
+        "SELECT details FROM audit_log WHERE event = 'ui_investments_values' "
+        "ORDER BY id DESC LIMIT 1"
+    ).fetchall()
+    data = _json.loads(rows[0]["details"])
+    assert data["changes"] == [
+        {"holding_id": hid, "from_cents": 1000, "to_cents": 2000},
+    ]
+
+
+def test_holding_route_clears_field_with_explicit_null(client):
+    r = client.post("/investments/holding", json={
+        "name": "Roth IRA", "kind": "retirement", "notes": "old note",
+    })
+    hid = r.json()["holding_id"]
+    r = client.post("/investments/holding", json={"id": hid, "notes": None})
+    assert r.status_code == 200
+    rows = client.get("/investments/holdings").json()["holdings"]
+    assert rows[0]["notes"] is None
+
+
+def test_holding_route_sets_and_clears_is_primary_residence(client):
+    r = client.post("/investments/holding", json={
+        "name": "117 Mayfield", "kind": "property",
+    })
+    hid = r.json()["holding_id"]
+
+    r = client.post("/investments/holding", json={
+        "id": hid, "is_primary_residence": True,
+    })
+    assert r.status_code == 200
+    rows = client.get("/investments/holdings").json()["holdings"]
+    assert rows[0]["is_primary_residence"] == 1
+
+    client.post("/investments/holding", json={
+        "id": hid, "is_primary_residence": False,
+    })
+    rows = client.get("/investments/holdings").json()["holdings"]
+    assert rows[0]["is_primary_residence"] == 0
+
+
+def test_holding_route_omits_created_at(client):
+    """list_holdings must whitelist columns — SELECT h.* leaked a
+    datetime created_at into a payload HoldingRow doesn't declare (the same
+    bug that already bit list_policies in this feature)."""
+    store.upsert_holding(client.db, name="Marcus", kind="cash")
+    rows = client.get("/investments/holdings").json()["holdings"]
+    assert "created_at" not in rows[0]
+
+
+def test_policy_route_clears_provider_and_through_employer(client):
+    r = client.post("/investments/policy", json={
+        "insurance_type": "Homeowners", "provider": "Amica",
+        "through_employer": True,
+    })
+    pid = r.json()["policy_id"]
+    r = client.post("/investments/policy", json={
+        "id": pid, "provider": None, "through_employer": None,
+    })
+    assert r.status_code == 200
+    rows = client.get("/investments/insurance").json()["policies"]
+    row = next(p for p in rows if p["id"] == pid)
+    assert row["provider"] is None
+    assert row["through_employer"] is None
+
+
+def test_round_route_rejects_malformed_date(client):
+    r = client.post("/investments/round", json={
+        "label": "Bad", "as_of_date": "not-a-date"})
+    assert r.status_code == 400
+
+
+def test_values_route_rejects_malformed_as_of_date(client):
+    hid = store.upsert_holding(client.db, name="Marcus", kind="cash")
+    r = client.post("/investments/round", json={
+        "label": "Jul 2026", "as_of_date": "2026-07-25"})
+    rid = r.json()["round_id"]
+    r = client.post("/investments/values", json={
+        "round_id": rid,
+        "values": [{
+            "holding_id": hid, "value_cents": 1000, "as_of_date": "2026-13-40",
+        }],
+    })
+    assert r.status_code == 400
+
+
+def test_premium_route_rejects_malformed_date(client):
+    r = client.post("/investments/policy", json={"insurance_type": "Auto"})
+    pid = r.json()["policy_id"]
+    r = client.post("/investments/policy/premium", json={
+        "policy_id": pid, "as_of_date": "2026/07/01", "amount_cents": 1000,
+    })
+    assert r.status_code == 400
+
+
+def test_snapshot_carries_is_seeded(client):
+    hid = store.upsert_holding(client.db, name="Marcus", kind="cash")
+    r1 = client.post("/investments/round", json={
+        "label": "Feb 2026", "as_of_date": "2026-02-15"})
+    rid1 = r1.json()["round_id"]
+    client.post("/investments/values", json={
+        "round_id": rid1, "values": [{"holding_id": hid, "value_cents": 1000}],
+    })
+    client.post("/investments/round", json={
+        "label": "Jul 2026", "as_of_date": "2026-07-25",
+        "seed_from_previous": True,
+    })
+    snap = client.get("/investments/snapshot").json()
+    values = snap["holdings"][0]["values"]
+    assert values[0]["is_seeded"] is False
+    assert values[1]["is_seeded"] is True

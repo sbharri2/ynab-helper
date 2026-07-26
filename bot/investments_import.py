@@ -34,7 +34,7 @@ _KIND_BY_TYPE = {
     "401k": "retirement", "403b": "retirement", "ira": "retirement",
     "roth ira": "retirement", "roth": "retirement", "simple ira": "retirement",
     "pension": "retirement", "profit sharing": "retirement",
-    "529": "education", "utma": "education",
+    "529": "education", "utma": "education", "custodial": "education",
     "hsa": "cash", "savings": "cash", "checking": "cash", "cd": "cash",
     "t-bills": "cash", "treasury": "cash",
     "crypto": "crypto", "bitcoin": "crypto", "ethereum": "crypto",

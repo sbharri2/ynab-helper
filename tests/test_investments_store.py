@@ -108,10 +108,11 @@ def test_upsert_values_updates_and_clears_seeded_flag(tmp_path):
     r2 = store.create_round(
         db, label="Jul 2026", as_of_date="2026-07-25", seed_from_previous=True,
     )
-    n = store.upsert_values(db, round_id=r2, values=[
+    n, changes = store.upsert_values(db, round_id=r2, values=[
         {"holding_id": a, "value_cents": 2566800, "as_of_date": "2026-07-20"},
     ])
     assert n == 1
+    assert changes == [{"holding_id": a, "from_cents": 1000, "to_cents": 2566800}]
     with connect(db) as con:
         row = dict(con.execute(
             "SELECT * FROM holding_value WHERE round_id = ? AND holding_id = ?",
@@ -147,6 +148,60 @@ def test_upsert_values_stores_components(tmp_path):
         }
     assert rows[p]["market_value_cents"] - rows[p]["debt_cents"] == rows[p]["value_cents"]
     assert rows[c]["units"] == 0.947
+
+
+def test_upsert_values_partial_save_preserves_untouched_components(tmp_path):
+    """Regression for the every-Save-nulls-everything bug.
+
+    The editor only ever sends the fields the user actually touched — a
+    plain "value" save with the breakout panel collapsed sends no
+    market_value_cents/debt_cents/note at all. Those columns must survive
+    untouched, not get nulled by the ON CONFLICT DO UPDATE.
+    """
+    db = tmp_path / "t.db"
+    init_db(db)
+    p = store.upsert_holding(db, name="117 Mayfield", kind="property")
+    r = store.create_round(db, label="Jul 2026", as_of_date="2026-07-25")
+    store.upsert_values(db, round_id=r, values=[
+        {"holding_id": p, "value_cents": 24952292,
+         "market_value_cents": 48240000, "debt_cents": 23287708,
+         "note": "county assessment"},
+    ])
+    # Second save: only value_cents (and the implicit as_of_date fallback)
+    # — the shape a plain "Save round" click produces when the breakout
+    # panel was never expanded.
+    store.upsert_values(db, round_id=r, values=[
+        {"holding_id": p, "value_cents": 24952292},
+    ])
+    with connect(db) as con:
+        row = dict(con.execute(
+            "SELECT * FROM holding_value WHERE holding_id = ? AND round_id = ?",
+            (p, r),
+        ).fetchone())
+    assert row["market_value_cents"] == 48240000
+    assert row["debt_cents"] == 23287708
+    assert row["note"] == "county assessment"
+
+
+def test_upsert_values_explicit_null_clears_a_component(tmp_path):
+    """Absent and explicitly-null are different: a key present with an
+    explicit None is a deliberate clear and must still write NULL."""
+    db = tmp_path / "t.db"
+    init_db(db)
+    p = store.upsert_holding(db, name="117 Mayfield", kind="property")
+    r = store.create_round(db, label="Jul 2026", as_of_date="2026-07-25")
+    store.upsert_values(db, round_id=r, values=[
+        {"holding_id": p, "value_cents": 24952292, "note": "county assessment"},
+    ])
+    store.upsert_values(db, round_id=r, values=[
+        {"holding_id": p, "value_cents": 24952292, "note": None},
+    ])
+    with connect(db) as con:
+        row = dict(con.execute(
+            "SELECT * FROM holding_value WHERE holding_id = ? AND round_id = ?",
+            (p, r),
+        ).fetchone())
+    assert row["note"] is None
 
 
 def test_upsert_holding_updates_when_id_given(tmp_path):
@@ -194,6 +249,43 @@ def test_minus_home_equity_subtracts_only_primary_residence(tmp_path):
     assert totals["Minus Home Equity"][0] == 6351669 + 2566800
 
 
+def test_minus_home_equity_is_none_with_zero_primary_residences(tmp_path):
+    """Zero flags must not silently collapse Minus Home Equity to Total —
+    that overstates retirement readiness and flips Delta positive."""
+    db = tmp_path / "t.db"
+    init_db(db)
+    cash = store.upsert_holding(db, name="Marcus", kind="cash")
+    _round_with(db, "Jul 2026", "2026-07-25", [
+        {"holding_id": cash, "value_cents": 2566800},
+    ])
+    totals = {t["label"]: t["cells"] for t in store.compute_totals(db)}
+    assert totals["Minus Home Equity"][0] is None
+    assert totals["Delta"][0] is None
+
+
+def test_minus_home_equity_is_none_with_two_primary_residences(tmp_path):
+    """Two flags must not silently double-subtract."""
+    db = tmp_path / "t.db"
+    init_db(db)
+    home1 = store.upsert_holding(db, name="117 Mayfield", kind="property")
+    home2 = store.upsert_holding(db, name="200 Elm St", kind="property")
+    with connect(db) as con:
+        con.execute(
+            "INSERT INTO property_detail (holding_id, is_primary_residence) "
+            "VALUES (?, 1)", (home1,),
+        )
+        con.execute(
+            "INSERT INTO property_detail (holding_id, is_primary_residence) "
+            "VALUES (?, 1)", (home2,),
+        )
+    _round_with(db, "Jul 2026", "2026-07-25", [
+        {"holding_id": home1, "value_cents": 24952292},
+        {"holding_id": home2, "value_cents": 6351669},
+    ])
+    totals = {t["label"]: t["cells"] for t in store.compute_totals(db)}
+    assert totals["Minus Home Equity"][0] is None
+
+
 def test_annual_change_annualizes_by_days(tmp_path):
     db = tmp_path / "t.db"
     init_db(db)
@@ -226,8 +318,20 @@ def test_target_and_delta_use_savings_target_row(tmp_path):
     db = tmp_path / "t.db"
     init_db(db)
     h = store.upsert_holding(db, name="Fund", kind="brokerage")
+    # compute_totals only computes Minus Home Equity (and therefore Delta)
+    # when exactly one holding is flagged as the primary residence — a $0
+    # placeholder here keeps this test about target/delta math, not that
+    # guard (covered separately by test_minus_home_equity_* and
+    # test_delta_is_none_without_exactly_one_primary_residence).
+    home = store.upsert_holding(db, name="117 Mayfield", kind="property")
+    with connect(db) as con:
+        con.execute(
+            "INSERT INTO property_detail (holding_id, is_primary_residence) "
+            "VALUES (?, 1)", (home,),
+        )
     _round_with(db, "Jul 2026", "2026-07-25", [
         {"holding_id": h, "value_cents": 100000000},
+        {"holding_id": home, "value_cents": 0},
     ])
     with connect(db) as con:
         con.execute(
@@ -300,6 +404,34 @@ def test_build_snapshot_matches_typescript_shape(tmp_path):
     assert [v["label"] for v in by_name["Roth IRA"]["values"]] == ["Feb 2026", "Jul 2026"]
     total = next(t for t in snap["totals_rows"] if t["label"] == "Total")
     assert total["cells"] == [300, 700]
+
+
+def test_build_snapshot_carries_is_seeded_per_cell(tmp_path):
+    """A carried-forward value must be identifiable in the payload, not
+    just internally — Overview's "N carried forward" banner and the
+    editor's chip both read this off the snapshot, not a client-side
+    guess."""
+    db = tmp_path / "t.db"
+    init_db(db)
+    h = store.upsert_holding(db, name="Marcus", kind="cash")
+    r1 = store.create_round(db, label="Feb 2026", as_of_date="2026-02-15")
+    store.upsert_values(db, round_id=r1, values=[
+        {"holding_id": h, "value_cents": 1000},
+    ])
+    r2 = store.create_round(
+        db, label="Jul 2026", as_of_date="2026-07-25", seed_from_previous=True,
+    )
+    snap = store.build_snapshot(db)
+    values = snap["holdings"][0]["values"]
+    assert values[0]["is_seeded"] is False   # the original, confirmed entry
+    assert values[1]["is_seeded"] is True    # copied forward, unconfirmed
+
+    # Confirming it (even with the same number) clears the flag.
+    store.upsert_values(db, round_id=r2, values=[
+        {"holding_id": h, "value_cents": 1000},
+    ])
+    snap2 = store.build_snapshot(db)
+    assert snap2["holdings"][0]["values"][1]["is_seeded"] is False
 
 
 def test_snapshot_emits_full_length_arrays_for_gap_holdings(tmp_path):

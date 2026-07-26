@@ -7,12 +7,15 @@ observations, not a claim that every value shares one date: each
 """
 from __future__ import annotations
 
+import logging
 import uuid
 from pathlib import Path
 from typing import Any
 
 from bot.storage import connect
 from datetime import date as _date
+
+log = logging.getLogger(__name__)
 
 _HOLDING_FIELDS = (
     "name", "owner", "kind", "account_type", "institution", "account_number",
@@ -133,7 +136,10 @@ def list_holdings(
     with connect(db_path) as con:
         rows = con.execute(
             f"""
-            SELECT h.*, p.address, p.is_primary_residence, p.listed_price_cents,
+            SELECT h.id, h.name, h.owner, h.kind, h.account_type,
+                   h.institution, h.account_number, h.tax_treatment,
+                   h.ledger_account_id, h.closed, h.sort_order, h.notes,
+                   p.address, p.is_primary_residence, p.listed_price_cents,
                    p.escrow_cents, p.valuation_source
               FROM holding h
               LEFT JOIN property_detail p ON p.holding_id = h.id
@@ -146,19 +152,41 @@ def list_holdings(
 
 # ── Values ───────────────────────────────────────────────────────────────
 
+_VALUE_COMPONENT_FIELDS = (
+    "market_value_cents", "debt_cents", "vested_cents",
+    "units", "unit_price_cents", "note",
+)
+
+
 def upsert_values(
     db_path: Path | str,
     *,
     round_id: str,
     values: list[dict[str, Any]],
     source: str = "manual",
-) -> int:
+) -> tuple[int, list[dict[str, Any]]]:
     """Insert-or-update one round's values in a single transaction.
 
     Each entry needs ``holding_id`` and ``value_cents``; ``as_of_date``
     defaults to the round's date. Writing a value always clears
     ``is_seeded`` — a number that was confirmed is no longer carried
     forward.
+
+    Component columns (``market_value_cents``, ``debt_cents``,
+    ``vested_cents``, ``units``, ``unit_price_cents``, ``note``) are only
+    written when the entry's dict actually contains that key. A caller that
+    omits a key leaves the existing stored value alone rather than nulling
+    it out — the editor only ever sends the fields it actually touched
+    (e.g. a plain "value" save with the breakout panel collapsed must not
+    erase a previously-recorded market_value_cents/debt_cents). A key
+    present with an explicit ``None`` still writes NULL — that's a
+    deliberate clear, distinct from never having mentioned the column.
+
+    Returns ``(count_written, changes)`` where ``changes`` lists
+    ``{holding_id, from_cents, to_cents}`` for every row whose
+    ``value_cents`` actually changed (including brand-new rows, where
+    ``from_cents`` is ``None``) — the audit trail a Save should leave
+    behind.
     """
     with connect(db_path) as con:
         row = con.execute(
@@ -170,40 +198,65 @@ def upsert_values(
         round_date = round_date.isoformat() if hasattr(round_date, "isoformat") else round_date
 
         n = 0
+        changes: list[dict[str, Any]] = []
         for v in values:
             unknown = set(v) - set(_VALUE_FIELDS) - {"holding_id", "as_of_date"}
             if unknown:
                 raise ValueError(f"unknown value fields: {sorted(unknown)}")
             if "holding_id" not in v or v.get("value_cents") is None:
                 raise ValueError("each value needs holding_id and value_cents")
+
+            holding_id = v["holding_id"]
+            as_of = v.get("as_of_date") or round_date
+
+            prior = con.execute(
+                "SELECT value_cents FROM holding_value "
+                "WHERE holding_id = ? AND round_id = ?",
+                (holding_id, round_id),
+            ).fetchone()
+            prior_cents = prior["value_cents"] if prior is not None else None
+
+            insert_cols = [
+                "holding_id", "round_id", "as_of_date", "value_cents",
+                "source", "is_seeded",
+            ]
+            insert_vals: list[Any] = [
+                holding_id, round_id, as_of, v["value_cents"], source, 0,
+            ]
+            set_parts = [
+                "as_of_date = excluded.as_of_date",
+                "value_cents = excluded.value_cents",
+                "source = excluded.source",
+                "is_seeded = 0",
+            ]
+            for col in _VALUE_COMPONENT_FIELDS:
+                insert_cols.append(col)
+                if col in v:
+                    insert_vals.append(v[col])
+                    set_parts.append(f"{col} = excluded.{col}")
+                else:
+                    insert_vals.append(None)
+                    # Column not mentioned: leave whatever is already
+                    # stored alone (no SET clause emitted for it).
+
+            placeholders = ", ".join("?" for _ in insert_cols)
             con.execute(
-                """
-                INSERT INTO holding_value (
-                    holding_id, round_id, as_of_date, value_cents,
-                    market_value_cents, debt_cents, vested_cents,
-                    units, unit_price_cents, source, is_seeded, note
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+                f"""
+                INSERT INTO holding_value ({', '.join(insert_cols)})
+                VALUES ({placeholders})
                 ON CONFLICT (holding_id, round_id) DO UPDATE SET
-                    as_of_date         = excluded.as_of_date,
-                    value_cents        = excluded.value_cents,
-                    market_value_cents = excluded.market_value_cents,
-                    debt_cents         = excluded.debt_cents,
-                    vested_cents       = excluded.vested_cents,
-                    units              = excluded.units,
-                    unit_price_cents   = excluded.unit_price_cents,
-                    source             = excluded.source,
-                    is_seeded          = 0,
-                    note               = excluded.note
+                    {', '.join(set_parts)}
                 """,
-                (
-                    v["holding_id"], round_id, v.get("as_of_date") or round_date,
-                    v["value_cents"], v.get("market_value_cents"), v.get("debt_cents"),
-                    v.get("vested_cents"), v.get("units"), v.get("unit_price_cents"),
-                    source, v.get("note"),
-                ),
+                insert_vals,
             )
             n += 1
-    return n
+            if prior_cents != v["value_cents"]:
+                changes.append({
+                    "holding_id": holding_id,
+                    "from_cents": prior_cents,
+                    "to_cents": v["value_cents"],
+                })
+    return n, changes
 
 
 # Totals are COMPUTED, never stored. The sheet stored them and they drifted
@@ -228,6 +281,19 @@ def _round_cells(db_path: Path | str) -> tuple[list[dict[str, Any]], dict[str, d
     return rounds, by_round
 
 
+def _seeded_flags(db_path: Path | str) -> dict[str, set[str]]:
+    """{round_id: {holding_id, ...}} for every cell still carried forward
+    (is_seeded=1) and never confirmed since."""
+    with connect(db_path) as con:
+        rows = con.execute(
+            "SELECT round_id, holding_id FROM holding_value WHERE is_seeded = 1"
+        ).fetchall()
+    out: dict[str, set[str]] = {}
+    for row in rows:
+        out.setdefault(row["round_id"], set()).add(row["holding_id"])
+    return out
+
+
 def compute_totals(db_path: Path | str) -> list[dict[str, Any]]:
     rounds, by_round = _round_cells(db_path)
     with connect(db_path) as con:
@@ -243,8 +309,20 @@ def compute_totals(db_path: Path | str) -> list[dict[str, Any]]:
             )
         ]
 
+    # Zero primary-residence flags makes "Minus Home Equity" == "Total"
+    # (silently overstating retirement readiness); two or more flags
+    # double-subtracts. Neither is a number worth reporting — a visibly
+    # absent cell is recoverable, a plausible wrong one is not.
+    home_count_ok = len(primary) == 1
+    if not home_count_ok:
+        log.warning(
+            "compute_totals: expected exactly 1 primary-residence holding, "
+            "found %d (%s) — emitting Minus Home Equity as None",
+            len(primary), sorted(primary),
+        )
+
     total_cells: list[int] = []
-    minus_home_cells: list[int] = []
+    minus_home_cells: list[int | None] = []
     change_cells: list[float | None] = []
     target_cells: list[int | None] = []
     delta_cells: list[int | None] = []
@@ -255,9 +333,12 @@ def compute_totals(db_path: Path | str) -> list[dict[str, Any]]:
     for r in rounds:
         cells = by_round.get(r["id"], {})
         total = sum(cells.values())
-        home = sum(v for hid, v in cells.items() if hid in primary)
         total_cells.append(total)
-        minus_home_cells.append(total - home)
+        if home_count_ok:
+            home = sum(v for hid, v in cells.items() if hid in primary)
+            minus_home_cells.append(total - home)
+        else:
+            minus_home_cells.append(None)
 
         as_of = _date.fromisoformat(_as_iso(r["as_of_date"]))
         # Both totals must be positive: a negative base raised to a
@@ -280,7 +361,8 @@ def compute_totals(db_path: Path | str) -> list[dict[str, Any]]:
             t = applicable[-1]
             target = int(round(t["combined_salary_cents"] * t["multiplier"]))
             target_cells.append(target)
-            delta_cells.append(minus_home_cells[-1] - target)
+            home_cell = minus_home_cells[-1]
+            delta_cells.append(None if home_cell is None else home_cell - target)
         else:
             target_cells.append(None)
             delta_cells.append(None)
@@ -319,6 +401,7 @@ def build_snapshot(
         }
 
     _, by_round = _round_cells(db_path)
+    seeded_by_round = _seeded_flags(db_path)
 
     holdings_out: list[dict[str, Any]] = []
     for h in list_holdings(db_path, include_closed=True):
@@ -327,6 +410,11 @@ def build_snapshot(
                 "label": r["label"],
                 "snapshot_date": _as_iso(r["as_of_date"]),
                 "cents": by_round.get(r["id"], {}).get(h["id"], 0),
+                # True when this cell was copied forward by
+                # create_round(seed_from_previous=True) and never confirmed
+                # since — a carried-forward number, not a fresh observation.
+                # See Overview's "N carried forward" banner.
+                "is_seeded": h["id"] in seeded_by_round.get(r["id"], set()),
             }
             for r in rounds
         ]

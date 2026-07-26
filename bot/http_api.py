@@ -39,7 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -78,6 +78,22 @@ def _snake(key: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def _require_iso_date(value: str, field: str) -> None:
+    """Reject a malformed date before it reaches a ``DATE`` column.
+
+    ``bot/storage.py`` registers a ``DATE -> date.fromisoformat`` converter,
+    so one bad string written here makes every subsequent read of the row
+    (list_rounds, snapshot, premium history) raise. Precedent:
+    ``/envelope/move``'s ``month`` regex check.
+    """
+    try:
+        date.fromisoformat(value)
+    except ValueError as e:
+        raise HTTPException(
+            400, f"{field} must be an ISO date (YYYY-MM-DD): {value!r}"
+        ) from e
 
 
 def _load_token_map(token_dir: Path) -> dict[str, str]:
@@ -236,6 +252,7 @@ class InvestmentHoldingBody(BaseModel):
     closed: bool | None = None
     sort_order: int | None = None
     notes: str | None = None
+    is_primary_residence: bool | None = None
 
 
 class InsurancePolicyBody(BaseModel):
@@ -902,6 +919,7 @@ def build_app(
     @app.post("/investments/round", dependencies=[Depends(_require_token)])
     def investments_create_round(body: InvestmentRoundBody) -> dict[str, Any]:
         from bot import investments_store as istore
+        _require_iso_date(body.as_of_date, "as_of_date")
         try:
             rid = istore.create_round(
                 db_path,
@@ -925,24 +943,43 @@ def build_app(
     @app.post("/investments/values", dependencies=[Depends(_require_token)])
     def investments_save_values(body: InvestmentValuesBody) -> dict[str, Any]:
         from bot import investments_store as istore
-        payload = [v.model_dump(exclude_none=True) for v in body.values]
+        # exclude_unset (not exclude_none): a component field the client
+        # never mentioned must be left alone by upsert_values, while one
+        # explicitly sent as null is a deliberate clear. exclude_none
+        # collapsed both cases to "absent" and nulled every column the
+        # editor didn't happen to populate on a plain Save.
+        payload: list[dict[str, Any]] = []
+        for v in body.values:
+            fields = v.model_dump(exclude_unset=True)
+            as_of = fields.get("as_of_date")
+            if as_of is not None:
+                _require_iso_date(as_of, "as_of_date")
+            payload.append(fields)
         try:
-            n = istore.upsert_values(
+            n, changes = istore.upsert_values(
                 db_path, round_id=body.round_id, values=payload,
             )
         except ValueError as e:
             raise HTTPException(400, str(e))
         storage.audit(db_path, "ui_investments_values", {
-            "round_id": body.round_id, "count": n,
+            "round_id": body.round_id, "count": n, "changes": changes,
         })
         return {"ok": True, "written": n}
 
     @app.post("/investments/holding", dependencies=[Depends(_require_token)])
     def investments_save_holding(body: InvestmentHoldingBody) -> dict[str, Any]:
         from bot import investments_store as istore
-        fields = body.model_dump(exclude_none=True)
+        # exclude_unset: a field the client never sent is left alone; one
+        # sent as an explicit null (e.g. clearing notes) is still written.
+        # exclude_none used to make those indistinguishable, so a cleared
+        # field silently no-op'd instead of clearing.
+        fields = body.model_dump(exclude_unset=True)
         hid = fields.pop("id", None)
-        if "closed" in fields:
+        # is_primary_residence lives on property_detail, not holding —
+        # pull it out before validating fields against _HOLDING_FIELDS.
+        is_primary_set = "is_primary_residence" in fields
+        is_primary = fields.pop("is_primary_residence", None)
+        if "closed" in fields and fields["closed"] is not None:
             fields["closed"] = int(fields["closed"])
         if hid is None and not fields.get("name"):
             raise HTTPException(400, "name required to create a holding")
@@ -950,18 +987,31 @@ def build_app(
             hid = istore.upsert_holding(db_path, id=hid, **fields)
         except ValueError as e:
             raise HTTPException(400, str(e))
+        if is_primary_set:
+            with storage.connect(db_path) as con:
+                con.execute(
+                    "INSERT INTO property_detail (holding_id, is_primary_residence) "
+                    "VALUES (?, ?) "
+                    "ON CONFLICT(holding_id) DO UPDATE SET "
+                    "is_primary_residence = excluded.is_primary_residence",
+                    (hid, int(bool(is_primary))),
+                )
         storage.audit(db_path, "ui_investments_holding", {
             "holding_id": hid, "fields": sorted(fields),
+            **({"is_primary_residence": bool(is_primary)} if is_primary_set else {}),
         })
         return {"ok": True, "holding_id": hid}
 
     @app.post("/investments/policy", dependencies=[Depends(_require_token)])
     def investments_save_policy(body: InsurancePolicyBody) -> dict[str, Any]:
         from bot import investments_insurance as iins
-        fields = body.model_dump(exclude_none=True)
+        # exclude_unset: an explicit null (e.g. clearing provider, or
+        # returning through_employer to "Unknown") must actually write
+        # NULL rather than silently no-op like exclude_none did.
+        fields = body.model_dump(exclude_unset=True)
         pid = fields.pop("id", None)
         for flag in ("active", "through_employer"):
-            if flag in fields:
+            if flag in fields and fields[flag] is not None:
                 fields[flag] = int(fields[flag])
         if pid is None and not fields.get("insurance_type"):
             raise HTTPException(400, "insurance_type required to create a policy")
@@ -977,6 +1027,7 @@ def build_app(
     @app.post("/investments/policy/premium", dependencies=[Depends(_require_token)])
     def investments_record_premium(body: InsurancePremiumBody) -> dict[str, Any]:
         from bot import investments_insurance as iins
+        _require_iso_date(body.as_of_date, "as_of_date")
         try:
             obs_id = iins.record_premium(
                 db_path,
