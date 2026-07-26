@@ -396,9 +396,13 @@ bot directly.
 Carried from the July 2026 round, to be entered once available:
 
 - **Optum HSA** — row exists, value blank. Active 2026-07-15, ~$350/wk.
-- **Escrow treatment** — 117 Mayfield holds $3,971.14, currently excluded
-  from equity and not a row. Amerisbank escrow unknown. Either becomes a
-  `cash` holding or is documented as deliberately omitted.
+- ~~**Escrow treatment**~~ — **decided 2026-07-25: deliberately omitted.**
+  117 Mayfield's $3,971.14 escrow balance does not become a holding and is
+  not counted in net worth. It is money already committed to taxes and
+  insurance the servicer will pay out, so counting it as an asset would
+  overstate what the household can actually deploy. The same applies to the
+  Amerisbank escrow on 105 7th Ave. Do not re-open this without a reason —
+  it was considered and declined.
 - **Bitcoin exact unit count** — 0.947 implied; a round 0.95 moves the row
   $186.
 - **Target base** — assumes the ~$14k December bonus belongs in the
