@@ -134,3 +134,56 @@ def test_large_amazon_does_not_auto_commit_from_matched_order(tmp_path):
         pt = con.execute("SELECT * FROM pending_txn").fetchone()
     assert pt["status"] == "pending"
     assert pt["chosen_category"] is None
+
+
+def test_retro_bucket_skips_large_charges(tmp_path):
+    db = _setup(tmp_path)
+    with storage.connect(db) as con:
+        con.execute(
+            "INSERT INTO ledger_txn (id, account_id, posted_date, amount_cents, "
+            "payee, category_id, is_split) "
+            "VALUES (900, ?, '2026-07-22', -81509, 'Amazon.com', "
+            "'cat-unassigned', 0)",
+            (ACCT,),
+        )
+    oid = storage.insert_pending_order(
+        db,
+        user_id="steven", source="amazon", external_id="112-0031580-6551463",
+        email_id="order-large", order_date=date(2026, 7, 22), total_cents=81509,
+        raw_summary="1 item(s): 1 Electronics item", raw_payload={},
+    )
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_order SET assigned_to_user_id = 'steven' WHERE id = ?",
+            (oid,),
+        )
+
+    assert ingest.retro_bucket_amazon_order(db, order_id=oid) is False
+    assert _row(db, "ledger_txn", 900)["category_id"] == "cat-unassigned"
+
+
+def test_retro_bucket_still_works_for_small_charges(tmp_path):
+    db = _setup(tmp_path)
+    with storage.connect(db) as con:
+        con.execute(
+            "INSERT INTO ledger_txn (id, account_id, posted_date, amount_cents, "
+            "payee, category_id, is_split) "
+            "VALUES (901, ?, '2026-07-06', -13941, 'Amazon.com', "
+            "'cat-unassigned', 0)",
+            (ACCT,),
+        )
+    oid = storage.insert_pending_order(
+        db,
+        user_id="steven", source="amazon", external_id="112-4520723-6491412",
+        email_id="order-small", order_date=date(2026, 7, 4), total_cents=13941,
+        raw_summary='1 item(s): "TaylorMade Golf Milled..." and 2 more items',
+        raw_payload={},
+    )
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_order SET assigned_to_user_id = 'steven' WHERE id = ?",
+            (oid,),
+        )
+
+    assert ingest.retro_bucket_amazon_order(db, order_id=oid) is True
+    assert _row(db, "ledger_txn", 901)["category_id"] == "cat-steven"

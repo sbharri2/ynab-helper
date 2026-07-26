@@ -998,6 +998,14 @@ def retro_bucket_amazon_order(db_path: Path | str, *, order_id: int) -> bool:
     total = o["total_cents"] or 0
     if not person or not total:
         return False
+    # Spec 2026-07-25: a charge at or above the threshold is deliberately
+    # being held for a human decision. Re-bucketing it here is exactly the
+    # behaviour that filed the real $815.09 eight minutes after it landed.
+    if _is_large_amazon_charge(-abs(total), None):
+        log.info("retro_bucket: order %s is $%.2f — above the large-charge "
+                 "threshold, leaving it for the confirm queue",
+                 order_id, abs(total) / 100)
+        return False
     target_cat = _amazon_bucket_category(db_path, person)
     unassigned_cat = _amazon_bucket_category(db_path, None)
     if not target_cat or not unassigned_cat or target_cat == unassigned_cat:
