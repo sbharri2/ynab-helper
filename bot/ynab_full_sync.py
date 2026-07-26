@@ -79,6 +79,24 @@ def _resolve_local_category_id(db_path: Path | str,
     return row["id"] if row else None
 
 
+def _is_local_only_category(con, category_id: str | None) -> bool:
+    """True when a category exists only in the bot, with no YNAB twin.
+
+    These are categories the bot created itself (`local-*`, `botcat_*`),
+    so `ynab_writer` has no ynab_category_id to push and YNAB will keep
+    reporting whatever category the transaction had before it was
+    re-filed. That makes them a special case during sync — see the
+    conflict rules in `_upsert_txn`.
+    """
+    if not category_id:
+        return False
+    row = con.execute(
+        "SELECT ynab_category_id FROM category WHERE id = ?",
+        (category_id,),
+    ).fetchone()
+    return bool(row) and row["ynab_category_id"] is None
+
+
 _GENERIC_PAYEE_WORDS = {
     "deposit", "withdrawal", "ach", "check", "purchase", "debit", "credit",
     "pos", "atm", "transfer", "usa", "the", "inc", "llc",
@@ -227,9 +245,19 @@ def _upsert_ledger_txn(db_path: Path | str, *, ytx: dict,
             # its children own the money. Otherwise apply the usual guard:
             # keep the local category when YNAB reports null (the bot's
             # not-yet-pushed decision), else take YNAB's value.
+            #
+            # Third case: the local category is one the bot invented and
+            # YNAB has no twin for (Steven Tennis, Allison Gym, ...).
+            # ynab_writer cannot push those — there is no
+            # ynab_category_id — so YNAB reports the pre-split category
+            # forever, and "YNAB wins" silently reverts the re-filing on
+            # every sync inside the 7-day window. The bot's budget is its
+            # own truth, so local wins here.
             if is_split:
                 effective_cat = None
             elif local_category_id is None and row["category_id"] is not None:
+                effective_cat = row["category_id"]
+            elif _is_local_only_category(con, row["category_id"]):
                 effective_cat = row["category_id"]
             else:
                 effective_cat = local_category_id
