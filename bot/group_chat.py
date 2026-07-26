@@ -134,6 +134,18 @@ async def _sweep_once(app: Application, settings, group_id: int) -> None:
     if expired:
         storage.audit(db_path, "group_questions_expired", {"count": expired})
     await _post_trip_confirms(app, settings, group_id)
+    # The age gate keys off COALESCE(lane_changed_at, created_at), not bare
+    # created_at: a large-Amazon HOLD row can sit invisible to this sweep
+    # (queue_lane = 'hold', filtered above) for up to 24h, then get
+    # promoted to HOT well after its own created_at has aged out of the
+    # window. lane_changed_at is stamped on every HOLD->HOT transition
+    # (queue_lane.promote_holds_to_hot and queue_lane.abandon_stale_holds
+    # both set it), so this measures "how long has it been askable", not
+    # "how long has it existed" — a row that was invisible for a day isn't
+    # then denied a ping because the clock started before it could be
+    # pinged at all. Rows that were never lane-changed (the common case —
+    # created straight into HOT and left there) fall back to created_at,
+    # unchanged from before.
     with storage.connect(db_path) as con:
         rows = con.execute(
             """SELECT pt.id, pt.payee, pt.amount_cents, pt.txn_date,
@@ -143,7 +155,8 @@ async def _sweep_once(app: Application, settings, group_id: int) -> None:
                LEFT JOIN category c ON c.id = pt.suggested_category
                WHERE pt.status = 'pending'
                  AND pt.queue_lane <> 'hold'
-                 AND pt.created_at >= datetime('now', ?)
+                 AND COALESCE(pt.lane_changed_at, pt.created_at)
+                     >= datetime('now', ?)
                  AND NOT EXISTS (
                    SELECT 1 FROM question q
                    WHERE q.item_kind = 'txn' AND q.item_id = pt.id
@@ -219,17 +232,20 @@ async def _post_trip_confirms(app: Application, settings, group_id: int) -> None
 
 
 def _ping_text(r) -> str:
-    """One instant-ping message. r needs payee/amount_cents/txn_date and
-    suggested_name (None when no suggestion). If r also carries a
-    non-empty raw_summary (e.g. a HOLD row's item text, filled in by
+    """One instant-ping message. r needs payee/amount_cents/txn_date,
+    raw_summary, and suggested_name (None when no suggestion). If
+    raw_summary is non-empty (e.g. a HOLD row's item text, filled in by
     queue_lane.promote_holds_to_hot when the order email matches), that
     detail rides along in the ping — the whole point of waiting for the
-    receipt is that the question isn't blind."""
-    try:
-        raw_summary = r["raw_summary"]
-    except (KeyError, IndexError):
-        raw_summary = None
-    detail = f"\n{raw_summary}" if raw_summary else ""
+    receipt is that the question isn't blind.
+
+    Deliberately NOT guarded with try/except around r["raw_summary"]: a
+    caller that forgets to SELECT it should get a loud KeyError, not a
+    silent detail-free ping. A broad except here is what let
+    post_instant_ping_sync omit the column unnoticed (2026-07-25 review,
+    Issue B) — both current callers (_sweep_once, post_instant_ping_sync)
+    now select it."""
+    detail = f"\n{r['raw_summary']}" if r["raw_summary"] else ""
     head = (f"🆕 {_fmt_money(r['amount_cents'])} {r['payee']} "
             f"({r['txn_date']})")
     if r["suggested_name"]:
@@ -264,7 +280,7 @@ def post_instant_ping_sync(settings, pt_id: int) -> int:
     with storage.connect(db_path) as con:
         r = con.execute(
             """SELECT pt.id, pt.payee, pt.amount_cents, pt.txn_date,
-                      c.name AS suggested_name
+                      pt.raw_summary, c.name AS suggested_name
                FROM pending_txn pt
                LEFT JOIN category c ON c.id = pt.suggested_category
                WHERE pt.id = ?""", (pt_id,),

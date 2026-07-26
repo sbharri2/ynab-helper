@@ -217,9 +217,24 @@ def apply_trip_to_pending(db_path: Path | str, trip_row) -> list[dict]:
     filed items for the receipt message.
 
     HOLD-lane rows (spec 2026-07-25: large Amazon charges awaiting their
-    order email) are excluded — nothing auto-commits a category at/above
-    the large-charge threshold, and a trip rule is not an exception. They
-    stay in HOLD and get asked normally once promoted or expired."""
+    order email) are excluded by the query below — nothing auto-commits a
+    category at/above the large-charge threshold, and a trip rule is not
+    an exception. They stay in HOLD and get asked normally once promoted
+    or expired.
+
+    That lane check alone isn't sufficient, though: a large Amazon charge
+    that already got PROMOTED out of HOLD (TTL expiry or a matched
+    receipt) is 'hot'/'cold', not 'hold', and status stays 'pending' until
+    a human answers. Guard on payee + amount too (2026-07-26 follow-up
+    review, Issue C) so a promoted-but-unanswered large Amazon charge
+    still can't be auto-filed here — before this, only the incidental
+    recurring_same_payee() True-for-Amazon check stood in the way, which
+    is exactly the coincidence-not-a-guard the original finding flagged.
+    (Amount alone isn't enough either: ingest._is_large_amazon_charge only
+    tests magnitude, so it has to be paired with ingest._is_amazon_payee —
+    otherwise a legitimately large NON-Amazon vacation charge, e.g. a
+    $400 hotel night, would be wrongly blocked from auto-filing too.)"""
+    from bot import ingest as _ingest
     from bot.group_chat import resolve_open_questions_for_item
     filed: list[dict] = []
     with storage.connect(db_path) as con:
@@ -238,6 +253,9 @@ def apply_trip_to_pending(db_path: Path | str, trip_row) -> list[dict]:
             (trip_row["start_date"], trip_row["end_date"]),
         ).fetchall()]
     for pt in cands:
+        if (_ingest._is_amazon_payee(pt["payee"] or "")
+                and _ingest._is_large_amazon_charge(pt["amount_cents"], None)):
+            continue
         src = pt["source"]
         if src is None:
             # pending row not linked via ledger: prefix — look it up by

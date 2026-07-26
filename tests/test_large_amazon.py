@@ -426,3 +426,208 @@ def test_large_amazon_composition_hold_not_pinged_then_ttl_promotes(tmp_path):
             (pt["id"],),
         ).fetchone()[0]
     assert q_count2 == 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-26 follow-up review — Issue A: the sweep's age gate must key off
+# COALESCE(lane_changed_at, created_at), not bare created_at, or a
+# TTL-promoted hold whose created_at has aged out of the 36h ping window
+# gets promoted to HOT and then never pinged (permanent silence — worse
+# than the pre-Finding-1 blind ping).
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_pings_hold_promoted_row_past_created_at_window(tmp_path):
+    """A row created 40h ago (outside the 36h ping window on created_at
+    alone) that only just got promoted out of HOLD (lane_changed_at =
+    now, simulating a bot-outage/quiet-hours stretch that delayed the
+    promotion well past its own created_at) must still be selected by the
+    sweep. Fails against a created_at-keyed gate; passes against
+    COALESCE(lane_changed_at, created_at)."""
+    from bot import group_chat
+
+    db = _setup(tmp_path)
+    pt_id = _hold_row(db, amount_cents=-81509, hours_ago=40)
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_txn SET created_at = datetime('now', '-40 hours') "
+            "WHERE id = ?",
+            (pt_id,),
+        )
+        # Promote it the way abandon_stale_holds / promote_holds_to_hot do:
+        # queue_lane -> hot, lane_changed_at stamped fresh.
+        con.execute(
+            "UPDATE pending_txn SET queue_lane = 'hot', lane_changed_at = ? "
+            "WHERE id = ?",
+            (storage._utcnow(), pt_id),
+        )
+
+    group_id = 777
+    fake_bot = _FakeBot()
+    app = _FakeApp({"chat_to_bot": {group_id: fake_bot}})
+    settings = _FakeSettings(db)
+
+    asyncio.run(group_chat._sweep_once(app, settings, group_id))
+
+    assert len(fake_bot.sent) == 1, (
+        "Issue A: a HOLD row promoted to HOT is still pingable even when "
+        "its created_at falls outside the 36h ping window — the sweep's "
+        "age gate must key off COALESCE(lane_changed_at, created_at)"
+    )
+
+
+def test_sweep_still_respects_age_window_for_never_promoted_rows(tmp_path):
+    """Sanity check the COALESCE fallback doesn't loosen the window for
+    the common case: a row that was NEVER lane-changed (lane_changed_at
+    stays NULL) and is genuinely old must still fall outside the window
+    and not be pinged."""
+    from bot import group_chat
+
+    db = _setup(tmp_path)
+    pt_id = storage.insert_pending_txn(
+        db, user_id="steven", ynab_txn_id="ledger:old-1",
+        ynab_account_id=ACCT, payee="Some Store", amount_cents=-5000,
+        txn_date=date(2026, 5, 1), memo="",
+    )
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_txn SET created_at = datetime('now', '-40 hours') "
+            "WHERE id = ?",
+            (pt_id,),
+        )
+        row = con.execute(
+            "SELECT lane_changed_at FROM pending_txn WHERE id = ?", (pt_id,)
+        ).fetchone()
+    assert row["lane_changed_at"] is None, (
+        "a row that was never lane-changed must have lane_changed_at NULL "
+        "so the COALESCE fallback is actually exercised by this test"
+    )
+
+    group_id = 778
+    fake_bot = _FakeBot()
+    app = _FakeApp({"chat_to_bot": {group_id: fake_bot}})
+    settings = _FakeSettings(db)
+
+    asyncio.run(group_chat._sweep_once(app, settings, group_id))
+
+    assert fake_bot.sent == [], (
+        "a genuinely old, never-promoted row must still fall outside the "
+        "36h window via the created_at fallback"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-26 follow-up review — Issue C: the trips guard from Finding 3
+# excluded queue_lane == 'hold', but a large Amazon charge that already
+# got PROMOTED out of HOLD (still status='pending', suggested_category
+# still NULL) sits in 'hot'/'cold', not 'hold' — so the lane check alone
+# doesn't protect it from apply_trip_to_pending's auto-file.
+# ---------------------------------------------------------------------------
+
+
+def test_apply_trip_to_pending_skips_promoted_large_amazon_charge(tmp_path):
+    """Without an amount-based guard, this charge sails past every other
+    check in trip_vacation_category: source is 'chase_alert' (city-
+    bearing), the payee isn't a home-city payee, it doesn't match
+    _ONLINE_RE, base_category_name is NULL (no suggestion was ever set)
+    so the ELIGIBLE_BASE_NAMES gate is skipped, and it isn't yet
+    recurring (only 1 prior ledger row) — so only the incidental
+    recurring_same_payee() check would have stood in the way. That's the
+    coincidence-not-a-guard the original Finding 3 flagged; this pins
+    that a promoted-but-unanswered large Amazon charge still cannot be
+    auto-filed as Vacation."""
+    from bot import trips
+
+    db = _setup(tmp_path)
+    with storage.connect(db) as con:
+        con.execute(
+            "INSERT INTO category (id, group_id, name, hidden, is_spending) "
+            "VALUES ('cat-vacation', 'g1', ?, 0, 1)",
+            (trips.VACATION_CATEGORY_NAME,),
+        )
+
+    res = _charge(db, amount_cents=-81509, email_id="trip-large-1")
+    with storage.connect(db) as con:
+        pt = con.execute("SELECT * FROM pending_txn").fetchone()
+    assert pt["queue_lane"] == "hold"
+
+    # Promote it out of HOLD the way abandon_stale_holds / promote_holds_to_hot
+    # would: queue_lane -> hot, still status='pending', suggested_category
+    # still NULL (no receipt ever matched).
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_txn SET queue_lane = 'hot' WHERE id = ?",
+            (pt["id"],),
+        )
+
+    trip_id = trips.create_confirmed_manual(
+        db, start=date(2026, 7, 20), end=date(2026, 7, 25), by="steven")
+    with storage.connect(db) as con:
+        trip_row = con.execute(
+            "SELECT * FROM trip WHERE id = ?", (trip_id,)
+        ).fetchone()
+
+    filed = trips.apply_trip_to_pending(db, trip_row)
+
+    assert filed == [], (
+        "a promoted (HOT, still pending) large Amazon charge must not be "
+        "auto-filed by a trip rule — nothing auto-commits at/above the "
+        "large-charge threshold, and a trip is not an exception"
+    )
+    pt_after = _row(db, "pending_txn", pt["id"])
+    assert pt_after["status"] == "pending"
+    assert pt_after["chosen_category"] is None
+    ledger = _row(db, "ledger_txn", res["ledger_txn_id"])
+    assert ledger["category_id"] is None
+
+
+def test_apply_trip_to_pending_still_files_normal_charge(tmp_path):
+    """Sanity check the new amount+payee guard doesn't overreach: a
+    normal (non-Amazon, below-threshold) dining charge inside a confirmed
+    trip window must still auto-file as Vacation, unchanged."""
+    from bot import trips
+
+    db = _setup(tmp_path)
+    with storage.connect(db) as con:
+        con.execute(
+            "INSERT INTO category (id, group_id, name, hidden, is_spending) "
+            "VALUES ('cat-vacation', 'g1', ?, 0, 1)",
+            (trips.VACATION_CATEGORY_NAME,),
+        )
+        con.execute(
+            "INSERT INTO category (id, group_id, name, hidden, is_spending) "
+            "VALUES ('cat-dining', 'g1', 'Dining Out/Entertainment', 0, 1)"
+        )
+
+    res = ingest.ingest_signal(
+        db,
+        signal_kind="chase_alert",
+        email_id="trip-dining-1",
+        parsed={
+            "account_id": ACCT,
+            "posted_date": date(2026, 7, 22),
+            "amount_cents": -4200,
+            "payee": "Some Beach Grill",
+            "summary": "Chase $42.00 at Some Beach Grill",
+        },
+        user_id="steven",
+        settings=None,
+    )
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_txn SET suggested_category = 'cat-dining' "
+            "WHERE id = (SELECT id FROM pending_txn ORDER BY id DESC LIMIT 1)"
+        )
+
+    trip_id = trips.create_confirmed_manual(
+        db, start=date(2026, 7, 20), end=date(2026, 7, 25), by="steven")
+    with storage.connect(db) as con:
+        trip_row = con.execute(
+            "SELECT * FROM trip WHERE id = ?", (trip_id,)
+        ).fetchone()
+
+    filed = trips.apply_trip_to_pending(db, trip_row)
+
+    assert len(filed) == 1, "a normal below-threshold trip charge must still auto-file"
+    ledger = _row(db, "ledger_txn", res["ledger_txn_id"])
+    assert ledger["category_id"] == "cat-vacation"
