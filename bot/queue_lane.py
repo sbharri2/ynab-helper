@@ -4,8 +4,10 @@ States
 ------
     HOT   — push loop drips DMs one at a time, real-time.
     COLD  — wait for the user to type /batch, then bulk-process.
-    HOLD  — Amazon CC alert without a matched order email yet.
-            Sweep promotes to HOT on enrichment, or COLD after 24h.
+    HOLD  — a charge waiting on its receipt: a LARGE Amazon charge (>= the
+            large-charge threshold) or an Apple/Venmo item. Sweep promotes to
+            HOT on enrichment; large Amazon also promotes to HOT after 24h so
+            it gets asked, everything else drops to COLD.
 
 Transitions
 -----------
@@ -47,11 +49,12 @@ HOT_TTL_HOURS = 2
 # Default HOLD TTL for non-Amazon items (Apple, Venmo). Kept short because
 # their match windows are tight — Apple receipts arrive within hours.
 HOLD_TTL_HOURS = 24
-# Amazon receipts can arrive days to weeks after the CC charge (third-party
-# sellers, slow shipments). Per Steven's directive (2026-06-26): never
-# auto-process an Amazon item without enrichment; surface the unmatched
-# ones as a dedicated alert when they exceed this window.
-AMAZON_HOLD_TTL_DAYS = 14
+# Large Amazon charges (spec 2026-07-25) wait this long for the order email
+# so the question can carry item detail, then get asked anyway. Small Amazon
+# charges never enter HOLD — they auto-bucket at ingest — so the old 14-day
+# Amazon TTL and its aged-out alert are gone.
+LARGE_AMAZON_HOLD_TTL_HOURS = 24
+LARGE_AMAZON_THRESHOLD_CENTS = 15000
 
 
 def _utcnow() -> datetime:
@@ -126,69 +129,84 @@ def demote_hot_to_cold(db_path: Path | str) -> int:
     return len(ids)
 
 
-def abandon_stale_holds(db_path: Path | str) -> int:
-    """HOLD rows that exhaust their TTL get an alert + move to COLD.
+def abandon_stale_holds(db_path: Path | str, *, settings=None) -> int:
+    """HOLD rows that exhaust their TTL move on.
 
-    Per-source TTL:
-      * Amazon  — 14 days. Items that exceed this become 'amazon_aged_out'
-        in audit log so the daily Amazon tracker can surface them.
-      * Other   — 24 hours.
+      * Large Amazon — 24h, then promoted to HOT so the user is ASKED with
+        whatever detail we have (amount + date). Spec 2026-07-25: an
+        unanswered big charge must nag, not settle quietly into the cold pile.
+      * Other — 24h, then COLD, unchanged.
 
-    We split the sweep into two queries (per TTL) to keep the rule
-    explicit. The lane_changed_at re-stamp keeps subsequent COLD-side
-    accounting straightforward.
+    ``settings`` overrides the large-charge threshold when supplied; the
+    module default applies otherwise.
     """
+    threshold = LARGE_AMAZON_THRESHOLD_CENTS
+    if settings is not None:
+        threshold = getattr(
+            getattr(settings, "amazon", None), "large_charge_cents", threshold
+        )
+
     total = 0
+    large_ids: list[int] = []
+    other_ids: list[int] = []
     with storage.connect(db_path) as con:
-        # Amazon (long TTL) — by payee match
-        amazon_rows = con.execute(
-            "SELECT id, payee FROM pending_txn "
+        # Large Amazon — ask anyway.
+        large_rows = con.execute(
+            "SELECT id FROM pending_txn "
             "WHERE queue_lane = 'hold' AND status = 'pending' "
             "  AND (UPPER(payee) LIKE '%AMAZON%' OR UPPER(payee) LIKE '%AMZN%') "
+            "  AND amount_cents <= ? "
             "  AND COALESCE(lane_changed_at, created_at) <= "
             "      datetime('now', ?)",
-            (f"-{AMAZON_HOLD_TTL_DAYS} days",),
+            (-abs(threshold), f"-{LARGE_AMAZON_HOLD_TTL_HOURS} hours"),
         ).fetchall()
-        if amazon_rows:
-            ids = [r["id"] for r in amazon_rows]
-            placeholders = ",".join(["?"] * len(ids))
+        if large_rows:
+            large_ids = [r["id"] for r in large_rows]
+            placeholders = ",".join(["?"] * len(large_ids))
             con.execute(
-                f"UPDATE pending_txn SET queue_lane = 'cold', "
-                f"lane_changed_at = ? WHERE id IN ({placeholders})",
-                [_utcnow(), *ids],
+                f"UPDATE pending_txn SET queue_lane = 'hot', "
+                f"last_pushed_at = NULL, lane_changed_at = ? "
+                f"WHERE id IN ({placeholders})",
+                [_utcnow(), *large_ids],
             )
-            storage.audit(db_path, "amazon_aged_out", {
-                "count": len(ids), "pt_ids": ids,
-                "ttl_days": AMAZON_HOLD_TTL_DAYS,
-            })
-            log.warning("abandon_stale_holds: %d Amazon items aged out "
-                         "(>%dd unmatched)", len(ids), AMAZON_HOLD_TTL_DAYS)
-            total += len(ids)
 
-        # Non-Amazon HOLD — short TTL
+        # Everything else — COLD.
         other_rows = con.execute(
             "SELECT id FROM pending_txn "
             "WHERE queue_lane = 'hold' AND status = 'pending' "
-            "  AND NOT (UPPER(payee) LIKE '%AMAZON%' "
-            "           OR UPPER(payee) LIKE '%AMZN%') "
             "  AND COALESCE(lane_changed_at, created_at) <= "
             "      datetime('now', ?)",
             (f"-{HOLD_TTL_HOURS} hours",),
         ).fetchall()
         if other_rows:
-            ids = [r["id"] for r in other_rows]
-            placeholders = ",".join(["?"] * len(ids))
+            other_ids = [r["id"] for r in other_rows]
+            placeholders = ",".join(["?"] * len(other_ids))
             con.execute(
                 f"UPDATE pending_txn SET queue_lane = 'cold', "
                 f"lane_changed_at = ? WHERE id IN ({placeholders})",
-                [_utcnow(), *ids],
+                [_utcnow(), *other_ids],
             )
-            storage.audit(db_path, "queue_lane_change", {
-                "to": "cold", "from": "hold",
-                "reason": "hold_ttl_expired", "count": len(ids),
-            })
-            log.info("abandon_stale_holds: %d non-Amazon rows", len(ids))
-            total += len(ids)
+
+    # Audit calls open their own connection, so they run after the block
+    # above commits and closes — matching the pattern in demote_hot_to_cold
+    # / set_lane elsewhere in this module. Firing them while the write
+    # transaction above was still open caused "database is locked".
+    if large_ids:
+        storage.audit(db_path, "large_amazon_ask_unenriched", {
+            "count": len(large_ids), "pt_ids": large_ids,
+            "ttl_hours": LARGE_AMAZON_HOLD_TTL_HOURS,
+        })
+        log.warning("abandon_stale_holds: %d large Amazon items asked "
+                    "without a receipt (>%dh)", len(large_ids),
+                    LARGE_AMAZON_HOLD_TTL_HOURS)
+        total += len(large_ids)
+    if other_ids:
+        storage.audit(db_path, "queue_lane_change", {
+            "to": "cold", "from": "hold",
+            "reason": "hold_ttl_expired", "count": len(other_ids),
+        })
+        log.info("abandon_stale_holds: %d rows to cold", len(other_ids))
+        total += len(other_ids)
     return total
 
 
@@ -271,5 +289,5 @@ def sweep_lanes(db_path: Path | str, *, settings) -> dict:
     return {
         "promoted_hold_to_hot": promote_holds_to_hot(db_path, settings=settings),
         "demoted_hot_to_cold": demote_hot_to_cold(db_path),
-        "abandoned_holds": abandon_stale_holds(db_path),
+        "abandoned_holds": abandon_stale_holds(db_path, settings=settings),
     }

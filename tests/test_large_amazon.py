@@ -187,3 +187,55 @@ def test_retro_bucket_still_works_for_small_charges(tmp_path):
 
     assert ingest.retro_bucket_amazon_order(db, order_id=oid) is True
     assert _row(db, "ledger_txn", 901)["category_id"] == "cat-steven"
+
+
+from bot import queue_lane
+
+
+def _hold_row(db, *, amount_cents, hours_ago, payee="AMAZON MKTPLACE PMTS"):
+    """Insert a pending_txn already sitting in HOLD, aged by hours_ago."""
+    pt_id = storage.insert_pending_txn(
+        db,
+        user_id="steven",
+        ynab_txn_id=f"ledger:{amount_cents}:{hours_ago}",
+        ynab_account_id=ACCT,
+        payee=payee,
+        amount_cents=amount_cents,
+        txn_date=date(2026, 7, 22),
+        memo="",
+    )
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_txn SET queue_lane = 'hold', "
+            "lane_changed_at = datetime('now', ?) WHERE id = ?",
+            (f"-{hours_ago} hours", pt_id),
+        )
+    return pt_id
+
+
+def test_large_hold_expires_to_hot_after_24h(tmp_path):
+    db = _setup(tmp_path)
+    pt_id = _hold_row(db, amount_cents=-81509, hours_ago=25)
+    queue_lane.abandon_stale_holds(db)
+    assert _row(db, "pending_txn", pt_id)["queue_lane"] == "hot", (
+        "an expired large hold must ASK, not drop into the cold pile"
+    )
+
+
+def test_large_hold_waits_under_24h(tmp_path):
+    db = _setup(tmp_path)
+    pt_id = _hold_row(db, amount_cents=-81509, hours_ago=3)
+    queue_lane.abandon_stale_holds(db)
+    assert _row(db, "pending_txn", pt_id)["queue_lane"] == "hold"
+
+
+def test_non_amazon_hold_still_goes_cold(tmp_path):
+    db = _setup(tmp_path)
+    pt_id = _hold_row(db, amount_cents=-2200, hours_ago=25, payee="APPLE.COM/BILL")
+    queue_lane.abandon_stale_holds(db)
+    assert _row(db, "pending_txn", pt_id)["queue_lane"] == "cold"
+
+
+def test_amazon_14_day_ttl_is_gone(tmp_path):
+    assert not hasattr(queue_lane, "AMAZON_HOLD_TTL_DAYS")
+    assert queue_lane.LARGE_AMAZON_HOLD_TTL_HOURS == 24
