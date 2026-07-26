@@ -292,3 +292,104 @@ def test_categorize_stamps_filed_by_per_token(tmp_path, fixture_db):
     ).fetchone()[0]
     con2.close()
     assert filed_by == "allison"
+
+
+# ─── Personal Expenses panel ────────────────────────────────────────────
+# The two queries backing /budget/personal. Both are hand-ports of the
+# Rust originals in commands.rs; these tests pin the contract that the
+# panel depends on, especially the counting rules on the trend query.
+
+
+def _personal_scope_sql() -> str:
+    return ("SELECT c.id FROM category c JOIN category_group g "
+            "ON g.id = c.group_id WHERE g.name = 'Personal Spending' "
+            "AND c.hidden = 0 LIMIT 1")
+
+
+def test_q_personal_expenses_month_shape(fixture_db):
+    from bot.webui_queries import REGISTRY
+    rows = REGISTRY["q_personal_expenses_month"](fixture_db, month="2026-07")
+    assert rows
+    assert {"category_id", "category_name", "owner", "budgeted_cents",
+            "activity_cents", "available_cents", "avg_monthly_cents"} <= set(rows[0])
+    assert {r["owner"] for r in rows} <= {"Steven", "Allison", "Joint"}
+    # Owner must follow the name, since that is the only source of truth.
+    for r in rows:
+        low = r["category_name"].lower()
+        if "steven" in low:
+            assert r["owner"] == "Steven"
+        elif "allison" in low:
+            assert r["owner"] == "Allison"
+
+
+def test_q_personal_expenses_month_scope(fixture_db):
+    """Only the two personal groups — a Monthly Bills category must not
+    leak in, or the panel stops being about personal spending."""
+    from bot.webui_queries import REGISTRY
+    rows = REGISTRY["q_personal_expenses_month"](fixture_db, month="2026-07")
+    names = {r["category_name"] for r in rows}
+    assert "Rent/Mortgage (1st)" not in names
+    assert "Groceries" not in names
+    assert "Steven Reimbursables" not in names
+
+
+def test_q_personal_expenses_trend_shape(fixture_db):
+    from bot.webui_queries import REGISTRY
+    rows = REGISTRY["q_personal_expenses_trend"](fixture_db, months=12)
+    assert rows
+    assert {"month", "steven_cents", "allison_cents",
+            "joint_cents"} <= set(rows[0])
+    # Chronological — the chart's x-axis depends on it.
+    assert [r["month"] for r in rows] == sorted(r["month"] for r in rows)
+    # Outflow magnitudes, never negative.
+    assert all(r["steven_cents"] >= 0 and r["allison_cents"] >= 0
+               for r in rows)
+
+
+def test_q_personal_expenses_trend_excludes_transfers_and_splits(
+        tmp_path, fixture_db):
+    """Transfer rows and split parents must not count as spending.
+
+    Steven pays credit cards in full, so 'Transfer :' rows are movement,
+    not spend; and splits are stored as parent + child rows, so counting
+    the parent double-counts its children.
+    """
+    from bot.webui_queries import REGISTRY
+    db = str(tmp_path / "trend.db")
+    shutil.copy(fixture_db, db)
+
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    cat_id = con.execute(_personal_scope_sql()).fetchone()["id"]
+    acct = con.execute(
+        "SELECT id FROM account WHERE on_budget = 1 LIMIT 1").fetchone()["id"]
+    month = _dt.date.today().strftime("%Y-%m")
+    day = f"{month}-15"
+
+    before = {r["month"]: r for r in
+              REGISTRY["q_personal_expenses_trend"](db, months=12)}
+    base = before.get(month, {"steven_cents": 0, "allison_cents": 0,
+                              "joint_cents": 0})
+    base_total = (base["steven_cents"] + base["allison_cents"]
+                  + base["joint_cents"])
+
+    con.executemany(
+        "INSERT INTO ledger_txn "
+        "  (account_id, category_id, payee, amount_cents, posted_date, is_split) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            (acct, cat_id, "Transfer : Citi Double Cash", -50000, day, 0),
+            (acct, cat_id, "Split Parent Co", -30000, day, 1),
+            (acct, cat_id, "Real Personal Purchase", -1000, day, 0),
+        ],
+    )
+    con.commit()
+    con.close()
+
+    after = {r["month"]: r for r in
+             REGISTRY["q_personal_expenses_trend"](db, months=12)}
+    row = after[month]
+    total = row["steven_cents"] + row["allison_cents"] + row["joint_cents"]
+    # Only the $10.00 real purchase counts — not the $500 transfer, not
+    # the $300 split parent.
+    assert total - base_total == 1000

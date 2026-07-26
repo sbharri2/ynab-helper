@@ -756,8 +756,112 @@ def q_seasonal_funds(db_path: str, **_: Any) -> list[dict[str, Any]]:
     return []
 
 
+# The groups the Personal Expenses panel covers. Reimbursables are
+# excluded because they are passthrough, Investments because a $20k
+# retirement transfer is not spending, and Personal Business because
+# Cross Stitch / Writing are side-project ledgers. Must match
+# PERSONAL_EXPENSE_GROUPS in commands.rs.
+PERSONAL_EXPENSE_GROUPS = ("Personal Spending", "Individual Vacations")
+
+
+def _owner_from_name(name: str) -> str:
+    """Owner lives in the category name, not a column. Must agree with
+    owner_from_name in commands.rs and ownerOf in Budget.tsx."""
+    lower = (name or "").lower()
+    if "steven" in lower:
+        return "Steven"
+    if "allison" in lower:
+        return "Allison"
+    return "Joint"
+
+
+def q_personal_expenses_month(
+    db_path: str, month: str, **_: Any
+) -> list[dict[str, Any]]:
+    """Personal envelopes for one month — port of
+    commands.rs q_personal_expenses_month (`PersonalRow[]`)."""
+    with storage.connect(db_path) as con:
+        rows = con.execute(
+            "SELECT c.id AS category_id, c.name AS category_name, "
+            "  COALESCE(mc.budgeted_cents, 0) AS budgeted_cents, "
+            "  COALESCE(mc.activity_cents, 0) AS activity_cents, "
+            "  COALESCE(mc.available_cents, 0) AS available_cents "
+            "FROM category c "
+            "JOIN category_group g ON g.id = c.group_id "
+            "LEFT JOIN month_category mc "
+            "       ON mc.category_id = c.id AND mc.month = ? "
+            "WHERE g.name IN (?, ?) AND c.hidden = 0 AND g.hidden = 0 "
+            "ORDER BY c.name",
+            (month, *PERSONAL_EXPENSE_GROUPS),
+        ).fetchall()
+
+        out = []
+        for r in rows:
+            avg = con.execute(
+                "SELECT CAST(AVG(month_total) AS INTEGER) FROM ("
+                "  SELECT strftime('%Y-%m', posted_date) AS m, "
+                "         SUM(-amount_cents) AS month_total "
+                "  FROM ledger_txn "
+                "  WHERE category_id = ? AND amount_cents < 0 "
+                "    AND posted_date >= date('now','start of month','-6 months') "
+                "    AND posted_date <  date('now','start of month') "
+                "    AND account_id IN (SELECT id FROM account WHERE on_budget = 1) "
+                "  GROUP BY m)",
+                (r["category_id"],),
+            ).fetchone()[0]
+            d = dict(r)
+            d["owner"] = _owner_from_name(r["category_name"])
+            d["avg_monthly_cents"] = avg or 0
+            out.append(d)
+    return out
+
+
+def q_personal_expenses_trend(
+    db_path: str, months: int | None = None, **_: Any
+) -> list[dict[str, Any]]:
+    """Personal outflow per (month, owner) over the trailing N months —
+    port of commands.rs q_personal_expenses_trend (`PersonalTrendRow[]`).
+
+    Aggregates raw ledger rows, so the household counting rules are
+    applied by hand: outflows only (a transfer INTO Personal Savings is
+    not spend), no 'Transfer :' payees (cards are paid in full), no split
+    parents (they'd double-count their children), on-budget accounts only.
+    """
+    n = max(1, min(int(months or 12), 60))
+    with storage.connect(db_path) as con:
+        rows = con.execute(
+            "SELECT strftime('%Y-%m', lt.posted_date) AS m, "
+            "  c.name AS category_name, SUM(-lt.amount_cents) AS cents "
+            "FROM ledger_txn lt "
+            "JOIN category c ON c.id = lt.category_id "
+            "JOIN category_group g ON g.id = c.group_id "
+            "WHERE g.name IN (?, ?) "
+            "  AND lt.amount_cents < 0 "
+            "  AND lt.is_split = 0 "
+            "  AND (lt.payee IS NULL OR lt.payee NOT LIKE 'Transfer :%') "
+            "  AND lt.account_id IN (SELECT id FROM account WHERE on_budget = 1) "
+            f"  AND lt.posted_date >= date('now','start of month','-{n} months') "
+            "GROUP BY m, c.id ORDER BY m",
+            PERSONAL_EXPENSE_GROUPS,
+        ).fetchall()
+
+    by_month: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        e = by_month.setdefault(
+            r["m"],
+            {"month": r["m"], "steven_cents": 0,
+             "allison_cents": 0, "joint_cents": 0},
+        )
+        key = {"Steven": "steven_cents", "Allison": "allison_cents"}.get(
+            _owner_from_name(r["category_name"]), "joint_cents")
+        e[key] += r["cents"]
+    return [by_month[m] for m in sorted(by_month)]
+
+
 REGISTRY: dict[str, Callable[..., Any]] = {
     "q_categories": q_categories,
+    "q_personal_expenses_month": q_personal_expenses_month,
+    "q_personal_expenses_trend": q_personal_expenses_trend,
     "q_category_groups": q_category_groups,
     "q_month_categories": q_month_categories,
     "q_category_avg_activity": q_category_avg_activity,
