@@ -31,3 +31,106 @@ def test_settings_override_threshold():
     s = Settings.model_construct(amazon=AmazonConfig(large_charge_cents=50000))
     assert ingest._is_large_amazon_charge(-20000, s) is False
     assert ingest._is_large_amazon_charge(-50000, s) is True
+
+
+ACCT = "acct-chase-1111"
+
+
+def _setup(tmp_path):
+    """Fresh DB with one account and the three Amazon buckets."""
+    db = tmp_path / "test.db"
+    storage.init_db(db)
+    with storage.connect(db) as con:
+        con.execute(
+            "INSERT INTO account (id, name, type, on_budget, closed, last4) "
+            "VALUES (?, 'Chase Amazon', 'credit_card', 1, 0, '1111')",
+            (ACCT,),
+        )
+        con.execute(
+            "INSERT INTO category_group (id, name) VALUES ('g1', 'Personal Spending')"
+        )
+        for cid, name in [
+            ("cat-steven", "Amazon - Steven"),
+            ("cat-allison", "Amazon - Allison"),
+            ("cat-unassigned", "Amazon - Unassigned"),
+        ]:
+            con.execute(
+                "INSERT INTO category (id, group_id, name, hidden, is_spending) "
+                "VALUES (?, 'g1', ?, 0, 0)",
+                (cid, name),
+            )
+    return db
+
+
+def _charge(db, *, amount_cents, email_id, settings=None):
+    return ingest.ingest_signal(
+        db,
+        signal_kind="chase_alert",
+        email_id=email_id,
+        parsed={
+            "account_id": ACCT,
+            "posted_date": date(2026, 7, 22),
+            "amount_cents": amount_cents,
+            "payee": "AMAZON MKTPLACE PMTS",
+            "summary": "Chase $X at Amazon.com",
+        },
+        user_id="steven",
+        settings=settings,
+    )
+
+
+def _row(db, table, rid):
+    with storage.connect(db) as con:
+        r = con.execute(f"SELECT * FROM {table} WHERE id = ?", (rid,)).fetchone()
+    return dict(r) if r else None
+
+
+def test_small_amazon_charge_still_auto_buckets(tmp_path):
+    db = _setup(tmp_path)
+    res = _charge(db, amount_cents=-4999, email_id="small-1")
+    ledger = _row(db, "ledger_txn", res["ledger_txn_id"])
+    assert ledger["category_id"] == "cat-unassigned"
+    with storage.connect(db) as con:
+        n = con.execute("SELECT COUNT(*) FROM pending_txn").fetchone()[0]
+    assert n == 0, "small Amazon charges must not enter the confirm queue"
+
+
+def test_large_amazon_charge_leaves_category_null(tmp_path):
+    db = _setup(tmp_path)
+    res = _charge(db, amount_cents=-81509, email_id="large-1")
+    ledger = _row(db, "ledger_txn", res["ledger_txn_id"])
+    assert ledger["category_id"] is None
+
+
+def test_large_amazon_charge_enters_hold_lane(tmp_path):
+    db = _setup(tmp_path)
+    _charge(db, amount_cents=-81509, email_id="large-2")
+    with storage.connect(db) as con:
+        rows = [dict(r) for r in con.execute("SELECT * FROM pending_txn")]
+    assert len(rows) == 1
+    assert rows[0]["queue_lane"] == "hold"
+    assert rows[0]["status"] == "pending"
+
+
+def test_large_amazon_does_not_auto_commit_from_matched_order(tmp_path):
+    """A user-chosen category on the matching order normally auto-files.
+    Above the threshold it must not — the whole point is a human look."""
+    db = _setup(tmp_path)
+    storage.insert_pending_order(
+        db,
+        user_id="steven", source="amazon", external_id="112-0031580-6551463",
+        email_id="order-1", order_date=date(2026, 7, 22), total_cents=81509,
+        raw_summary="1 item(s): 1 Electronics item", raw_payload={},
+    )
+    with storage.connect(db) as con:
+        con.execute(
+            "UPDATE pending_order SET chosen_category = 'cat-steven', "
+            "assigned_to_user_id = 'steven' WHERE email_id = 'order-1'"
+        )
+    res = _charge(db, amount_cents=-81509, email_id="large-3")
+    ledger = _row(db, "ledger_txn", res["ledger_txn_id"])
+    assert ledger["category_id"] is None
+    with storage.connect(db) as con:
+        pt = con.execute("SELECT * FROM pending_txn").fetchone()
+    assert pt["status"] == "pending"
+    assert pt["chosen_category"] is None

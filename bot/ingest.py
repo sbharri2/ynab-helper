@@ -185,6 +185,9 @@ def ingest_signal(
     # (redesign-v2 Phase 3); 'llm' stays a suggestion awaiting a human.
     categorize_method: str = "llm"
     is_amazon = _is_amazon_payee(payee)
+    # Spec 2026-07-25: at or above the threshold an Amazon charge is too big
+    # to file blind. It skips the bucket, holds uncategorized, and asks.
+    is_large_amazon = is_amazon and _is_large_amazon_charge(amount_cents, settings)
     if existing:
         ledger_txn_id = existing["id"]
         # Enrich existing row if the new signal carries better payee/memo/amount
@@ -222,7 +225,7 @@ def ingest_signal(
         # write category_id onto the ledger row now (there's no user-confirm
         # step to promote it later).
         ledger_category_id: str | None = None
-        if is_amazon:
+        if is_amazon and not is_large_amazon:
             person = (matched_order or {}).get("assigned_to_user_id")
             category_id = _amazon_bucket_category(db_path, person)
             ledger_category_id = category_id
@@ -332,7 +335,7 @@ def ingest_signal(
     # Sync-to-YNAB panel for a batch push whenever Steven wants.
     pending_txn_id: int | None = None
     if (action == "new" and signal_kind in _PROMPT_USER_KINDS
-            and user_id and not is_amazon):
+            and user_id and (not is_amazon or is_large_amazon)):
         try:
             pending_txn_id = storage.insert_pending_txn(
                 db_path,
@@ -344,6 +347,20 @@ def ingest_signal(
                 txn_date=posted_date,
                 memo=parsed.get("summary") or parsed.get("memo") or "",
             )
+            if pending_txn_id and is_large_amazon:
+                # Wait for the order email so the question can carry item
+                # detail. queue_lane.promote_holds_to_hot() re-runs the
+                # matcher every 30 min; a 24h TTL asks anyway if no receipt.
+                from bot import queue_lane as _queue_lane
+                _queue_lane.set_lane(
+                    db_path, pending_txn_id, "hold",
+                    reason="large_amazon_awaiting_receipt",
+                )
+                storage.audit(db_path, "large_amazon_held", {
+                    "pending_txn_id": pending_txn_id,
+                    "ledger_txn_id": ledger_txn_id,
+                    "amount_cents": amount_cents, "payee": payee,
+                })
             # Lodging charges open a candidate trip window; the group
             # sweep asks for one-tap confirmation (suggestions-v2).
             if pending_txn_id:
@@ -356,8 +373,10 @@ def ingest_signal(
                 except Exception as e:  # noqa: BLE001 — never block ingest
                     log.warning("trip detection failed: %s", e)
             if pending_txn_id and category_id:
-                auto_commit = categorize_method in (
-                    "override", "prior", "order", "trip")
+                auto_commit = (
+                    categorize_method in ("override", "prior", "order", "trip")
+                    and not is_large_amazon
+                )
                 with storage.connect(db_path) as con:
                     if auto_commit:
                         # Redesign-v2 Phase 3: HIGH-CONFIDENCE picks commit
