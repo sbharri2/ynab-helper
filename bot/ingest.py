@@ -60,14 +60,18 @@ _BALANCE_KINDS = {
     "citi_balance_summary",
 }
 
-# Signal kinds that should ALSO write a pending_txn row when ingest
-# creates a new ledger_txn — so the user gets a confirm-category DM
-# right after the email arrives, not silently absorbed into the ledger
-# with whatever the LLM picked. ynab_sync is intentionally NOT in here —
-# ynab_watcher.poll_once already writes its own pending_txn for those.
+# Signal kinds that ALSO write a pending_txn row when ingest creates a new
+# ledger_txn. Every kind that can produce a real charge belongs here: as of
+# 2026-08-01 nothing files without reaching Telegram first.
+#
+# ynab_sync was previously excluded, with a comment claiming
+# ynab_watcher.poll_once queued those rows instead. bot/ynab_watcher.py was
+# deleted in the Phase 7+ writer redesign, so that comment guarded a hole
+# rather than documenting a decision — 40 of 213 July 2026 outflows never
+# entered the queue at all.
 _PROMPT_USER_KINDS = {
     "chase_alert", "citi_alert", "coastal_transaction_alert",
-    "coastal_check_cleared", "paypal_payment",
+    "coastal_check_cleared", "paypal_payment", "ynab_sync",
 }
 
 
@@ -384,50 +388,24 @@ def ingest_signal(
                 except Exception as e:  # noqa: BLE001 — never block ingest
                     log.warning("trip detection failed: %s", e)
             if pending_txn_id and category_id:
-                auto_commit = (
-                    categorize_method in ("override", "prior", "order", "trip")
-                    and not is_large_amazon
-                )
+                # Store the categorizer's pick as a SUGGESTION only. Ingest
+                # no longer commits: bot/dispatch.py decides whether this
+                # row files by rule (FYI) or asks. The suggestion pre-fills
+                # the question's buttons.
+                #
+                # Until 2026-08-01 a "high-confidence" pick (explicit payee
+                # rule, ≥3×/≥70% prior, matched order, trip window) committed
+                # here with status='categorized' and never entered the ask
+                # queue — 51 of 213 July outflows. Learned confidence now
+                # proposes rules in the Auto-Sync panel instead of acting on
+                # its own; only a rule a human wrote can file without asking.
                 with storage.connect(db_path) as con:
-                    if auto_commit:
-                        # Redesign-v2 Phase 3: HIGH-CONFIDENCE picks commit
-                        # immediately with provenance instead of waiting in
-                        # the queue — an explicit payee rule, a ≥3×/≥70%
-                        # human-confirmed prior, or the user's own category
-                        # on the matched order. The Inbox's "recently filed"
-                        # section is the correcting safety net; the row never
-                        # enters the ask queue (status != 'pending').
-                        con.execute(
-                            "UPDATE pending_txn SET suggested_category = ?, "
-                            "chosen_category = ?, chosen_at = ?, "
-                            "status = 'categorized', filed_by = ?, "
-                            "raw_summary = ? WHERE id = ?",
-                            (category_id, category_id, storage._utcnow(),
-                             f"auto_{categorize_method}",
-                             parsed.get("summary") or "", pending_txn_id),
-                        )
-                        # Promote onto the ledger row now — same semantics
-                        # as the Amazon auto-bucket path: there is no later
-                        # confirm step to do it.
-                        con.execute(
-                            "UPDATE ledger_txn SET category_id = ?, "
-                            "updated_at = CURRENT_TIMESTAMP WHERE id = ?",
-                            (category_id, ledger_txn_id),
-                        )
-                    else:
-                        con.execute(
-                            "UPDATE pending_txn SET suggested_category = ?, "
-                            "raw_summary = ? WHERE id = ?",
-                            (category_id, parsed.get("summary") or "",
-                             pending_txn_id),
-                        )
-                if auto_commit:
-                    storage.audit(db_path, "auto_filed", {
-                        "pending_txn_id": pending_txn_id,
-                        "ledger_txn_id": ledger_txn_id,
-                        "payee": payee, "category_id": category_id,
-                        "method": categorize_method,
-                    })
+                    con.execute(
+                        "UPDATE pending_txn SET suggested_category = ?, "
+                        "raw_summary = ? WHERE id = ?",
+                        (category_id, parsed.get("summary") or "",
+                         pending_txn_id),
+                    )
             # (Small Amazon charges never reach here — they auto-bucket
             # above and skip the prompt queue entirely. Large Amazon charges
             # DO reach here and were already routed to HOLD a few lines up.
