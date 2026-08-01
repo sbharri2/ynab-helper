@@ -235,10 +235,12 @@ Expected: succeeds. A pre-existing chunk-size warning about the main bundle exce
 Tailwind only emits what it sees, and a hand-written rule inside `@layer components` is easy to get silently dropped by a typo in the block. Prove it survived the build:
 
 ```bash
-grep -c "page-container" dist/assets/*.css
+grep -o "page-container" dist/assets/*.css | wc -l
 ```
 
-Expected: at least 2 matches (the base rule and the `html.wide` override). Zero means the rule never made it into the bundle and the toggle will appear to do nothing.
+Expected: at least 2 occurrences (the base rule and the `html.wide` override). Zero means the rule never made it into the bundle and the toggle will appear to do nothing.
+
+Count occurrences, not lines — `grep -c` reports 1 no matter what, because the built CSS is a single minified line.
 
 - [ ] **Step 10: Commit**
 
