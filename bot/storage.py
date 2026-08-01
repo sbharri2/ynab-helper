@@ -108,6 +108,26 @@ CREATE TABLE IF NOT EXISTS income_source_override (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Auto-Sync rules (2026-08-01). Payee pattern -> category, authored by the
+-- user in the Auto-Sync panel. Replaces the hard-coded OVERRIDES list in
+-- bot/payee_overrides.py, which needed a code edit plus a bot restart to
+-- change one bill's category. A matching rule files the charge and sends an
+-- FYI; no rule means the charge asks. First enabled rule by ascending id
+-- wins -- deliberately no priority scoring, so a wrong filing is always
+-- explainable by pointing at exactly one rule.
+CREATE TABLE IF NOT EXISTS auto_rule (
+  id            INTEGER PRIMARY KEY,
+  pattern       TEXT NOT NULL UNIQUE,
+  category_id   TEXT NOT NULL REFERENCES category(id),
+  enabled       INTEGER NOT NULL DEFAULT 1,
+  note          TEXT,
+  created_by    TEXT,
+  created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  last_fired_at TIMESTAMP,
+  fire_count    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_auto_rule_enabled ON auto_rule(enabled, id);
+
 CREATE INDEX IF NOT EXISTS idx_pending_order_status
   ON pending_order(status, source, user_id);
 CREATE INDEX IF NOT EXISTS idx_pending_txn_status
@@ -757,6 +777,81 @@ def insert_pending_txn(
             return cur.lastrowid
         except sqlite3.IntegrityError:
             return None
+
+
+def list_auto_rules(db_path: Path | str, *,
+                    enabled_only: bool = False) -> list[dict]:
+    """All Auto-Sync rules in match order (ascending id).
+
+    Match order is id order, not fire_count order — the panel sorts by
+    fire_count for display, but matching must stay deterministic and
+    independent of how often a rule has fired.
+    """
+    sql = "SELECT * FROM auto_rule"
+    if enabled_only:
+        sql += " WHERE enabled = 1"
+    sql += " ORDER BY id ASC"
+    with connect(db_path) as con:
+        return [dict(r) for r in con.execute(sql)]
+
+
+def create_auto_rule(db_path: Path | str, *, pattern: str, category_id: str,
+                     created_by: str, note: str | None = None) -> int:
+    """Insert a rule. Raises sqlite3.IntegrityError on duplicate pattern —
+    callers surface that as a user-facing 'this rule already exists'."""
+    with connect(db_path) as con:
+        cur = con.execute(
+            "INSERT INTO auto_rule (pattern, category_id, created_by, note) "
+            "VALUES (?, ?, ?, ?)",
+            (pattern, category_id, created_by, note),
+        )
+        return cur.lastrowid
+
+
+def update_auto_rule(db_path: Path | str, rule_id: int, *,
+                     pattern: str | None = None,
+                     category_id: str | None = None,
+                     enabled: bool | None = None,
+                     note: str | None = None) -> bool:
+    """Patch the supplied fields. Returns False when no such rule."""
+    sets, args = [], []
+    if pattern is not None:
+        sets.append("pattern = ?")
+        args.append(pattern)
+    if category_id is not None:
+        sets.append("category_id = ?")
+        args.append(category_id)
+    if enabled is not None:
+        sets.append("enabled = ?")
+        args.append(1 if enabled else 0)
+    if note is not None:
+        sets.append("note = ?")
+        args.append(note)
+    if not sets:
+        return False
+    args.append(rule_id)
+    with connect(db_path) as con:
+        cur = con.execute(
+            f"UPDATE auto_rule SET {', '.join(sets)} WHERE id = ?", args,
+        )
+        return cur.rowcount > 0
+
+
+def delete_auto_rule(db_path: Path | str, rule_id: int) -> bool:
+    with connect(db_path) as con:
+        cur = con.execute("DELETE FROM auto_rule WHERE id = ?", (rule_id,))
+        return cur.rowcount > 0
+
+
+def bump_auto_rule_fire(db_path: Path | str, rule_id: int) -> None:
+    """Record that a rule filed a transaction. Drives the panel's
+    'fired N times / last fired' columns so dead rules are visible."""
+    with connect(db_path) as con:
+        con.execute(
+            "UPDATE auto_rule SET fire_count = fire_count + 1, "
+            "last_fired_at = ? WHERE id = ?",
+            (_utcnow(), rule_id),
+        )
 
 
 def list_unmatched_pending_orders(db_path: Path | str) -> list[dict]:
