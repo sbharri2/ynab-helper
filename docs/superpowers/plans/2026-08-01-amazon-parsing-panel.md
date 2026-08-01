@@ -11,6 +11,8 @@
 ## Global Constraints
 
 - **Spec:** `docs/superpowers/specs/2026-08-01-amazon-parsing-panel-design.md`. Read it before Task 1.
+- **Line numbers in this plan are indicative, not authoritative.** A parallel agent is actively editing `bot/ingest.py`, `bot/telegram_bot.py`, and `bot/http_api.py` on this branch (the auto-sync / `bot/dispatch.py` work, commits `338909e`…`90910de`). **Locate every edit by grepping for the named symbol**, not by line number. If a target symbol has already been removed or renamed by that work, stop and ask rather than guessing.
+- **Known collision:** that agent's `90910de` ("stop auto-filing; queue ynab_sync rows") restructured the same ingest region Task 4 rewrites, and its code references `is_large_amazon`, which Task 5 deletes. Before starting Phase 2, re-read the current Amazon fork and confirm with Steven that both designs still agree on what happens to an Amazon charge at ingest.
 - **Never PID-kill or start the bot.** It is the `YNAB-Helper-Bot` scheduled task and owns its own lifecycle; a parallel agent may be deploying. Bot code goes live only on its restart. Use the Bot Control panel if it must be cycled.
 - **Never bulk-recompute `month_category`.** Measured at +$10.5k phantom Ready-to-Assign. Use `envelope.apply_activity_delta` for a targeted fix; never `recompute_month` over history.
 - **The matcher's rules in `bot/matcher.py` are not modified by this plan.** No threshold, weight, window, or tolerance changes. If a task seems to require one, stop and ask.
