@@ -57,22 +57,47 @@ Two things drove it:
 table to read, and no diagnosis of the matching process is possible today. This
 is the foundation and must be built first.
 
-## Sizing
+## Sizing — and the matcher is not the problem
 
-Amazon CC charges vs. parsed orders, by month:
+Measured 2026-08-01 by running `bot.matcher.find_best_match` over every Amazon
+charge since January:
 
-| | Apr | May | Jun | Jul |
-|---|---|---|---|---|
-| CC charges | 17 | 23 | 16 | 17 |
-| Orders parsed | 8 | 5 | 10 | **18** |
+| Month | Charges | Bot matched | Ceiling* |
+|---|---|---|---|
+| Jan | 13 | 46% | 77% |
+| Feb | 4 | 25% | 25% |
+| Mar | 13 | 15% | 15% |
+| Apr | 17 | 53% | 76% |
+| May | 23 | 22% | 48% |
+| Jun | 16 | 31% | 56% |
+| **Jul** | **17** | **94%** | **94%** |
 
-May's 5-for-23 is the era before the multi-order parser fix (2026-07-26, commit
-`2ff8bcf`); July is near-parity because that fix landed. **A match rate computed
-over history will look far worse than what the system does now** — the panel
-must show the month, not one lifetime number, or it will misrepresent the fix.
+\* *ceiling = a receipt exists at all within the amount tolerance and date
+window. The matcher cannot beat it.*
 
-Telegram load at July volume: ~16–20 matched pings/mo plus unmatched pings —
-about **5 messages/week** to the group.
+**July sits exactly on the ceiling** — 16 of the 16 charges that had a receipt
+were matched. The single miss is a $3.21 charge (ledger 24953) with no order
+email in existence. All 16 matches had the receipt **already in hand when the
+charge landed**, so matching happens at ingest with zero latency.
+
+The bad history is the multi-order parser bug (fixed 2026-07-26, `2ff8bcf`) and
+the IMAP capture outage — **not** the matching rules. The ceiling is receipt
+capture, and capture is already repaired.
+
+**Consequence: the matcher is not changed by this design.** Two candidate fixes
+were measured and rejected:
+
+- Replacing the 14-day date decay with a 21-day ship window changes the outcome
+  for **one** charge in seven months ($42.89, 12-day gap).
+- The ambiguity guard rejects perfect scores (1.000 and 0.979, both $0.00 diff)
+  when two orders sit within 0.10 of each other — June's $34.29 / $34.31 twins.
+  This is correct behaviour and must stay; it needs a **human disambiguation
+  surface**, which is what the panel's manual match is for. That makes manual
+  match the highest-value action in the panel, not a minor affordance.
+
+Telegram load at July volume: ~16 matched pings/mo, and — because the match rate
+is 94% — roughly **one unmatched ping a month**. The 4-day unmatched flow is a
+safety net, not a workflow.
 
 ## Decisions
 
@@ -85,10 +110,14 @@ about **5 messages/week** to the group.
    real category, which the bucket model never allowed.
 4. **The match gets persisted**, at every site that computes one.
 5. **The panel is a drain surface with matching diagnostics attached**, not a
-   tracker.
+   tracker. It already exists as a Reconciler sub-tab and is promoted and
+   extended rather than rebuilt (§7).
 6. **Historical rows stay pointed at the old buckets.** June/July reporting is
    unchanged and `month_category` is not bulk-recomputed — the standing
    never-backfill rule (measured at +$10.5k phantom RTA) holds.
+7. **The matcher's rules do not change.** It runs at the ceiling of what receipt
+   capture allows (94% in July, 16 of 16 available). The Rust duplicate is
+   deleted so the panel reports what the bot actually did.
 
 ## Phasing
 
@@ -99,12 +128,17 @@ the link:
    else depends on it.
 2. **Cutover** — `Amazon Uncategorized`, the envelope moves, the ingest
    simplification, the deletions.
-3. **Panel** — the four views.
+3. **Panel** — promote the existing Reconciler Amazon tab to its own page,
+   delete the Rust pairing logic in favour of the persisted link, add the Who
+   column and the drain and manual-match actions.
 4. **Telegram** — the two pings.
 
 Phases 1 and 2 are independently shippable and independently reversible. The
 panel is usable without the pings; the pings are not useful without the panel to
 send people to.
+
+Phase 3 touches Rust, so it requires a full desktop app rebuild — unlike the
+pure-TypeScript work, a hot-swap of the bundle is not enough.
 
 ## Architecture
 
@@ -229,59 +263,78 @@ The 5 stale HOLD rows from early July (pt 1011, 1042, 1068, 1069, 1070) are
 resolved by the cutover script: they are re-filed to `Amazon Uncategorized` and
 their `pending_txn` rows closed.
 
-### 6. HTTP API
+### 6. Data access
 
-Read (all `GET`, token-guarded, backed by `bot/webui_queries.py`):
+Reads do **not** go over new `GET` endpoints. This UI has three data-source
+modes chosen at import time (`src/lib/db.ts`), so every query needs three
+implementations:
 
-- `GET /amazon/overview?month=YYYY-MM` — header numbers: Amazon Uncategorized
-  available, row count and dollars still to drain, and per-month
-  charges/orders/matched counts for the last 6 months.
-- `GET /amazon/charges?month=` — Amazon `ledger_txn` rows: date, amount,
-  account, payee, category, person, match state, linked order.
-- `GET /amazon/orders?month=` — `pending_order` rows where `source='amazon'`:
-  date, total, items, person, match state, linked charges.
-- `GET /amazon/matched?month=` — the join: charge + order items + person.
-- `GET /amazon/unmatched` — **two-sided**: charges older than 4 days with
-  `pending_order_id IS NULL`, and orders older than 4 days with no charge
-  pointing at them.
+1. **Tauri** — a Rust `q_*` command in `src-tauri/src/commands.rs` (rusqlite).
+2. **HTTP** — a Python `q_*` in `bot/webui_queries.py`, reached via
+   `POST /q/{name}`, for the same bundle served in a browser.
+3. **Mock** — a fixture in `src/lib/mockData.ts` for `npm run dev`.
 
-Write:
+`q_amazon_reconcile` already exists in all three. It is **extended**, not
+replaced: same name, same `AmazonReconcile` return shape, plus a `who` field on
+charges and a `month` breakdown for the header.
+
+Writes use the existing token-guarded HTTP API:
 
 - `POST /amazon/match {ledger_txn_id, pending_order_id}` — manual link.
 - `POST /amazon/unmatch {ledger_txn_id}` — clear a bad link. Reverts
   `pending_order.status` to `pending` when no charges remain linked.
-
-Recategorization reuses the existing `POST /categorize` — no new endpoint.
+- Recategorization reuses the existing `POST /categorize` — no new endpoint.
 
 Per the standing FastAPI rule, every Pydantic body model lives at **module
-scope**, never inside `build_app()`.
+scope**, never inside `build_app()`. New API routes must be declared above the
+catch-all `GET /{full_path:path}`.
 
-### 7. The panel
+### 7. The panel — which already exists
 
-`src/pages/AmazonParsing.tsx`, route `/amazon`, in the **Core** sidebar group
-next to Reconciler — it is primarily a diagnostic surface, and Reconciler is the
-established precedent for read-plus-one-action diagnostics.
+**`Reconciler.tsx` → the Amazon tab (`AmazonView:944`) is this panel.** It
+already renders all four buckets — charges, orders, matched, and unmatched on
+both sides — with match rates and a deep link from Transactions
+(`?view=amazon&charge=<id>`). It was not dead; it was buried and read-only.
 
-Header: Amazon Uncategorized available, count of rows still in it, dollars still
-to drain, and a small per-month charges/orders/matched bar for the last 6
-months (so the July parser fix is visible rather than averaged away).
+Two things are wrong with it:
 
-Four views, tab-switched:
+1. **It computes its own matches in Rust**, with different rules than
+   `bot/matcher.py` (21-day ship window and closest-pair ranking vs. the bot's
+   weighted score, 14-day decay, and ambiguity guard). So it displays matches
+   the bot never made. This is the concrete reason the matching process cannot
+   be diagnosed today — the display and the process disagree.
+2. **It is read-only** — nothing can be drained or disambiguated from it.
 
-| View | Rows | Actions |
-|---|---|---|
-| **Charges** | every Amazon ledger row — date, amount, account, category, who, match state | recategorize |
-| **Orders** | every parsed order — date, total, items, who, match state | — |
-| **Matched** | the pairs: charge + item text + who | recategorize (**this is the drain**) |
-| **Unmatched** | charges >4d unlinked **and** orders >4d unlinked | manual match, recategorize |
+**Decision.** The bot's matcher is the only one that runs in production: it
+drives categorization, the memo enrichment, and the pings. It is therefore the
+one that persists, and its rules are **left exactly as they are** (§Sizing).
+The Rust pairing logic is **deleted**; `q_amazon_reconcile` becomes a plain read
+of `ledger_txn.pending_order_id`. One matcher, one truth.
 
-Unmatched is two-sided by design. Steven specified the charge side; a parsed
-order with no charge is the other half of any matching bug and the panel cannot
-diagnose matching with one side visible.
+**Promotion.** The view moves out of Reconciler into its own top-level sidebar
+entry: `src/pages/Amazon.tsx`, route `/amazon`. The Reconciler tab and its
+`?view=amazon` deep link are removed, and the Transactions deep link is
+repointed at `/amazon?charge=<id>`.
 
-A **Who** column (Steven / Allison / —) is filterable and totals per person,
+Header gains: Amazon Uncategorized available, rows still in it, dollars still to
+drain, and per-month charges/matched counts for the last 6 months — so the July
+parser fix stays visible instead of being averaged into a single lifetime rate.
+
+Rows gain:
+
+| View | Added |
+|---|---|
+| **Charges** | Who column; recategorize |
+| **Orders** | Who column |
+| **Matched** | Who column; recategorize (**this is the drain**) |
+| **Unmatched** | manual match; recategorize |
+
+The **Who** column (Steven / Allison / —) is filterable and totals per person,
 replacing what the per-person categories used to show — and unlike the buckets,
-it keeps working after an item drains out to Household Items.
+it keeps working after an item drains out to a real category.
+
+Per the standing UI rule, no matcher scores, weights, or breakdowns are
+rendered. `match_score` is stored for diagnosis only.
 
 Recategorization uses `CategoryPicker` directly in a modal — **not** the shared
 `CategoryActivityModal`, which is keyed on a category and a month, whereas these
@@ -352,6 +405,13 @@ fires (it is deduped separately from the unmatched one).
 
 ## Known gaps
 
+- **Receipt capture is the ceiling, and nothing here raises it.** The matcher
+  already extracts 100% of what capture provides. Any future push toward "every
+  charge matched" is an email-capture project, not a matching project — the
+  known suspects are Amazon digital purchases that send no order email (July's
+  $3.21 miss) and Allison's Amazon mail routing to TRASH under a 30-day purge.
+  The panel makes the gap measurable, which is the prerequisite for deciding
+  whether it is worth closing.
 - **Item text is often useless.** Amazon's confirmation emails frequently give
   rollups ("4 Apparel and Arts & Crafts items", "4 Drugstore, Kitchen, and other
   items") rather than product names. A matched ping carrying that text is barely
@@ -400,6 +460,8 @@ Ordered, because the cutover crosses both processes:
    `YNAB-Helper-Bot` scheduled task restarts. Never PID-kill or start the bot
    in-session — a parallel agent may be deploying.
 4. Desktop UI: `npm run tauri build`, hot-swap the exe over the install dir.
+   **Required** for phase 3 — it changes `src-tauri/src/commands.rs`, and a
+   bundle-only deploy will not pick up a Rust change.
    Mobile web: `deploy_webui.ps1`, no restart.
 
 Steps 1 and 2 are safe to run before the restart: the old ingest path writes to
