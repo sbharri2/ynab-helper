@@ -121,16 +121,36 @@ Rows that must never produce a question, unchanged from today's filters:
 `Transfer :%` payees, split parents (`is_split = 1`), split children
 (`parent_txn_id IS NOT NULL`), and off-budget accounts.
 
-### FYIs bypass the drip
+### Delivery path: group pings, not DMs
 
-The push loop advances one question at a time, gated on
-`bot_conversation.last_asked_id`. That gate is what stalls the entire queue
-when a DM is ignored.
+`telegram_bot._push_loop` — the one-at-a-time DM drip gated on
+`bot_conversation.last_asked_id` — **is not running.** `_post_init`
+(`telegram_bot.py:1699`) starts the daily, weekly, gmail, ynab_full_sync,
+lane_sweep, group_ping, and ui_api loops; there is no push task. The DM ask
+loop was switched off in the redesign-v2 cutover on 2026-07-09.
 
-**FYI messages must never read or write `last_asked_id`, `last_asked_kind`, or
-`last_asked_message_id`.** They send freely and in batch. Getting this wrong
-converts ~101 messages/month into ~101 ways to jam the queue. This is the
-single highest-risk detail in the change and gets a dedicated regression test.
+The live delivery path is `group_chat.group_ping_loop` → `_sweep_once`, which
+is **stateless**: "has this item been pinged?" is a `question`-table lookup,
+not a conversation pointer (`group_chat.py:109`). Questions therefore do not
+serialize, and the queue-stall failure mode does not apply to them.
+
+**The constraint that does apply: an FYI must never INSERT a `question` row.**
+`question` rows drive the loose-reply heuristic (`_handle_question_reply`
+assumes a small number of open questions) and the 7-day expiry sweep at
+`_sweep_once`'s head. Injecting ~101 no-reply-expected rows per month into
+that table would degrade reply matching for the ~95 that do need answers.
+
+FYIs get their own sweep with its own cap, writing no `question` rows. This is
+the highest-risk detail in the change and gets a dedicated regression test.
+
+### A fifth suppression path
+
+`_PING_MAX_AGE_HOURS = 72` (`group_chat.py:50`) means a `pending_txn` whose
+`created_at` is older than 72 hours is never pinged at all. Combined with
+`_MAX_PINGS_PER_SWEEP = 4` every 180s, throughput is ~80/hour — far above the
+~7/day this change produces, so the window is not a practical constraint today.
+It is left unchanged, but noted: if volume ever exceeds the drain rate, rows
+age out silently rather than queueing.
 
 ### FYI delivery
 
@@ -146,8 +166,8 @@ this change does not touch it.
 
 ### The Correct button
 
-Reuses the existing category-resolution path in `group_chat.py` /
-`telegram_bot.py`. Tapping it:
+Reuses the existing category-resolution path in `group_chat.py`
+(`_process_answer` → `_file_item`). Correcting an FYI:
 
 - sets `chosen_category` to the new pick and `filed_by` to the tapping user,
 - clears `synced_to_ynab_at` so `ynab_writer` re-pushes the correction,
@@ -260,9 +280,9 @@ change has no reason to touch history.
 
 - `dispatch.classify` table test: rule hit → filed + FYI; miss → stays pending
   with `suggested_category` set.
-- **Regression guard:** an FYI send leaves `bot_conversation.last_asked_id`,
-  `last_asked_kind`, and `last_asked_message_id` untouched. Assert directly on
-  the row.
+- **Regression guard:** an FYI send inserts no row into `question`. Assert
+  `SELECT COUNT(*) FROM question` is unchanged across the FYI sweep, and that
+  `_sweep_once` still pings a genuinely unruled row in the same pass.
 - A `ynab_sync`-sourced ledger row produces a `pending_txn`.
 - `Transfer :%` payees, split parents, split children, and off-budget accounts
   produce no `pending_txn`.
